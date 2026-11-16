@@ -8,22 +8,44 @@ on:
 
 jobs:
   build:
-    runs-on: macos-latest
+    runs-on: ubuntu-latest
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            make git curl xz-utils clang lld llvm file build-essential \
+            libssl-dev libplist-dev zlib1g-dev libtinfo6 || true
 
       - name: Setup Theos
         uses: Randomblock1/theos-action@v1
         with:
           theos-src: https://github.com/theos/theos.git
 
+      - name: Install iOS SDK
+        run: |
+          set -e
+          mkdir -p "$THEOS/sdks"
+          cd "$THEOS/sdks"
+          if [ ! -d "iPhoneOS15.0.sdk" ]; then
+            curl -L --retry 3 --retry-delay 5 --max-time 900 \
+              -o sdk.tar.xz \
+              https://github.com/theos/sdks/releases/download/master/iPhoneOS15.0.sdk.tar.xz
+            tar -xJf sdk.tar.xz
+          fi
+          ls -d *.sdk
+
       - name: Show toolchain
         run: |
           echo "THEOS=$THEOS"
           ls "$THEOS"
-          xcrun --sdk iphoneos --show-sdk-version
+          ls "$THEOS/sdks" || true
+          clang --version | head -1
+          which ldid || ls "$THEOS/bin" || true
 
       - name: Clean
         working-directory: VCam-upload
@@ -31,7 +53,7 @@ jobs:
 
       - name: Build package
         working-directory: VCam-upload
-        run: make package FINALPACKAGE=1 DEBUG=0
+        run: make package FINALPACKAGE=1 DEBUG=0 2>&1 | tail -200
 
       - name: List artifacts
         run: ls -lh VCam-upload/packages/ || true

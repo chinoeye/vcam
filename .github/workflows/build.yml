@@ -30,21 +30,32 @@ jobs:
         run: |
           set -e
           mkdir -p "$THEOS/sdks"
-          cd "$THEOS/sdks"
-          if [ ! -d "iPhoneOS15.0.sdk" ]; then
-            curl -L --retry 3 --retry-delay 5 --max-time 900 \
-              -o sdk.tar.xz \
-              https://github.com/theos/sdks/releases/download/master/iPhoneOS15.0.sdk.tar.xz
-            tar -xJf sdk.tar.xz
+          echo "--- 当前 sdks 目录 ---"
+          ls -la "$THEOS/sdks" || true
+
+          if ls "$THEOS/sdks"/*.sdk >/dev/null 2>&1; then
+            echo "SDK 已存在，跳过下载"
+            ls -d "$THEOS/sdks/"*.sdk
+            exit 0
           fi
-          ls -d *.sdk
+
+          cd /tmp
+          git clone --depth 1 --filter=blob:none --sparse \
+            https://github.com/theos/sdks.git sdks-repo
+          cd sdks-repo
+          git sparse-checkout set iPhoneOS15.0.sdk
+          cp -r iPhoneOS15.0.sdk "$THEOS/sdks/"
+          ls -d "$THEOS/sdks/"*.sdk
 
       - name: Show toolchain
         run: |
           echo "THEOS=$THEOS"
           ls "$THEOS"
+          echo "--- SDK ---"
           ls "$THEOS/sdks" || true
+          echo "--- clang ---"
           clang --version | head -1
+          echo "--- ldid ---"
           which ldid || ls "$THEOS/bin" || true
 
       - name: Clean
@@ -53,7 +64,7 @@ jobs:
 
       - name: Build package
         working-directory: VCam-upload
-        run: make package FINALPACKAGE=1 DEBUG=0 2>&1 | tail -200
+        run: make package FINALPACKAGE=1 DEBUG=0 2>&1 | tail -300
 
       - name: List artifacts
         run: ls -lh VCam-upload/packages/ || true

@@ -1,0 +1,14 @@
+{
+    Filter = {
+        Bundles = (
+            "com.ss.iphone.ugc.Aweme",
+            "com.ss.iphone.ugc.AwemeLite",
+            "com.jiangjia.gif",
+            "com.kuaishou.nebula",
+            "com.tencent.xin",
+            "com.ss.iphone.ugc.live",
+            "com.inke.gaia",
+            "com.taobao.taobao4iphone"
+        );
+    };
+}

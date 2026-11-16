@@ -223,6 +223,14 @@ static NSLock *VCProxyLock(void)
     }
 
     // ---------------- 音频 ----------------
+    // 从「真麦」切到「素材」的瞬间，音频 reader 还停在很久以前读到的位置。
+    // 必须先把它跳到视频当前所在处，否则一开口就是几十秒前的音，口型全错。
+    static VCAudioMode sLastAudioMode = VCAudioModeMic;
+    if (cfg.audioMode == VCAudioModeAsset && sLastAudioMode != VCAudioModeAsset) {
+        [[VCFrameSource shared] seekAudioToVideoTime];
+    }
+    sLastAudioMode = cfg.audioMode;
+
     switch (cfg.audioMode) {
         case VCAudioModeMic:
             return NULL;   // 真麦克风透传

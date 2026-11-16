@@ -7,6 +7,8 @@
 #import "VCamConfig.h"
 #import "VCLog.h"
 
+#import <math.h>
+
 @interface VCFrameSource ()
 {
     AVAsset *_asset;
@@ -21,6 +23,15 @@
     NSUInteger _frameCount;
     CGFloat _aspect;
     NSURL *_currentURL;
+
+    // ---- 音画同步状态 ----
+    // 视频和音频是两条独立的 AVAssetReader，谁也不看谁。
+    // 一旦任何一边丢一次回调，两条轨道的源位置就错开，而且误差只累加不纠正。
+    // 这组变量用来把音频强行钉在视频的时间轴上。
+    double _videoSourceSeconds;      // 当前视频帧在源文件中的位置
+    uint64_t _audioSamplesOut;       // 已输出给 App 的音频样本总数
+    uint64_t _audioSamplesRead;      // 已从 reader 读出的样本总数（含被丢弃的）
+    double _audioSampleRate;
 }
 
 - (BOOL)restartVideoReaderLocked;
@@ -49,6 +60,10 @@
         _pixelFormat = kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange;
         _fps = 30.0;
         _aspect = 1080.0 / 1920.0;
+        _audioSampleRate = 48000.0;
+        _videoSourceSeconds = 0.0;
+        _audioSamplesOut = 0;
+        _audioSamplesRead = 0;
     }
     return self;
 }
@@ -56,6 +71,7 @@
 - (BOOL)isReady   { return _ready; }
 - (NSUInteger)frameCount { return _frameCount; }
 - (CGFloat)sourceAspectRatio { return _aspect; }
+- (NSTimeInterval)currentVideoSourceTime { return _videoSourceSeconds; }
 
 // ------------------------------------------------------------------ 装载
 
@@ -136,6 +152,9 @@
 
         _ready = YES;
         _frameCount = 0;
+        _videoSourceSeconds = 0.0;
+        _audioSamplesRead = 0;
+        _audioSamplesOut = 0;
         [[VCSampleBufferFactory shared] resetTimeline];
 
         VCLog(@"素材装载成功: %@  比例 %.3f", url.lastPathComponent, _aspect);
@@ -168,6 +187,15 @@
 
             CMSampleBufferRef raw = [_videoOutput copyNextSampleBuffer];
             if (raw) {
+                // 记下这一帧在源文件里的位置。音频侧拿它对表，
+                // 这是整条音画同步链的基准点。
+                CMTime srcPTS = CMSampleBufferGetPresentationTimeStamp(raw);
+                if (CMTIME_IS_VALID(srcPTS)) {
+                    double t = CMTimeGetSeconds(srcPTS);
+                    if (isfinite(t) && t >= 0) {
+                        _videoSourceSeconds = t;
+                    }
+                }
                 result = [[VCSampleBufferFactory shared] retimeSampleBuffer:raw];
                 CFRelease(raw);
                 _frameCount++;
@@ -222,15 +250,37 @@
         _ready = NO;
         return NO;
     }
+
+    // 视频回绕 = 素材从头开始，音频必须跟着回绕。
+    // 让两条轨道各自回绕的话，一次循环就错开一整个素材长度。
+    [self restartAudioReaderLocked];
+    _audioSamplesRead = 0;
+    _audioSamplesOut = 0;
+    _videoSourceSeconds = 0.0;
+
     return YES;
 }
 
 // ------------------------------------------------------------------ 音频拉取
+//
+//  音画同步的核心在这里。
+//  视频和音频是两条独立 reader，各自的推进节奏不同，误差只累加不纠正。
+//  做法：音频的「读指针」始终被拽向视频的源时间位置——
+//    - 落后超过 250ms：快速读、丢弃，把指针追上去
+//    - 超前超过 250ms：本次不读，原地等视频追上来
+//  阈值取 250ms 是因为低于这个量人耳基本察觉不到口型偏差，
+//  而太小的阈值会导致频繁跳帧、听感反而更差。
+
+#define VC_AV_MAX_DRIFT 0.25
+#define VC_AV_CATCHUP_SLACK 0.10
+#define VC_AV_CATCHUP_GUARD 128
 
 - (NSData *)copyNextAudioPCMWithFrameCount:(CMItemCount *)frameCountOut
                                       asbd:(AudioStreamBasicDescription *)asbdOut
 {
-    if (!_ready || !_audioReader) return nil;
+    if (!_ready || !_audioReader || VCamConfig.shared.audioMode != VCAudioModeAsset) {
+        return nil;
+    }
 
     [_lock lock];
     NSData *result = nil;
@@ -242,12 +292,39 @@
             return nil;
         }
 
+        double videoT = _videoSourceSeconds;
+        double readerT = (double)_audioSamplesRead / _audioSampleRate;
+
+        // ---- 超前：原地等，不消耗数据 ----
+        if (readerT > videoT + VC_AV_MAX_DRIFT) {
+            return nil;
+        }
+
+        // ---- 落后：快速读并丢弃，把读指针追到视频附近 ----
+        if (readerT < videoT - VC_AV_MAX_DRIFT) {
+            int guard = 0;
+            while (guard++ < VC_AV_CATCHUP_GUARD) {
+                double cur = (double)_audioSamplesRead / _audioSampleRate;
+                if (cur >= videoT - VC_AV_CATCHUP_SLACK) break;
+
+                CMSampleBufferRef skip = [_audioOutput copyNextSampleBuffer];
+                if (!skip) break;
+                _audioSamplesRead += CMSampleBufferGetNumSamples(skip);
+                CFRelease(skip);
+            }
+            VCLogVerbose(@"音频追赶：%.0fms -> %.0fms",
+                         readerT * 1000, (double)_audioSamplesRead / _audioSampleRate * 1000);
+            // 本次不输出，让 proxy 丢掉这一帧音频
+            return nil;
+        }
+
+        // ---- 正常区间：读一块输出 ----
         CMSampleBufferRef raw = [_audioOutput copyNextSampleBuffer];
         if (!raw) {
-            [self restartAudioReaderLocked];
-            raw = [_audioOutput copyNextSampleBuffer];
+            // 读到素材末尾。不自行回绕 —— 等视频回绕时一起处理，
+            // 各回各的会立刻错开一整个素材长度。
+            return nil;
         }
-        if (!raw) return nil;
 
         CMBlockBufferRef block = CMSampleBufferGetDataBuffer(raw);
         CMItemCount frames = CMSampleBufferGetNumSamples(raw);
@@ -256,6 +333,9 @@
         const AudioStreamBasicDescription *asbd =
             CMAudioFormatDescriptionGetStreamBasicDescription(fmt);
         if (asbd && asbdOut) *asbdOut = *asbd;
+        if (asbd && asbd->mSampleRate > 0) {
+            _audioSampleRate = asbd->mSampleRate;
+        }
 
         if (block) {
             size_t len = CMBlockBufferGetDataLength(block);
@@ -263,6 +343,8 @@
             if (CMBlockBufferCopyDataBytes(block, 0, len, buf.mutableBytes) == kCMBlockBufferNoErr) {
                 result = buf;
                 if (frameCountOut) *frameCountOut = frames;
+                _audioSamplesRead += frames;
+                _audioSamplesOut += frames;
             }
         }
         CFRelease(raw);
@@ -295,6 +377,62 @@
     if (![_audioReader canAddOutput:_audioOutput]) return NO;
     [_audioReader addOutput:_audioOutput];
     return [_audioReader startReading];
+}
+
+/// 把音频轨道跳到视频当前所在位置。
+/// 从「真麦」切到「素材」时必须调用 —— 否则音频 reader 还停在很久以前读到的位置，
+/// 切过去声音会从几十秒前的地方接上来，口型完全对不上。
+- (void)seekAudioToVideoTime
+{
+    [_lock lock];
+    @try {
+        if (!_asset) return;
+
+        AVAssetTrack *atrack = [[_asset tracksWithMediaType:AVMediaTypeAudio] firstObject];
+        if (!atrack) return;
+
+        double v = _videoSourceSeconds;
+
+        @try { [_audioReader cancelReading]; } @catch (NSException *e) {}
+
+        NSError *err = nil;
+        _audioReader = [[AVAssetReader alloc] initWithAsset:_asset error:&err];
+        if (!_audioReader) {
+            VCLog(@"音频 seek 失败: %@", err);
+            return;
+        }
+
+        // 往前留 50ms 余量，避免正好卡在音频块边界上丢掉半个包
+        CMTime start = CMTimeMakeWithSeconds(MAX(0.0, v - 0.05), 1000);
+        _audioReader.timeRange = CMTimeRangeMake(start, kCMTimePositiveInfinity);
+
+        NSDictionary *asettings = @{
+            AVFormatIDKey: @(kAudioFormatLinearPCM),
+            AVLinearPCMBitDepthKey: @32,
+            AVLinearPCMIsFloatKey: @YES,
+            AVLinearPCMIsBigEndianKey: @NO,
+            AVLinearPCMIsNonInterleaved: @NO,
+            AVSampleRateKey: @48000,
+            AVNumberOfChannelsKey: @1,
+        };
+        _audioOutput = [[AVAssetReaderTrackOutput alloc] initWithTrack:atrack
+                                                       outputSettings:asettings];
+        _audioOutput.alwaysCopiesSampleData = YES;
+        if (![_audioReader canAddOutput:_audioOutput]) return;
+        [_audioReader addOutput:_audioOutput];
+
+        if (![_audioReader startReading]) {
+            VCLog(@"音频 seek 启动失败: %@", _audioReader.error);
+            return;
+        }
+
+        _audioSamplesRead = (uint64_t)(MAX(0.0, v) * _audioSampleRate);
+        _audioSamplesOut = _audioSamplesRead;
+
+        VCLog(@"音频已对齐到视频位置 %.2fs", v);
+    } @finally {
+        [_lock unlock];
+    }
 }
 
 // ------------------------------------------------------------------ 生命周期

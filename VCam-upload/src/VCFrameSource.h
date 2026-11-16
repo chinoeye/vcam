@@ -53,6 +53,14 @@ NS_ASSUME_NONNULL_BEGIN
 @property (nonatomic, readonly) NSUInteger frameCount;
 @property (nonatomic, readonly) CGFloat sourceAspectRatio;
 
+/// 当前视频帧在源文件里的时间位置（秒）。
+/// 音频侧靠它对表，保证音画不会各跑各的。
+@property (nonatomic, readonly) NSTimeInterval currentVideoSourceTime;
+
+/// 把音频轨道跳到视频当前所在的位置。
+/// 从「真麦」切到「素材」时必须调用，否则声音会从很久以前的地方接上。
+- (void)seekAudioToVideoTime;
+
 @end
 
 NS_ASSUME_NONNULL_END

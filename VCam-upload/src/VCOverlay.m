@@ -230,7 +230,8 @@ static UIWindow *gVCamPanelWindow = nil;
         b.contentHorizontalAlignment = UIControlContentHorizontalAlignmentLeft;
         b.titleLabel.font = [UIFont systemFontOfSize:12];
         b.tag = [assets indexOfObject:name];
-        [b setTitle:( [name isEqualToString:current] ? @"● " : @"○ " ) stringByAppendingString:name]
+        NSString *marker = [name isEqualToString:current] ? @"● " : @"○ ";
+        [b setTitle:[marker stringByAppendingString:name]
            forState:UIControlStateNormal];
         [b setTitleColor:([name isEqualToString:current]
                           ? [UIColor colorWithRed:0.35 green:0.85 blue:0.45 alpha:1]
@@ -379,8 +380,8 @@ static UIWindow *gVCamPanelWindow = nil;
             ov.videoGravity = AVLayerVideoGravityResizeAspectFill;
             ov.backgroundColor = [UIColor blackColor].CGColor;
             ov.opaque = YES;
-            // 跟随父层尺寸变化
-            ov.autoresizingMask = kCALayerWidthSizable | kCALayerHeightSizable;
+            // 不用 autoresizingMask —— 尺寸对齐在 pushVideoSampleBuffer: 里
+            // 每帧同步 parent.bounds，比 autoresizing 更可靠。
             [VCOverlayTable() setObject:ov forKey:layer];
         }
         [ov removeFromSuperlayer];

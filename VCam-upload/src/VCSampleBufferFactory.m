@@ -219,9 +219,9 @@
         if (VTPixelTransferSessionCreate(kCFAllocatorDefault, &_transfer) != noErr) {
             return NULL;
         }
-        VTSessionSetProperty(_transfer,
-                             kVTPixelTransferPropertyKey_EnableHardwareAcceleratedTransfer,
-                             kCFBooleanTrue);
+        // 这里原本想显式开硬件加速，但 kVTPixelTransferPropertyKey_EnableHardwareAcceleratedTransfer
+        // 在 iOS SDK 里并不存在（那是 macOS 侧的常量），写了直接编译失败。
+        // 而且 VTPixelTransferSession 默认就走硬件路径，不需要手动开。
     }
 
     size_t w = CVPixelBufferGetWidth(src);

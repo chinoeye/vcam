@@ -114,6 +114,15 @@ static double VCDrift(double amplitude, double speed)
 - (void)setVideoSettings:(NSDictionary *)videoSettings
 {
     %orig;
+
+    // 静默模式：连这个单例都不要碰。
+    //
+    // VCSampleBufferFactory 的 init 里会创建 CIContext ——
+    // 那是 GPU 上下文，iPhone 8 的显存本来就紧张，
+    // 抖音点开视频正在抢 GPU 做解码时，被它占住一块，画面会直接冻住。
+    // 而主线程不受影响，表现出来正是「画面卡死、HOME 键却有反应」。
+    if (!VCInjectionActive()) return;
+
     id fmt = videoSettings[(id)kCVPixelBufferPixelFormatTypeKey];
     if ([fmt isKindOfClass:[NSNumber class]]) {
         [VCSampleBufferFactory shared].requestedVideoFormat = [fmt unsignedIntValue];

@@ -59,6 +59,41 @@ static UIWindow *gVCamPanelWindow = nil;
 - (void)fillAssetStack;
 @end
 
+// ------------------------------------------------------------------
+//  触摸穿透容器 VCPassthroughView
+//
+//  悬浮面板是一个全屏透明 UIWindow（windowLevel = Alert + 100）。
+//  iOS 的触摸事件只会分发给**最上层命中的那个 window**，不会往下传。
+//  只要这个 window 的 rootView 还接受触摸（userInteractionEnabled 默认 YES），
+//  整个屏幕的每一次点击、滑动都会被它吃掉，下面的 App 一个事件都收不到。
+//
+//  在抖音里的表现：
+//    · 视频照播（不需要触摸）
+//    · 手指一滑动，界面就僵住不动 —— 用户说的"卡"
+//    · 点链接没反应，反复点，看起来像"加载慢"
+//    · 跟「注入」开关完全无关，因为面板一直都在
+//
+//  修法：用一个只转发给子视图的容器当 rootView ——
+//  命中自己就返回 nil（穿透），命中子视图（悬浮球 / 面板）才响应。
+//  hidden 的子视图本来就不参与 hitTest，所以面板收起时自动只剩球。
+//
+//  注意 hitTest:withEvent: 是 UIView 的方法，UIViewController 上没有，
+//  所以必须落在一个自定义 UIView 上。
+// ------------------------------------------------------------------
+@interface VCPassthroughView : UIView
+@end
+
+@implementation VCPassthroughView
+
+- (UIView *)hitTest:(CGPoint)point withEvent:(UIEvent *)event
+{
+    UIView *hit = [super hitTest:point withEvent:event];
+    if (hit == self) return nil;   // 空白区域 → 放行给下层 App
+    return hit;
+}
+
+@end
+
 @implementation VCamPanelController
 {
     UIButton *_ball;
@@ -73,28 +108,11 @@ static UIWindow *gVCamPanelWindow = nil;
     CGPoint _ballHome;
 }
 
-// ------------------------------------------------------------------
-//  触摸穿透
-//
-//  悬浮面板是一个全屏透明 UIWindow（windowLevel = Alert + 100）。
-//  iOS 的触摸事件只会分发给**最上层命中的那个 window**，不会往下传。
-//  只要这个 window 的 rootView 还接受触摸（userInteractionEnabled 默认 YES），
-//  整个屏幕的每一次点击、滑动都会被它吃掉，下面的 App 一个事件都收不到。
-//
-//  在抖音里的表现：
-//    · 视频照播（不需要触摸）
-//    · 手指一滑动，界面就僵住不动 —— 用户说的"卡"
-//    · 点链接没反应，反复点，看起来像"加载慢"
-//    · 跟「注入」开关完全无关，因为面板一直都在
-//
-//  修法：只有悬浮球和展开的面板算我们的，其余区域一律返回 nil 穿透。
-//  hidden 的子视图本来就不参与 hitTest，所以面板收起时自动只剩球。
-// ------------------------------------------------------------------
-- (UIView *)hitTest:(CGPoint)point withEvent:(UIEvent *)event
+// 用穿透容器替换默认的 rootView
+- (void)loadView
 {
-    UIView *hit = [super hitTest:point withEvent:event];
-    if (hit == self.view) return nil;   // 空白区域 → 放行给下层 App
-    return hit;
+    self.view = [[VCPassthroughView alloc] initWithFrame:[UIScreen mainScreen].bounds];
+    self.view.backgroundColor = [UIColor clearColor];
 }
 
 - (void)viewDidLoad

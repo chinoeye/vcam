@@ -4,6 +4,7 @@
 
 #import "VCCaptureProxy.h"
 #import "VCFrameSource.h"
+#import "VCLiveSource.h"
 #import "VCSampleBufferFactory.h"
 #import "VCOverlay.h"
 #import "VCamConfig.h"
@@ -219,7 +220,21 @@ static NSLock *VCProxyLock(void)
     }
 
     if (_kind == VCProxyKindVideo) {
-        CMSampleBufferRef fresh = [[VCFrameSource shared] copyNextVideoSampleBuffer];
+        // 按 sourceKind 分流：
+        //   Asset(0) → 本地 MP4 循环（VCFrameSource）
+        //   Live(1)  → 局域网 TCP 实时帧（VCLiveSource，配 pc/obs_live_push.py）
+        //
+        // 之前这里写死了 VCFrameSource，导致 VCLiveSource 收上来的帧
+        // 从来没人取 —— 电脑推得再欢，手机也是放 MP4。
+        //
+        // 实时源没帧时返回 NULL，上层会丢这一帧（dropOut=YES），
+        // 表现为画面冻结 —— 绝不会透传真摄像头画面。
+        CMSampleBufferRef fresh = NULL;
+        if (cfg.sourceKind == VCSourceKindLive) {
+            fresh = [[VCLiveSource shared] copyNextVideoSampleBuffer];
+        } else {
+            fresh = [[VCFrameSource shared] copyNextVideoSampleBuffer];
+        }
         if (fresh) {
             if (!_loggedFirstReplacement) {
                 _loggedFirstReplacement = YES;

@@ -37,7 +37,12 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
             make git curl xz-utils clang lld llvm file build-essential \
-            libssl-dev libplist-dev zlib1g-dev libtinfo6 fakeroot dpkg || true
+            libssl-dev libplist-dev zlib1g-dev libtinfo6 fakeroot dpkg \
+            perl pkg-config libssl-dev || true
+          echo "::notice::perl: $(perl -v 2>/dev/null | sed -n 2p)"
+          echo "::notice::clang: $(clang --version | head -1)"
+          echo "::notice::dpkg-deb: $(which dpkg-deb || echo MISSING)"
+          echo "::notice::fakeroot: $(which fakeroot || echo MISSING)"
 
       - name: Setup Theos
         uses: Randomblock1/theos-action@v1
@@ -72,11 +77,24 @@ jobs:
       - name: Show toolchain
         run: |
           echo "THEOS=$THEOS"
-          ls "$THEOS/sdks" || true
+          echo "::notice::THEOS=$THEOS"
+          echo "--- sdks ---"
+          ls "$THEOS/sdks" 2>/dev/null || echo "(无 sdks 目录)"
+          ls -d "$THEOS/sdks/"*.sdk 2>/dev/null | while read -r s; do echo "::notice::SDK: $s"; done
+          echo "--- makefiles ---"
+          ls "$THEOS/makefiles" 2>/dev/null | head -12 || echo "!!! makefiles 目录缺失"
+          echo "::notice:: makefiles common.mk 存在: $([ -f "$THEOS/makefiles/common.mk" ] && echo YES || echo NO)"
+          echo "::notice:: makefiles tweak.mk   存在: $([ -f "$THEOS/makefiles/tweak.mk" ] && echo YES || echo NO)"
           echo "--- clang ---"
           clang --version | head -1
+          echo "::notice::clang: $(clang --version | head -1)"
           echo "--- ldid ---"
-          which ldid || ls "$THEOS/bin" || true
+          (ls -l "$THEOS/bin/ldid" 2>/dev/null || which ldid 2>/dev/null) || echo "!!! ldid 缺失"
+          echo "::notice::ldid: $("$THEOS/bin/ldid" -v 2>&1 | head -1 || echo MISSING)"
+          echo "--- make ---"
+          make --version | head -1
+          echo "--- 当前目录 ---"
+          pwd && ls -la | head -20
 
       - name: Clean
         run: |
@@ -88,9 +106,22 @@ jobs:
       - name: Build package
         # pipefail 不能漏：不然 make 失败时管道的退出码是 tail 的（永远是 0），
         # 步骤会显示成功而实际没编译出任何东西。
+        #
+        # 这里故意不用 pipefail，改成手动检查 PIPESTATUS[0]，
+        # 这样 make 失败时还能把日志尾部打成 ::error:: 注解，
+        # 在 check-runs API 里就能直接读到失败原因，不用登录网页翻日志。
         run: |
-          set -o pipefail
           make package FINALPACKAGE=1 DEBUG=0 2>&1 | tee /tmp/build.log | tail -400
+          RC=${PIPESTATUS[0]}
+          echo "=== make 退出码: $RC ==="
+          if [ "$RC" -ne 0 ]; then
+            echo "::error::make 失败，退出码 $RC"
+            echo "--- 错误行 ---"
+            grep -inE 'error|no such file|not found|\*\*\*|missing separator|undefined|cannot' /tmp/build.log 2>/dev/null | head -15 | while IFS= read -r line; do echo "::error::$line"; done
+            echo "--- 日志尾部 ---"
+            tail -25 /tmp/build.log 2>/dev/null | while IFS= read -r line; do echo "::error::$line"; done
+            exit "$RC"
+          fi
           echo "=== 构建完成 ==="
 
       - name: List artifacts

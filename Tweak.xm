@@ -13,6 +13,7 @@
 
 #import "VCamConfig.h"
 #import "VCFrameSource.h"
+#import "VCAudioPipeline.h"
 #import "VCLiveSource.h"
 #import "VCCaptureProxy.h"
 #import "VCOverlay.h"
@@ -200,82 +201,7 @@ static double VCDrift(double amplitude, double speed)
 
 // ==================================================================
 #pragma mark - 音频：AVAudioEngine 路径
-// ==================================================================
-//
-//  实测抖音的直播音频不走 AVCaptureAudioDataOutput：
-//  把 audioMode 切成静音，录出来还是真麦克风的声音 —— 说明那条 hook
-//  压根没碰到它的采集链路。它用的是 AVAudioEngine / 底层 AudioUnit。
-//
-//  这里走跟视频同一套「原地改内容」的思路：
-//    tap 回调给的是 AVAudioPCMBuffer（系统原生对象）
-//    我们只改它里面的 floatChannelData，不造任何东西
-//    然后把**同一个 buffer** 交给原始 block
-//
-//  这样格式、所有权、时间戳全是系统的，不存在伪造导致崩溃的风险。
 
-static void VCRewritePCMBuffer(AVAudioPCMBuffer *buf)
-{
-    if (!buf) return;
-
-    VCamConfig *cfg = VCamConfig.shared;
-    if (cfg.audioMode == VCAudioModeMic) return;   // 真麦，不碰
-
-    AVAudioFrameCount frames = buf.frameLength;
-    if (frames == 0) return;
-
-    AVAudioFormat *fmt = buf.format;
-    if (!fmt) return;
-
-    // 静音：整块清零
-    if (cfg.audioMode == VCAudioModeMute) {
-        if (fmt.commonFormat == AVAudioPCMFormatFloat32 && buf.floatChannelData) {
-            UInt32 ch = fmt.channelCount;
-            for (UInt32 c = 0; c < ch; c++) {
-                memset(buf.floatChannelData[c], 0, frames * sizeof(float));
-            }
-        }
-        return;
-    }
-
-    // 素材音轨：只处理 float32
-    if (fmt.commonFormat != AVAudioPCMFormatFloat32 || !buf.floatChannelData) {
-        static BOOL sWarned = NO;
-        if (!sWarned) {
-            sWarned = YES;
-            VCLog(@"AVAudioPCMBuffer 不是 float32（commonFormat=%ld），素材音轨无法灌入",
-                  (long)fmt.commonFormat);
-        }
-        return;
-    }
-
-    CMItemCount srcFrames = 0;
-    AudioStreamBasicDescription asbd = {0};
-    NSData *pcm = [[VCFrameSource shared] copyNextAudioPCMWithFrameCount:&srcFrames asbd:&asbd];
-    if (!pcm || srcFrames == 0) return;
-
-    const float *src = (const float *)pcm.bytes;
-    size_t avail = pcm.length / sizeof(float);
-    if (avail == 0) return;
-
-    size_t n = ((size_t)frames < avail) ? (size_t)frames : avail;
-    UInt32 ch = fmt.channelCount;
-
-    static BOOL sLogged = NO;
-    if (!sLogged) {
-        sLogged = YES;
-        VCLog(@"AVAudioEngine 音频注入接通：系统 %.0fHz x%u，每块 %u 帧，灌入 %zu 帧",
-              fmt.sampleRate, (unsigned)ch, (unsigned)frames, n);
-    }
-
-    for (UInt32 c = 0; c < ch; c++) {
-        float *dst = buf.floatChannelData[c];
-        if (!dst) continue;
-        memcpy(dst, src, n * sizeof(float));
-        if (n < (size_t)frames) {
-            memset(dst + n, 0, ((size_t)frames - n) * sizeof(float));
-        }
-    }
-}
 
 // ==================================================================
 #pragma mark - 音频会话：强制 48000Hz
@@ -318,28 +244,9 @@ static void VCRewritePCMBuffer(AVAudioPCMBuffer *buf)
 }
 
 %end
+// AVAudioEngine 的 tap 路径已废弃：抖音音频走 AudioUnit，
+// 这条路从未被调用过（实测 installTapOnBus 一次都没命中）。
 
-%hook AVAudioEngine
-
-- (void)installTapOnBus:(AVAudioNodeBus)bus
-             bufferSize:(AVAudioFrameCount)bufferSize
-                 format:(AVAudioFormat *)format
-                  block:(AVAudioNodeTapBlock)tapBlock
-{
-    VCLog(@"AVAudioEngine installTapOnBus 命中：bus=%u size=%u fmt=%@",
-          (unsigned)bus, (unsigned)bufferSize, format);
-
-    // 包一层：先改系统给的这个 buffer 的内容，再交给原始 block。
-    // 传下去的还是同一个 buffer 对象，不新建、不折腾所有权。
-    AVAudioNodeTapBlock wrapped = ^(AVAudioPCMBuffer *buffer, AVAudioTime *when) {
-        VCRewritePCMBuffer(buffer);
-        if (tapBlock) tapBlock(buffer, when);
-    };
-
-    %orig(bus, bufferSize, format, wrapped);
-}
-
-%end
 
 // ==================================================================
 #pragma mark - 音频：AudioUnit (RemoteIO) 路径  ★真正在这条
@@ -363,7 +270,6 @@ typedef OSStatus (*VC_AURender_FN)(AudioUnit, AudioUnitRenderActionFlags *,
                                    const AudioTimeStamp *, UInt32, UInt32,
                                    AudioBufferList *);
 
-static VC_AURender_FN orig_AudioUnitRender = NULL;
 
 // ---- AudioUnitSetProperty hook：把音频格式的采样率钉成 48000 ----
 //
@@ -441,7 +347,7 @@ static volatile int    g_assetProbed        = 0;
 // 已输出的目标采样帧数累计。用来算真实播放时间，避免按源样本数推算的速率偏差。
 static volatile UInt64 g_audioOutFrames = 0;
 
-// VCRewriteAudioBufferList 每次提前返回的原因。
+// 音频写入每次提前返回的原因。
 // 报告里直接读，一眼看出卡在哪一步 —— 比猜省事。
 //   0 = 正常写入
 //   1 = audioMode 是 Mic
@@ -456,7 +362,6 @@ static volatile int g_audioWriteOK = 0;
 // 当这一轮拿不到新数据（seek 校正期间、解码器重启）时，
 // 用它填充而不是写静音 —— 静音会造成幅度突降到 0，听感是「啪」一声；
 // 延音保持幅度连续，140ms 的阻塞也听不出来。
-static NSMutableData *g_lastAudioOut = nil;
 
 // ==================================================================
 #pragma mark - PCM 格式转换
@@ -478,10 +383,6 @@ static NSMutableData *g_lastAudioOut = nil;
 //  单声道或双声道。所以每次从 AudioUnitGetProperty 取实时的格式，
 //  格式变了就重建转换器。
 
-static AudioConverterRef g_conv = NULL;
-static AudioStreamBasicDescription g_convSrc = {0};
-static AudioStreamBasicDescription g_convDst = {0};
-static NSLock *g_convLock = nil;
 
 // AudioConverter 的喂数据上下文。
 //
@@ -498,300 +399,9 @@ typedef struct {
     size_t       consumed;
 } VCConvCtx;
 
-static OSStatus VCConvInputProc(AudioConverterRef cvt,
-                                UInt32 *ioNumPackets,
-                                AudioBufferList *ioData,
-                                AudioStreamPacketDescription **outDesc,
-                                void *userData)
-{
-    VCConvCtx *ctx = (VCConvCtx *)userData;
-    if (!ctx || !ctx->data) return 1;
 
-    size_t remaining = ctx->totalFrames - ctx->consumed;
-    UInt32 want = *ioNumPackets;
-    if (want > (UInt32)remaining) want = (UInt32)remaining;
-    if (want == 0) return 1;   // 喂完了
+// 音频写入逻辑已迁移到 VCAudioPipeline（生产者-消费者）。
 
-    ioData->mNumberBuffers = 1;
-    ioData->mBuffers[0].mNumberChannels = 1;
-    ioData->mBuffers[0].mData = (void *)(ctx->data + ctx->consumed);
-    ioData->mBuffers[0].mDataByteSize = (UInt32)(want * sizeof(float));
-
-    *ioNumPackets = want;
-    ctx->consumed += want;
-    return noErr;
-}
-
-// 按系统实际格式准备转换器（格式变了就重建）
-static BOOL VCEnsureConverter(AudioStreamBasicDescription dst)
-{
-    static dispatch_once_t once;
-    dispatch_once(&once, ^{
-        g_convLock = [[NSLock alloc] init];
-    });
-
-    [g_convLock lock];
-    @try {
-        if (g_conv && memcmp(&g_convDst, &dst, sizeof(dst)) == 0) {
-            return YES;
-        }
-
-        if (g_conv) {
-            AudioConverterDispose(g_conv);
-            g_conv = NULL;
-        }
-
-        AudioStreamBasicDescription src = {0};
-        src.mSampleRate       = 48000;
-        src.mFormatID         = kAudioFormatLinearPCM;
-        src.mFormatFlags      = kAudioFormatFlagIsFloat | kAudioFormatFlagIsPacked;
-        src.mBytesPerPacket   = 4;
-        src.mFramesPerPacket  = 1;
-        src.mBytesPerFrame    = 4;
-        src.mChannelsPerFrame = 1;
-        src.mBitsPerChannel   = 32;
-
-        OSStatus st = AudioConverterNew(&src, &dst, &g_conv);
-        if (st != noErr || !g_conv) {
-            g_conv = NULL;
-            VCLog(@"AudioConverterNew 失败: %d (dst %.0fHz x%u %u bit flags=0x%x)",
-                  (int)st, dst.mSampleRate, (unsigned)dst.mChannelsPerFrame,
-                  (unsigned)dst.mBitsPerChannel, (unsigned)dst.mFormatFlags);
-            return NO;
-        }
-
-        g_convSrc = src;
-        g_convDst = dst;
-
-        VCLog(@"音频转换器就绪: 48000Hz/mono/float32 -> %.0fHz/x%u/%u bit",
-              dst.mSampleRate, (unsigned)dst.mChannelsPerFrame,
-              (unsigned)dst.mBitsPerChannel);
-        return YES;
-    } @finally {
-        [g_convLock unlock];
-    }
-}
-
-static void VCRewriteAudioBufferList(AudioBufferList *ioData, UInt32 frames)
-{
-    if (!ioData || frames == 0) return;
-
-    VCamConfig *cfg = VCamConfig.shared;
-    if (cfg.audioMode == VCAudioModeMic) { g_audioBail = 1; return; }
-
-    // ---- 静音：整块清零 ----
-    if (cfg.audioMode == VCAudioModeMute) {
-        g_audioBail = 2;
-        for (UInt32 b = 0; b < ioData->mNumberBuffers; b++) {
-            AudioBuffer *buf = &ioData->mBuffers[b];
-            if (buf->mData && buf->mDataByteSize) {
-                memset(buf->mData, 0, buf->mDataByteSize);
-            }
-        }
-        return;
-    }
-
-    // ---- 素材音轨：带 carry buffer ----
-    //
-    // 系统的 frames 是变长的（实测 470~941 之间跳），
-    // 而解码器每次吐一整块固定大小。以前只用前 frames 个、剩下直接丢，
-    // 结果是每块都少播一点、音频一直在赶进度 —— 听感就是「断点声」。
-    //
-    // 现在改成：攒够 frames 个样本再写，多出来的留到下一次。
-    static NSMutableData *carry = nil;
-    static NSLock *carryLock = nil;
-    static dispatch_once_t once;
-    dispatch_once(&once, ^{
-        carry = [NSMutableData dataWithCapacity:48000 * 2 * sizeof(float)];
-        carryLock = [[NSLock alloc] init];
-    });
-
-    [carryLock lock];
-    @try {
-        // ---- 系统要什么格式 ----
-        AudioStreamBasicDescription dst = {0};
-        dst.mSampleRate       = (Float64)g_auSysSampleRate;
-        dst.mFormatID         = kAudioFormatLinearPCM;
-        dst.mFormatFlags      = g_auSysFlags;
-        dst.mChannelsPerFrame = g_auSysChannels;
-        dst.mBitsPerChannel   = g_auSysBits;
-        dst.mBytesPerFrame    = g_auSysBytesPerFrame;
-        dst.mBytesPerPacket   = g_auSysBytesPerFrame;
-        dst.mFramesPerPacket  = 1;
-
-        if (dst.mSampleRate <= 0 || dst.mChannelsPerFrame == 0 ||
-            dst.mBytesPerFrame == 0) {
-            g_audioBail = 3;
-        }
-        if (dst.mSampleRate <= 0 || dst.mChannelsPerFrame == 0 ||
-            dst.mBytesPerFrame == 0 || !VCEnsureConverter(dst)) {
-            if (g_audioBail == 0) g_audioBail = 4;
-            // 还没探到系统格式：宁可静音也不放错数据
-            for (UInt32 b = 0; b < ioData->mNumberBuffers; b++) {
-                AudioBuffer *buf = &ioData->mBuffers[b];
-                if (buf->mData && buf->mDataByteSize) {
-                    memset(buf->mData, 0, buf->mDataByteSize);
-                }
-            }
-            return;
-        }
-
-        // ---- 需要多少源帧 ----
-        // 系统要 frames 帧（目标采样率），源采样率是 48000，
-        // 按比例算出要消耗多少源帧。这是重采样必须的一步。
-        const double ratio = g_convSrc.mSampleRate / dst.mSampleRate;
-        // 不加额外补偿：ratio == 1.0 时多要的样本会一直攒在 carry 里，
-        // 攒到上限又得丢最旧的，反而成了新的断点来源。
-        size_t needSrcFrames = (size_t)((double)frames * ratio) + 1;
-        const size_t needBytes = needSrcFrames * sizeof(float);
-
-        // ---- 从解码器补足 carry ----
-        int guard = 0;
-        while (carry.length < needBytes && guard++ < 64) {
-            CMItemCount got = 0;
-            AudioStreamBasicDescription a = {0};
-            NSData *more = [[VCFrameSource shared]
-                            copyNextAudioPCMWithFrameCount:&got asbd:&a];
-            if (!more || more.length == 0) break;
-            [carry appendData:more];
-        }
-
-        // 上限 2 秒，防止解码快于消费时延迟无限累积
-        const size_t maxBytes = 48000 * 2 * sizeof(float);
-        if (carry.length > maxBytes) {
-            [carry replaceBytesInRange:NSMakeRange(0, carry.length - maxBytes)
-                             withBytes:NULL
-                                length:0];
-        }
-
-        size_t availFrames = carry.length / sizeof(float);
-
-        // 源数据不够时，用「最后一个样本」把它补满。
-        //
-        // 不能留空：AudioConverter 拿到的输入不足会输出不足，
-        // 我们再把剩余部分静音填上，听感就是一阵阵断音。
-        // 用最后样本延音是最平滑的补法 —— 幅度连续，不会有咔哒声。
-        if (availFrames < needSrcFrames) {
-            size_t padCount = needSrcFrames - availFrames;
-            NSMutableData *pad = [NSMutableData dataWithLength:padCount * sizeof(float)];
-            float last = 0.0f;
-            if (availFrames > 0) {
-                last = ((const float *)carry.bytes)[availFrames - 1];
-            }
-            float *pp = (float *)pad.mutableBytes;
-            for (size_t i = 0; i < padCount; i++) pp[i] = last;
-            [carry appendData:pad];
-            availFrames = needSrcFrames;
-        }
-
-        size_t useSrcFrames = (availFrames < needSrcFrames) ? availFrames : needSrcFrames;
-
-        static BOOL sLogged = NO;
-        if (!sLogged && useSrcFrames > 0) {
-            sLogged = YES;
-            VCLog(@"音频转换：系统 %.0fHz x%u %u bit，每块要 %u 帧 -> 消耗源 %zu 帧",
-                  dst.mSampleRate, (unsigned)dst.mChannelsPerFrame,
-                  (unsigned)dst.mBitsPerChannel, (unsigned)frames, useSrcFrames);
-        }
-
-        if (useSrcFrames == 0) {
-            g_audioBail = 5;
-            // 没数据时重复上一块，而不是静音。
-            // 静音会造成幅度突降到 0，听感是「啪」一声断掉；
-            // 延音保持幅度连续，140ms 的阻塞也听不出来。
-            for (UInt32 b = 0; b < ioData->mNumberBuffers; b++) {
-                AudioBuffer *buf = &ioData->mBuffers[b];
-                if (!buf->mData || buf->mDataByteSize == 0) continue;
-                if (g_lastAudioOut.length > 0) {
-                    size_t n = g_lastAudioOut.length < buf->mDataByteSize
-                             ? g_lastAudioOut.length : buf->mDataByteSize;
-                    memcpy(buf->mData, g_lastAudioOut.bytes, n);
-                    if (n < buf->mDataByteSize) {
-                        memset((uint8_t *)buf->mData + n, 0, buf->mDataByteSize - n);
-                    }
-                } else {
-                    memset(buf->mData, 0, buf->mDataByteSize);
-                }
-            }
-            return;
-        }
-
-        // ---- 走 AudioConverter 做重采样 + 位深 + 声道 ----
-        const size_t outBytes = (size_t)frames * dst.mBytesPerFrame;
-        NSMutableData *out = [NSMutableData dataWithLength:outBytes];
-
-        AudioBufferList outABL;
-        outABL.mNumberBuffers = 1;
-        outABL.mBuffers[0].mNumberChannels = dst.mChannelsPerFrame;
-        outABL.mBuffers[0].mData = out.mutableBytes;
-        outABL.mBuffers[0].mDataByteSize = (UInt32)outBytes;
-
-        VCConvCtx ctx;
-        ctx.data        = (const float *)carry.bytes;
-        ctx.totalFrames = useSrcFrames;
-        ctx.consumed    = 0;
-
-        UInt32 outPackets = frames;
-        OSStatus st = AudioConverterFillComplexBuffer(g_conv,
-                                                      VCConvInputProc,
-                                                      &ctx,
-                                                      &outPackets,
-                                                      &outABL,
-                                                      NULL);
-
-        if (st != noErr && st != 1) {
-            static BOOL sErr = NO;
-            if (!sErr) {
-                sErr = YES;
-                VCLog(@"AudioConverterFillComplexBuffer 失败: %d", (int)st);
-            }
-            for (UInt32 b = 0; b < ioData->mNumberBuffers; b++) {
-                AudioBuffer *buf = &ioData->mBuffers[b];
-                if (buf->mData && buf->mDataByteSize) {
-                    memset(buf->mData, 0, buf->mDataByteSize);
-                }
-            }
-            return;
-        }
-
-        // ---- 写进系统 buffer ----
-        for (UInt32 b = 0; b < ioData->mNumberBuffers; b++) {
-            AudioBuffer *buf = &ioData->mBuffers[b];
-            if (!buf->mData || buf->mDataByteSize == 0) continue;
-
-            memset(buf->mData, 0, buf->mDataByteSize);
-
-            size_t writeLen = outABL.mBuffers[0].mDataByteSize;
-            if (writeLen > buf->mDataByteSize) writeLen = buf->mDataByteSize;
-            if (writeLen > 0) {
-                memcpy(buf->mData, outABL.mBuffers[0].mData, writeLen);
-            }
-        }
-
-        g_audioWriteOK++;
-        g_audioBail = 0;
-        {
-            if (!g_lastAudioOut) g_lastAudioOut = [NSMutableData data];
-            [g_lastAudioOut setData:out];
-        }
-
-        // ---- 消费 carry：按转换器实际吃掉的量 ----
-        if (ctx.consumed > 0) {
-            [carry replaceBytesInRange:NSMakeRange(0, ctx.consumed * sizeof(float))
-                             withBytes:NULL
-                                length:0];
-            // 回报真实播放进度：avc 用它算音画偏差，避免因解码超前而误 seek
-            [VCFrameSource shared].audioConsumedSourceFrames += ctx.consumed;
-        }
-
-        // 统计实际输出帧数（诊断用）。
-        // 注意：不要拿它去驱动 VCFrameSource 的同步判断 —— 那会形成
-        // 「不转换就不更新、不更新就不转换」的死锁。
-        g_audioOutFrames += outPackets;
-    } @finally {
-        [carryLock unlock];
-    }
-}
 
 static OSStatus hook_AudioUnitRender(AudioUnit unit,
                                      AudioUnitRenderActionFlags *flags,
@@ -863,8 +473,50 @@ static OSStatus hook_AudioUnitRender(AudioUnit unit,
               ioData->mNumberBuffers ? (unsigned)ioData->mBuffers[0].mNumberChannels : 0);
     }
 
-    // 按 audioMode 处理：Mic 原样透传 / Mute 清零 / Asset 灌素材
-    VCRewriteAudioBufferList(ioData, frames);
+    // ---- 音频处理：全部交给管道 ----
+    //
+    // 这里只做两件事：
+    //   1) 告诉管道目标格式（第一次拿到就设，之后内部自己判断是否变化）
+    //   2) 让它填数据
+    //
+    // 解码、重采样、时间同步、seek 校正都在管道后台线程里做，
+    // 这一行实际只是从环形缓冲 memcpy —— 纳秒级，不会拖住实时线程。
+    VCamConfig *cfg = VCamConfig.shared;
+    if (cfg.audioMode == VCAudioModeMic) {
+        return st;                    // 真麦：原样透传，什么都不动
+    }
+
+    VCAudioPipeline *pipe = [VCAudioPipeline shared];
+
+    if (cfg.audioMode == VCAudioModeMute) {
+        for (UInt32 b = 0; b < ioData->mNumberBuffers; b++) {
+            AudioBuffer *buf = &ioData->mBuffers[b];
+            if (buf->mData && buf->mDataByteSize) {
+                memset(buf->mData, 0, buf->mDataByteSize);
+            }
+        }
+        [pipe stop];
+        g_audioBail = 2;
+        return st;
+    }
+
+    // 素材音轨
+    if (g_auSysSampleRate > 0) {
+        AudioStreamBasicDescription dst = {0};
+        dst.mSampleRate       = g_auSysSampleRate;
+        dst.mFormatID         = kAudioFormatLinearPCM;
+        dst.mFormatFlags      = g_auSysFlags;
+        dst.mChannelsPerFrame = g_auSysChannels;
+        dst.mBitsPerChannel   = g_auSysBits;
+        dst.mBytesPerFrame    = g_auSysBytesPerFrame;
+        dst.mBytesPerPacket   = g_auSysBytesPerFrame;
+        dst.mFramesPerPacket  = 1;
+        [pipe setTargetFormat:dst];
+    }
+
+    [pipe fillIOData:ioData frames:frames];
+    g_audioBail = 0;
+    g_audioWriteOK++;
     return st;
 }
 
@@ -1454,10 +1106,17 @@ static NSString *VCRunAudioDiagnosis(void)
 
     [out appendFormat:@"seek 校正次数   : %d\n", g_vcSeekCount];
 
-    [out appendString:@"\n--- 写入状态 ---\n"];
-    [out appendFormat:@"成功写入次数  : %d\n", g_audioWriteOK];
-    [out appendFormat:@"最近返回原因  : %d  (0=正常 1=Mic 2=Mute 3=格式无效 4=转换器失败 5=无源数据)\n",
-        g_audioBail];
+    [out appendString:@"\n--- 音频管道 ---\n"];
+    {
+        VCAudioPipeline *pipe = [VCAudioPipeline shared];
+        [out appendFormat:@"运行中        : %@\n", pipe.isRunning ? @"是" : @"否"];
+        [out appendFormat:@"后台产出帧数  : %llu\n", pipe.producedFrames];
+        [out appendFormat:@"实时取走帧数  : %llu\n", pipe.consumedFrames];
+        [out appendFormat:@"缓冲存货帧数  : %zu\n", pipe.bufferedFrames];
+        [out appendFormat:@"缓冲欠载次数  : %llu   (大于0说明后台供不上)\n", pipe.underrunCount];
+    }
+    [out appendFormat:@"hook 填充次数 : %d\n", g_audioWriteOK];
+    [out appendFormat:@"最近返回原因  : %d  (0=正常 1=Mic 2=Mute)\n", g_audioBail];
 
     [out appendString:@"\n--- 系统音频格式 ---\n"];
     [out appendFormat:@"采样率        : %u Hz\n", (unsigned)g_auSysSampleRate];

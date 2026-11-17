@@ -403,6 +403,17 @@ static volatile int    g_assetProbed        = 0;
 // 已输出的目标采样帧数累计。用来算真实播放时间，避免按源样本数推算的速率偏差。
 static volatile UInt64 g_audioOutFrames = 0;
 
+// VCRewriteAudioBufferList 每次提前返回的原因。
+// 报告里直接读，一眼看出卡在哪一步 —— 比猜省事。
+//   0 = 正常写入
+//   1 = audioMode 是 Mic
+//   2 = audioMode 是 Mute
+//   3 = 系统格式无效（g_auSys* 还没探到）
+//   4 = 转换器创建失败
+//   5 = 源数据为空（copyNextAudioPCM 一直返回 nil）
+static volatile int g_audioBail = 0;
+static volatile int g_audioWriteOK = 0;
+
 // ==================================================================
 #pragma mark - PCM 格式转换
 // ==================================================================
@@ -522,10 +533,11 @@ static void VCRewriteAudioBufferList(AudioBufferList *ioData, UInt32 frames)
     if (!ioData || frames == 0) return;
 
     VCamConfig *cfg = VCamConfig.shared;
-    if (cfg.audioMode == VCAudioModeMic) return;
+    if (cfg.audioMode == VCAudioModeMic) { g_audioBail = 1; return; }
 
     // ---- 静音：整块清零 ----
     if (cfg.audioMode == VCAudioModeMute) {
+        g_audioBail = 2;
         for (UInt32 b = 0; b < ioData->mNumberBuffers; b++) {
             AudioBuffer *buf = &ioData->mBuffers[b];
             if (buf->mData && buf->mDataByteSize) {
@@ -564,7 +576,12 @@ static void VCRewriteAudioBufferList(AudioBufferList *ioData, UInt32 frames)
         dst.mFramesPerPacket  = 1;
 
         if (dst.mSampleRate <= 0 || dst.mChannelsPerFrame == 0 ||
+            dst.mBytesPerFrame == 0) {
+            g_audioBail = 3;
+        }
+        if (dst.mSampleRate <= 0 || dst.mChannelsPerFrame == 0 ||
             dst.mBytesPerFrame == 0 || !VCEnsureConverter(dst)) {
+            if (g_audioBail == 0) g_audioBail = 4;
             // 还没探到系统格式：宁可静音也不放错数据
             for (UInt32 b = 0; b < ioData->mNumberBuffers; b++) {
                 AudioBuffer *buf = &ioData->mBuffers[b];
@@ -632,6 +649,7 @@ static void VCRewriteAudioBufferList(AudioBufferList *ioData, UInt32 frames)
         }
 
         if (useSrcFrames == 0) {
+            g_audioBail = 5;
             for (UInt32 b = 0; b < ioData->mNumberBuffers; b++) {
                 AudioBuffer *buf = &ioData->mBuffers[b];
                 if (buf->mData && buf->mDataByteSize) {
@@ -692,6 +710,9 @@ static void VCRewriteAudioBufferList(AudioBufferList *ioData, UInt32 frames)
                 memcpy(buf->mData, outABL.mBuffers[0].mData, writeLen);
             }
         }
+
+        g_audioWriteOK++;
+        g_audioBail = 0;
 
         // ---- 消费 carry：按转换器实际吃掉的量，不再按比例估算 ----
         if (ctx.consumed > 0) {
@@ -1364,6 +1385,11 @@ static NSString *VCRunAudioDiagnosis(void)
     [out appendFormat:@"字节数          : %u\n", (unsigned)g_assetLastBytes];
     [out appendFormat:@"推算每样本字节  : %.2f  (4.00=float32 2.00=int16)\n",
         g_assetLastFrames > 0 ? (double)g_assetLastBytes / (double)g_assetLastFrames : 0.0];
+
+    [out appendString:@"\n--- 写入状态 ---\n"];
+    [out appendFormat:@"成功写入次数  : %d\n", g_audioWriteOK];
+    [out appendFormat:@"最近返回原因  : %d  (0=正常 1=Mic 2=Mute 3=格式无效 4=转换器失败 5=无源数据)\n",
+        g_audioBail];
 
     [out appendString:@"\n--- 系统音频格式 ---\n"];
     [out appendFormat:@"采样率        : %u Hz\n", (unsigned)g_auSysSampleRate];

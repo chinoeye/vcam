@@ -322,6 +322,10 @@
 //
 //  0.25 秒是「校正得足够勤、又不至于太频繁」的平衡点：
 //  偏差一到 250ms 就 seek 回正，人耳察觉不到，seek 频率也很低。
+// 音频 seek 校正的累计次数。报告里读它 —— 如果这个数一直涨，
+// 说明偏差仍在持续产生，断点就是 seek 造成的。
+int g_vcSeekCount = 0;
+
 #define VC_AV_MAX_DRIFT 0.25
 #define VC_AV_CATCHUP_SLACK 0.10
 #define VC_AV_CATCHUP_GUARD 128
@@ -367,11 +371,10 @@
         //  换来的是「偏差永远不超过 250ms」，15 小时的素材也不会跑偏。
         double drift = readerT - videoT;
         if (fabs(drift) > VC_AV_MAX_DRIFT) {
-            static int sSeekCount = 0;
-            sSeekCount++;
-            if (sSeekCount <= 5 || sSeekCount % 100 == 0) {
+            g_vcSeekCount++;
+            if (g_vcSeekCount <= 5 || g_vcSeekCount % 100 == 0) {
                 VCLog(@"音频校正 #%d：偏差 %.0fms -> seek 到 %.2fs",
-                      sSeekCount, drift * 1000, videoT);
+                      g_vcSeekCount, drift * 1000, videoT);
             }
             [self seekAudioToVideoTimeLocked];
             return nil;

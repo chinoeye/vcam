@@ -352,18 +352,38 @@ static OSStatus hook_AudioUnitRender(AudioUnit unit,
     OSStatus st = orig_AudioUnitRender(unit, flags, ts, bus, frames, ioData);
     if (st != noErr || !ioData) return st;
 
-    // RemoteIO / VoiceProcessingIO：output bus = 0（播放），input bus = 1（采集）
-    if (bus != 1) return st;
+    // ================= 【诊断版】无条件清零 =================
+    //
+    // 目的：一刀切开「hook 没装上」和「装上了但写入逻辑不对」。
+    //   录出来是纯静音  -> hook 生效，问题在 bus 判断或 PCM 格式
+    //   录出来还有声音  -> hook 根本没被调用，抖音不走 AudioUnitRender
+    //
+    // 只碰 input bus（1 = 采集），碰播放 bus 会出回声。
+    if (bus == 1) {
+        static BOOL sLoggedHit = NO;
+        if (!sLoggedHit) {
+            sLoggedHit = YES;
+            VCLog(@"★ AudioUnitRender 命中 input bus：frames=%u buffers=%u ch=%u —— hook 生效",
+                  (unsigned)frames, (unsigned)ioData->mNumberBuffers,
+                  ioData->mNumberBuffers ? (unsigned)ioData->mBuffers[0].mNumberChannels : 0);
+        }
 
-    static BOOL sLoggedBus = NO;
-    if (!sLoggedBus) {
-        sLoggedBus = YES;
-        VCLog(@"AudioUnitRender 命中 input bus：frames=%u buffers=%u ch=%u",
-              (unsigned)frames, (unsigned)ioData->mNumberBuffers,
-              ioData->mNumberBuffers ? (unsigned)ioData->mBuffers[0].mNumberChannels : 0);
+        for (UInt32 b = 0; b < ioData->mNumberBuffers; b++) {
+            AudioBuffer *buf = &ioData->mBuffers[b];
+            if (buf->mData && buf->mDataByteSize) {
+                memset(buf->mData, 0, buf->mDataByteSize);
+            }
+        }
+        return st;
     }
 
-    VCRewriteAudioBufferList(ioData, frames);
+    // 其它 bus（播放方向）：只在真注入时做统计日志，绝不改数据
+    static BOOL sLoggedOther = NO;
+    if (!sLoggedOther) {
+        sLoggedOther = YES;
+        VCLog(@"AudioUnitRender 其它 bus=%u frames=%u（播放方向，不动）",
+              (unsigned)bus, (unsigned)frames);
+    }
     return st;
 }
 

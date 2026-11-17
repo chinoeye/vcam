@@ -11,6 +11,7 @@
 #import <arpa/inet.h>
 #import <unistd.h>
 #import <string.h>
+#import <stdarg.h>
 
 static NSString *const kDomain = @"com.yg.vcam";
 
@@ -157,39 +158,28 @@ static NSString *VCJailbreakRoot(void)
 
 - (void)reload
 {
-    NSUserDefaults *d = [[NSUserDefaults alloc] initWithSuiteName:kDomain];
-    if (!d) d = [NSUserDefaults standardUserDefaults];
-
+    // 面板已经移除（那个全屏 window 是画面卡死的元凶），
+    // UserDefaults 里的历史值现在只有害处：
+    // 你之前在面板里关过「注入」，persist 把 injectEnabled=NO 写进去了，
+    // 之后每次启动都读回 NO → VCInjectionActive() 永远假 → 素材压根不加载。
+    //
+    // 所以这里不再读 UserDefaults，只认「默认值 + Documents/VCam/config.plist」。
     [self applyDefaults];
-
-    if ([d objectForKey:@"sourceKind"])       _sourceKind = (VCSourceKind)[d integerForKey:@"sourceKind"];
-    if ([d objectForKey:@"audioMode"])        _audioMode = (VCAudioMode)[d integerForKey:@"audioMode"];
-    if ([d objectForKey:@"assetName"])        _assetName = [d stringForKey:@"assetName"] ?: @"";
-    if ([d objectForKey:@"liveHost"])         _liveHost = [d stringForKey:@"liveHost"] ?: @"";
-    if ([d objectForKey:@"livePort"])         _livePort = (uint16_t)[d integerForKey:@"livePort"];
-    if ([d objectForKey:@"injectEnabled"])    _injectEnabled = [d boolForKey:@"injectEnabled"];
-    if ([d objectForKey:@"loopEnabled"])      _loopEnabled = [d boolForKey:@"loopEnabled"];
-    if ([d objectForKey:@"paused"])           _paused = [d boolForKey:@"paused"];
-    if ([d objectForKey:@"jitterTimestamps"]) _jitterTimestamps = [d boolForKey:@"jitterTimestamps"];
-    // 用新 key：老版本 persist 过 hideJailbreak=YES，直接沿用旧 key 会把
-    // 新的默认值 NO 覆盖掉，路径遮蔽又装回来了。
-    if ([d objectForKey:@"hideJailbreakV2"])  _hideJailbreak = [d boolForKey:@"hideJailbreakV2"];
-    if ([d objectForKey:@"letRealCameraRun"]) _letRealCameraRun = [d boolForKey:@"letRealCameraRun"];
-    if ([d objectForKey:@"hideOverlayQuickly"]) _hideOverlayQuickly = [d boolForKey:@"hideOverlayQuickly"];
 
     if (_livePort == 0) _livePort = 8099;
 
-    // 再让 Documents/VCam/config.plist 覆盖一遍（存在才覆盖）。
-    // 后台模式下没有 UI，这个文件就是唯一的控制入口。
+    // Documents/VCam/config.plist 里的键覆盖默认值（文件存在才生效）
     [self applyConfigFile];
 
+    // 素材名兜底：配置里没写、沙盒里也没有，就用默认的 test_demo
     if (_assetName.length == 0) {
         NSArray *all = [self availableAssets];
-        _assetName = all.firstObject ?: @"";
+        _assetName = all.firstObject ?: @"test_demo";
     }
 
-    VCLog(@"配置已加载: source=%ld audio=%ld asset=%@ inject=%d",
-          (long)_sourceKind, (long)_audioMode, _assetName, _injectEnabled);
+    VCLog(@"配置已加载: source=%ld audio=%ld asset=%@ inject=%d host=%@:%u/%u",
+          (long)_sourceKind, (long)_audioMode, _assetName, _injectEnabled,
+          _liveHost, _httpPort, _livePort);
 }
 
 - (void)persist
@@ -351,6 +341,68 @@ static BOOL VCDownloadHTTP(NSString *host, uint16_t port, NSString *path, NSStri
     BOOL ok = VCDownloadHTTP(_liveHost, port, path, dest);
     VCLog(@"素材下载%@", ok ? @"成功" : @"失败");
     return ok;
+}
+
+// ------------------------------------------------------------------ 远程日志
+//
+//  真机里的 NSLog 电脑看不到，爱思的实时日志又不落盘。
+//  出问题时只能让 dylib 自己把线索发回来。
+
+/// 发一个 GET 就走，不等响应。服务端收到就会落盘。
+static void VCSendGet(NSString *host, uint16_t port, NSString *path)
+{
+    if (host.length == 0 || path.length == 0) return;
+
+    struct hostent *he = gethostbyname(host.UTF8String);
+    if (!he || !he->h_addr_list[0]) return;
+
+    int fd = socket(AF_INET, SOCK_STREAM, 0);
+    if (fd < 0) return;
+
+    struct timeval tv;
+    tv.tv_sec = 3;
+    tv.tv_usec = 0;
+    setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+
+    struct sockaddr_in addr;
+    memset(&addr, 0, sizeof(addr));
+    addr.sin_family = AF_INET;
+    addr.sin_port   = htons(port);
+    memcpy(&addr.sin_addr.s_addr, he->h_addr_list[0], sizeof(uint32_t));
+
+    if (connect(fd, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
+        close(fd);
+        return;
+    }
+
+    char req[1600];
+    snprintf(req, sizeof(req),
+             "GET %s HTTP/1.0\r\nHost: %s\r\nConnection: close\r\n\r\n",
+             path.UTF8String, host.UTF8String);
+    send(fd, req, strlen(req), 0);
+    close(fd);
+}
+
+void VCRemoteLog(NSString *fmt, ...)
+{
+    va_list ap;
+    va_start(ap, fmt);
+    NSString *msg = [[NSString alloc] initWithFormat:fmt arguments:ap];
+    va_end(ap);
+    if (msg.length == 0) return;
+
+    VCLog(@"[远程] %@", msg);
+
+    // 内部异步：任何线程调用都不会被网络阻塞
+    dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
+        VCamConfig *c = VCamConfig.shared;
+        if (c.liveHost.length == 0) return;
+        uint16_t port = c.httpPort > 0 ? c.httpPort : 8088;
+        NSString *enc = [msg stringByAddingPercentEncodingWithAllowedCharacters:
+                         [NSCharacterSet URLQueryAllowedCharacterSet]];
+        VCSendGet(c.liveHost, port,
+                  [NSString stringWithFormat:@"/vcam-log?m=%@", enc ?: @"..."]);
+    });
 }
 
 @end

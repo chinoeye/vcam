@@ -468,8 +468,25 @@ static OSStatus hook_AudioUnitRender(AudioUnit unit,
         return st;
     }
 
-    // 素材音轨
-    if (g_auSysSampleRate > 0) {
+    // 素材音轨。
+    //
+    // setTargetFormat 只在格式真的变化时才调用 —— 它内部会重建环形缓冲
+    // 和转换器，每秒调 47 次等于每秒重建 47 次，缓冲永远是空的。
+    // 这里用人手做一次「上次设置的格式」缓存，避免每帧都进去比较。
+    static UInt32 sLastRate = 0, sLastCh = 0, sLastBits = 0, sLastFlags = 0, sLastBpf = 0;
+    if (g_auSysSampleRate > 0 &&
+        (g_auSysSampleRate  != sLastRate  ||
+         g_auSysChannels    != sLastCh    ||
+         g_auSysBits        != sLastBits  ||
+         g_auSysFlags       != sLastFlags ||
+         g_auSysBytesPerFrame != sLastBpf)) {
+
+        sLastRate  = g_auSysSampleRate;
+        sLastCh    = g_auSysChannels;
+        sLastBits  = g_auSysBits;
+        sLastFlags = g_auSysFlags;
+        sLastBpf   = g_auSysBytesPerFrame;
+
         AudioStreamBasicDescription dst = {0};
         dst.mSampleRate       = g_auSysSampleRate;
         dst.mFormatID         = kAudioFormatLinearPCM;

@@ -64,6 +64,14 @@ typedef struct section vc_section;
 #ifndef SECT_NON_LAZY_SYMBOL_POINTERS
 #define SECT_NON_LAZY_SYMBOL_POINTERS "__nl_symbol_ptr"
 #endif
+
+// 现代 Mach-O 里非懒加载符号指针的 section 实际叫 __got。
+// __nl_symbol_ptr 是十几年前的旧名，现在的链接器根本不产这个段 ——
+// 之前只认旧名，导致所有 __got 里的导入符号（AudioUnitRender 就在其中）
+// 全部漏掉，VCHookSymbol 从来没成功绑上过任何东西。
+#ifndef SECT_GOT_POINTERS
+#define SECT_GOT_POINTERS "__got"
+#endif
 #ifndef INDIRECT_SYMBOL_LOCAL
 #define INDIRECT_SYMBOL_LOCAL 0x80000000
 #endif
@@ -201,7 +209,8 @@ static void vc_rebind_image(vc_entry_t *e, const vc_mach_header *header, intptr_
             const vc_section *cs = &sec[k];
 
             BOOL isLazy = (strncmp(cs->sectname, SECT_LAZY_SYMBOL_POINTERS, 16) == 0);
-            BOOL isNL   = (strncmp(cs->sectname, SECT_NON_LAZY_SYMBOL_POINTERS, 16) == 0);
+            BOOL isNL   = (strncmp(cs->sectname, SECT_NON_LAZY_SYMBOL_POINTERS, 16) == 0)
+                       || (strncmp(cs->sectname, SECT_GOT_POINTERS, 16) == 0);
             if (!isLazy && !isNL) continue;
 
             uint32_t n = (uint32_t)(cs->size / sizeof(void *));

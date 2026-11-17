@@ -71,10 +71,10 @@ static NSLock *VCProxyLock(void)
     [VCProxyRegistry() setObject:proxy forKey:output];
     [VCProxyLock() unlock];
 
-    VCLogVerbose(@"建立%@代理: %@ <- %@",
-                 kind == VCProxyKindVideo ? @"视频" : @"音频",
-                 NSStringFromClass([output class]),
-                 NSStringFromClass([target class]));
+    VCLog(@"建立%@代理: %@ <- %@",
+          kind == VCProxyKindVideo ? @"视频" : @"音频",
+          NSStringFromClass([output class]),
+          NSStringFromClass([target class]));
     return proxy;
 }
 
@@ -324,6 +324,17 @@ static NSLock *VCProxyLock(void)
 {
     if (dropOut) *dropOut = NO;
     if (!buffer) return;
+
+    // 第一条到达这里的音频帧打一次日志 —— 用来判断
+    // 「音频 delegate 到底有没有走我们这条代理」。
+    // 如果日志里完全没有这一行，说明抖音压根没用 AVCaptureAudioDataOutput，
+    // 那 hook 再怎么写也拦不到它的麦克风。
+    static BOOL sLoggedArrival = NO;
+    if (!sLoggedArrival) {
+        sLoggedArrival = YES;
+        VCLog(@"音频回调已到达代理（audioMode=%ld kind=%ld）",
+              (long)VCamConfig.shared.audioMode, (long)_kind);
+    }
 
     if (![self syncInjectingState]) return;   // 不注入，原样透传
     if (_kind != VCProxyKindAudio) return;

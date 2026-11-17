@@ -43,6 +43,9 @@ static NSLock *VCProxyLock(void)
 @interface VCCaptureProxy ()
 - (CMSampleBufferRef)replacementForBuffer:(CMSampleBufferRef)original
                                      drop:(BOOL *)dropOut;
+- (void)rewriteVideoBufferInPlace:(CMSampleBufferRef)buffer
+                             drop:(BOOL *)dropOut;
+- (BOOL)syncInjectingState;
 - (AudioStreamBasicDescription)standardAudioFormat;
 @end
 
@@ -163,45 +166,48 @@ static NSLock *VCProxyLock(void)
         [invocation getArgument:&output atIndex:2];
         [invocation getArgument:&original atIndex:3];
 
+        // ---- 视频：原地改写系统 buffer 的内容 ----
+        //
+        // 不再伪造 CMSampleBuffer 塞给 App。伪造出来的 buffer 缺少
+        // sample attachments / format description extensions，
+        // App 一读就是 NULL，然后 CFRelease(NULL)，EXC_BREAKPOINT。
+        //
+        // 现在只把系统 buffer 里的像素换掉，buffer 本身原样转发。
+        if (_kind == VCProxyKindVideo) {
+            BOOL drop = NO;
+            [self rewriteVideoBufferInPlace:original drop:&drop];
+
+            if (drop) {
+                // 拿不到可替换的帧时宁可丢这一帧（画面短暂冻结），
+                // 也不能把真摄像头画面漏给 App。
+                return;
+            }
+
+            @try {
+                [invocation invokeWithTarget:target];
+            } @catch (NSException *e) {
+                VCLog(@"转发 delegate 异常: %@", e.reason);
+            }
+            return;
+        }
+
+        // ---- 音频：沿用替换策略 ----
         BOOL drop = NO;
         CMSampleBufferRef replacement = [self replacementForBuffer:original drop:&drop];
 
         if (replacement) {
-            // ---- 关键：必须额外 retain 一次 ----
-            //
-            // AVFoundation 的 -[AVCaptureVideoDataOutput _processSampleBuffer:]
-            // 在把 buffer 交给 delegate 之后，自己还会 release 一份 ——
-            // 它默认那个 buffer 是系统创建的、由它持有。
-            //
-            // 我们这里换成了自己的 buffer（引用计数 1，由我们持有）。
-            // 如果不额外 retain，就变成「系统 release + 我们 release」的
-            // 双重释放，之后任何一次访问都是野指针。
-            //
-            // 崩溃现场的堆栈正好是：
-            //   CFRelease.cold.1 <- CFRelease <- AwemeCore <- __invoking___
-            //   <- ... <- VCam.dylib forwardInvocation: <- AVFCapture
-            // CoreFoundation 报的是 "CFRelease() called with NULL"。
-            //
-            // 引用计数账：
-            //   copyNextVideoSampleBuffer 返回        +1（我们的）
-            //   CFRetain 给系统                       +1 = 2
-            //   系统调用完 delegate 后 release        -1 = 1
-            //   我们 @finally release                 -1 = 0  ✓
-            CFRetain(replacement);
             [invocation setArgument:&replacement atIndex:3];
             @try {
                 [invocation invokeWithTarget:target];
             } @catch (NSException *e) {
                 VCLog(@"转发 delegate 异常: %@", e.reason);
             } @finally {
-                CFRelease(replacement);   // 只释放我们自己那一份
+                CFRelease(replacement);
             }
             return;
         }
 
         if (drop) {
-            // 拿不到可替换的帧时宁可丢这一帧（画面短暂冻结），
-            // 也不能把真摄像头画面漏给 App。
             return;
         }
     }
@@ -213,20 +219,17 @@ static NSLock *VCProxyLock(void)
     }
 }
 
-// ------------------------------------------------------------------ 替换逻辑
-
-- (CMSampleBufferRef)replacementForBuffer:(CMSampleBufferRef)original drop:(BOOL *)dropOut
+// ------------------------------------------------------------------ 注入状态
+//
+//  注入状态一变，同步覆盖层的可见性。
+//  那个 AVSampleBufferDisplayLayer 是 opaque 的全屏层，即便一帧都不推，
+//  它仍然要参与 GPU 合成 —— 等于凭空多合成一整屏预览。
+//  视频路径和音频路径都要用到，抽出来共用。
+- (BOOL)syncInjectingState
 {
-    if (dropOut) *dropOut = NO;
-
     VCamConfig *cfg = VCamConfig.shared;
     BOOL injecting = (cfg.injectEnabled && cfg.sourceKind != VCSourceKindNone);
 
-    // 注入状态一变，同步覆盖层的可见性。
-    //
-    // 那个 AVSampleBufferDisplayLayer 是 opaque 的全屏层，即便一帧都不推，
-    // 它仍然要参与 GPU 合成 —— 等于凭空多合成一整屏预览。
-    // 「关掉注入还是卡」很大一部分就是这么来的。
     static BOOL sLastInjecting = YES;
     if (sLastInjecting != injecting) {
         sLastInjecting = injecting;
@@ -235,56 +238,96 @@ static NSLock *VCProxyLock(void)
               injecting ? @"开" : @"关",
               injecting ? @"显示" : @"隐藏");
     }
+    return injecting;
+}
 
-    if (!injecting) {
+// ------------------------------------------------------------------ 视频：原地改写
+//
+//  保留系统给的 CMSampleBuffer，只把它里面的像素换成我们的。
+//
+//  为什么不再伪造 buffer：
+//    用 CMSampleBufferCreateReadyWithImageBuffer 造出来的 buffer 缺少
+//    sample attachments、format description extensions（VerInfo /
+//    CameraIntrinsicMatrix）等真实摄像头才有的东西。
+//    App 一读就拿到 NULL，然后对它 CFRelease ——
+//    崩溃现场固定是：
+//      CFRelease.cold.1 <- CFRelease <- AwemeCore
+//      <- __invoking___ <- VCam.dylib forwardInvocation: <- AVFCapture
+//
+//  改成原地改写后，PTS / attachments / format description 全是原生，
+//  App 完全感知不到差异。代价是每帧一次 memcpy 或一次 GPU 缩放。
+- (void)rewriteVideoBufferInPlace:(CMSampleBufferRef)buffer drop:(BOOL *)dropOut
+{
+    if (dropOut) *dropOut = NO;
+    if (!buffer) return;
+
+    if (![self syncInjectingState]) return;   // 不注入，原样透传
+    if (_kind != VCProxyKindVideo) return;
+
+    CVPixelBufferRef dst = CMSampleBufferGetImageBuffer(buffer);
+    if (!dst) {
+        if (dropOut) *dropOut = YES;
+        return;
+    }
+
+    VCamConfig *cfg = VCamConfig.shared;
+    CVPixelBufferRef src = NULL;
+
+    if (cfg.sourceKind == VCSourceKindLive) {
+        // 实时源没有现成的 pixelBuffer 接口，借 CMSampleBuffer 中转一下
+        CMSampleBufferRef sb = [[VCLiveSource shared] copyNextVideoSampleBuffer];
+        if (sb) {
+            CVPixelBufferRef pb = CMSampleBufferGetImageBuffer(sb);
+            if (pb) src = CVPixelBufferRetain(pb);
+            CFRelease(sb);
+        }
+    } else {
+        src = [[VCFrameSource shared] copyNextPixelBuffer];
+    }
+
+    if (!src) {
+        // 帧源暂时空（素材没加载好、实时源断线），丢帧而不是透传真画面
+        if (dropOut) *dropOut = YES;
+        return;
+    }
+
+    if (![[VCSampleBufferFactory shared] copyPixelBuffer:src into:dst]) {
+        CVPixelBufferRelease(src);
+        if (dropOut) *dropOut = YES;
+        return;
+    }
+
+    if (!_loggedFirstReplacement) {
+        _loggedFirstReplacement = YES;
+        VCLog(@"首帧注入成功（原地改写）%zux%zu fmt=0x%x",
+              CVPixelBufferGetWidth(dst), CVPixelBufferGetHeight(dst),
+              (unsigned)CVPixelBufferGetPixelFormatType(dst));
+    }
+
+    [[VCSampleBufferFactory shared] updateJPEGFromPixelBuffer:dst];
+    [VCOverlay pushVideoSampleBuffer:buffer];
+
+    CVPixelBufferRelease(src);
+}
+
+// ------------------------------------------------------------------ 音频：替换
+//
+//  视频走原地改写，这里只剩音频在用替换策略。
+//  音频 buffer 没有视频那边那么多附件要求，替换是安全的。
+
+- (CMSampleBufferRef)replacementForBuffer:(CMSampleBufferRef)original drop:(BOOL *)dropOut
+{
+    if (dropOut) *dropOut = NO;
+
+    if (![self syncInjectingState]) {
         return NULL;   // 关闭注入，原样透传
     }
 
     if (_kind == VCProxyKindVideo) {
-        // 按 sourceKind 分流：
-        //   Asset(0) → 本地 MP4 循环（VCFrameSource）
-        //   Live(1)  → 局域网 TCP 实时帧（VCLiveSource，配 pc/obs_live_push.py）
-        //
-        // 之前这里写死了 VCFrameSource，导致 VCLiveSource 收上来的帧
-        // 从来没人取 —— 电脑推得再欢，手机也是放 MP4。
-        //
-        // 实时源没帧时返回 NULL，上层会丢这一帧（dropOut=YES），
-        // 表现为画面冻结 —— 绝不会透传真摄像头画面。
-        CMSampleBufferRef fresh = NULL;
-        if (cfg.sourceKind == VCSourceKindLive) {
-            fresh = [[VCLiveSource shared] copyNextVideoSampleBuffer];
-        } else {
-            fresh = [[VCFrameSource shared] copyNextVideoSampleBuffer];
-        }
-        if (fresh) {
-            // 拿不到图像数据的 buffer 交给 App 一定出事 ——
-            // 抖音那边会 CMSampleBufferGetImageBuffer 拿到 NULL，
-            // 然后对它 CFRelease，直接触发 "CFRelease() called with NULL"。
-            // 宁可丢这一帧。
-            CVPixelBufferRef pb = CMSampleBufferGetImageBuffer(fresh);
-            if (!pb) {
-                VCLog(@"帧没有图像数据，丢弃（避免 App 侧空指针崩溃）");
-                CFRelease(fresh);
-                if (dropOut) *dropOut = YES;
-                return NULL;
-            }
-
-            if (!_loggedFirstReplacement) {
-                _loggedFirstReplacement = YES;
-                VCLog(@"首帧注入成功 %zux%zu fmt=0x%x",
-                      CVPixelBufferGetWidth(pb), CVPixelBufferGetHeight(pb),
-                      (unsigned)CVPixelBufferGetPixelFormatType(pb));
-            }
-
-            [[VCSampleBufferFactory shared] updateJPEGFromPixelBuffer:pb];
-            // 同一帧也喂给预览覆盖层 —— 只解码一次，两处共用
-            [VCOverlay pushVideoSampleBuffer:fresh];
-            return fresh;
-        }
-        // 帧源暂时空（换素材、实时源断线），丢帧而不是透传真画面
-        if (dropOut) *dropOut = YES;
-        return NULL;
+        return NULL;   // 视频已经走 rewriteVideoBufferInPlace:，这里不处理
     }
+
+    VCamConfig *cfg = VCamConfig.shared;
 
     // ---------------- 音频 ----------------
     // 从「真麦」切到「素材」的瞬间，音频 reader 还停在很久以前读到的位置。

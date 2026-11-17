@@ -1,92 +1,86 @@
 name: Build VCam
 
+# 把 ios/ 目录整个作为仓库根上传后即可用。
+# 触发：push / 手动 workflow_dispatch / 打 tag
+#
+# 产物在 Artifacts 里，是一个 .deb，直接 scp 到手机 dpkg -i 安装。
+
 on:
   push:
     branches: [main, master]
     tags: ["v*"]
   workflow_dispatch:
 
+# 用 API 逐文件上传会产生多个 commit，也就是多次 push 触发。
+# 只保留最后一次运行，前面排队/进行中的全部取消，避免白等一轮。
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   build:
-    runs-on: ubuntu-latest
+    runs-on: macos-latest
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
-
-      - name: Install dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends \
-            make git curl xz-utils clang lld llvm file build-essential \
-            libssl-dev libplist-dev zlib1g-dev libtinfo6 || true
 
       - name: Setup Theos
         uses: Randomblock1/theos-action@v1
         with:
           theos-src: https://github.com/theos/theos.git
 
-      - name: Install iOS SDK
-        run: |
-          set -e
-          mkdir -p "$THEOS/sdks"
-          if ls "$THEOS/sdks"/*.sdk >/dev/null 2>&1; then
-            echo "SDK 已存在"
-            ls -d "$THEOS/sdks/"*.sdk
-            exit 0
-          fi
-          cd /tmp
-          git clone --depth 1 --filter=blob:none --sparse \
-            https://github.com/theos/sdks.git sdks-repo
-          cd sdks-repo
-          git sparse-checkout set iPhoneOS15.0.sdk
-          cp -r iPhoneOS15.0.sdk "$THEOS/sdks/"
-          ls -d "$THEOS/sdks/"*.sdk
-
       - name: Show toolchain
         run: |
           echo "THEOS=$THEOS"
           ls "$THEOS"
-          echo "--- SDK ---"
-          ls "$THEOS/sdks" || true
-          echo "--- clang ---"
-          clang --version | head -1
-          echo "--- ldid ---"
-          which ldid || ls "$THEOS/bin" || true
-
-      - name: Inspect source
-        working-directory: VCam-upload
-        run: |
-          echo "=== 当前目录 ==="
-          pwd
-          echo "=== 文件清单 ==="
-          find . -maxdepth 2 -type f | sort
-          echo "=== Makefile 内容 ==="
-          cat Makefile
+          xcrun --sdk iphoneos --show-sdk-version
 
       - name: Clean
-        working-directory: VCam-upload
         run: make clean || true
 
       - name: Build package
-        working-directory: VCam-upload
-        run: |
-          set -o pipefail
-          make package FINALPACKAGE=1 DEBUG=0 2>&1 | tee /tmp/build.log | tail -300
+        run: make package FINALPACKAGE=1 DEBUG=0
 
       - name: List artifacts
+        run: ls -lh packages/ || true
+
+      # TrollFools 注入要的是裸 dylib，不是 deb。
+      # 这里直接把 .theos 里的 arm64 产物捞出来单独出一个 artifact，
+      # 省掉「下载 deb → 解包 → 找 dylib」这三步。
+      - name: Collect raw dylib
+        shell: bash
         run: |
-          echo "--- packages 目录 ---"
-          ls -lh VCam-upload/packages/ 2>/dev/null || echo "packages 目录不存在"
-          echo "--- 全仓库找 deb/dylib ---"
-          find VCam-upload -type f \( -name '*.deb' -o -name '*.dylib' \) 2>/dev/null || true
-          echo "--- .theos 构建目录 ---"
-          find VCam-upload/.theos -maxdepth 2 2>/dev/null | head -30 || echo "无 .theos"
+          set -e
+          mkdir -p out
+          # 优先取 arm64 的最终产物（debug 目录里的旧副本不要）
+          while IFS= read -r f; do
+            cp -v "$f" "out/$(basename "$f")"
+          done < <(find .theos -type f -name "*.dylib" -path "*arm64*" 2>/dev/null || true)
+
+          if [ -z "$(ls -A out 2>/dev/null)" ]; then
+            echo "arm64 目录没找到，退回全量搜索"
+            while IFS= read -r f; do
+              cp -v "$f" "out/$(basename "$f")"
+            done < <(find .theos -type f -name "*.dylib" 2>/dev/null || true)
+          fi
+
+          echo "--- out ---"
+          ls -lh out/ || true
+          test -n "$(ls -A out 2>/dev/null)" || { echo "没有找到 dylib"; exit 1; }
 
       - name: Upload deb
         uses: actions/upload-artifact@v4
         with:
           name: VCam-deb
-          path: VCam-upload/packages/*.deb
+          path: packages/*.deb
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Upload dylib
+        uses: actions/upload-artifact@v4
+        with:
+          name: VCam-dylib
+          path: out/*.dylib
           if-no-files-found: error
           retention-days: 30

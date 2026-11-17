@@ -358,50 +358,20 @@ static volatile UInt64 g_audioOutFrames = 0;
 static volatile int g_audioBail = 0;
 static volatile int g_audioWriteOK = 0;
 
-// 上一块成功写给系统的音频数据。
-// 当这一轮拿不到新数据（seek 校正期间、解码器重启）时，
-// 用它填充而不是写静音 —— 静音会造成幅度突降到 0，听感是「啪」一声；
-// 延音保持幅度连续，140ms 的阻塞也听不出来。
+// ---- 音频处理说明 ----
+//
+//  实测这台机器上两侧格式完全不同：
+//    素材侧（AVAssetReader）  float32 / 单声道 / 48000 Hz / 每样本 4 字节
+//    系统侧（AudioUnit 采集）  int16   / 双声道 / 44100 Hz / 每帧 4 字节
+//                              formatFlags = 0xc = packed | signed int
+//
+//  所以必须做真正的重采样 + 位深转换 + 声道扩展。
+//  这部分逻辑现在全部在 VCAudioPipeline 的后台线程里完成，
+//  实时线程只从环形缓冲 memcpy —— 不在这里做任何转换。
 
-// ==================================================================
-#pragma mark - PCM 格式转换
-// ==================================================================
-//
-//  实测（2026-11-18）这台机器上两侧格式完全不同：
-//
-//    素材侧（AVAssetReader 解出来的）
-//      float32 / 单声道 / 48000 Hz / 每样本 4 字节
-//
-//    系统侧（AudioUnit input element 的 output scope）
-//      int16   / 双声道 / 44100 Hz / 每帧 4 字节
-//      formatFlags = 0xc = packed | signed integer
-//
-//  直接把 float 当 int16 塞进去，四个维度全错 —— 听感就是沙沙声。
-//  必须走 AudioConverter 做真正的重采样 + 位深转换 + 声道扩展。
-//
-//  目标格式不能在编译期写死：不同机型/音频会话下可能是 48k 或 44.1k、
-//  单声道或双声道。所以每次从 AudioUnitGetProperty 取实时的格式，
-//  格式变了就重建转换器。
-
-
-// AudioConverter 的喂数据上下文。
-//
-//  之前的实现每次都把整块数据从头返回、且永远 return noErr ——
-//  转换器需要更多数据时会重复拿到同一段，边界处就出错，
-//  听感是持续的低度杂音。
-//
-//  改成记录「已经喂到哪儿」，吃完返回 1 告诉转换器没数据了。
-//  同时 consumed 让我们知道转换器到底吃了多少源帧，
-//  消费 carry 时按实际值扣，不再按比例估算（估不准会累积漂移）。
-typedef struct {
-    const float *data;
-    size_t       totalFrames;
-    size_t       consumed;
-} VCConvCtx;
-
-
-// 音频写入逻辑已迁移到 VCAudioPipeline（生产者-消费者）。
-
+// 原始函数的保存点。fishhook 绑定成功后把原地址写到这里，
+// hook 内部必须先调它、再处理数据 —— 少这一行整个 hook 逻辑就崩了。
+static VC_AURender_FN orig_AudioUnitRender = NULL;
 
 static OSStatus hook_AudioUnitRender(AudioUnit unit,
                                      AudioUnitRenderActionFlags *flags,

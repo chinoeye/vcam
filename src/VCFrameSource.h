@@ -73,6 +73,9 @@ NS_ASSUME_NONNULL_BEGIN
 /// 用真实的输出帧数换算时间，才能和系统播放进度严格一致。
 @property (nonatomic, assign) double audioPlaybackSeconds;
 
+/// 音频 seek 校正的累计次数（诊断用，定义在 .m 里）。
+extern int g_vcSeekCount;
+
 /// 把音频轨道跳到视频当前所在的位置。
 /// 从「真麦」切到「素材」时必须调用，否则声音会从很久以前的地方接上。
 - (void)seekAudioToVideoTime;

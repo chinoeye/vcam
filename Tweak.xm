@@ -26,6 +26,9 @@
 #import <string.h>
 #import <objc/runtime.h>
 #import <mach-o/dyld.h>
+#import <mach-o/nlist.h>
+#import <mach-o/loader.h>
+#import <mach/vm_types.h>
 
 // ------------------------------------------------------------------ 工具
 
@@ -811,6 +814,96 @@ static void VCDumpLogAlert(void)
 //
 //  结果写文件 + 塞剪贴板，再弹窗提示。
 
+/// 列出某个镜像「导入了哪些外部符号」。
+///
+/// 这是判断一个 C/C++ framework 用什么系统 API 最直接的办法：
+/// byteaudio 没有 ObjC 类名（纯 C++），但它的 __la_symbol_ptr / __got
+/// 里存着它调用的每个系统函数名 —— AudioUnitRender 还是 AudioQueueNewInput，
+/// 一眼就能看出来，不用再逐个 hook 试探。
+static void VCDumpImageImports(const char *pathFragment, NSMutableString *out)
+{
+    if (!pathFragment || !out) return;
+
+    uint32_t n = _dyld_image_count();
+    for (uint32_t i = 0; i < n; i++) {
+        const char *nm = _dyld_get_image_name(i);
+        if (!nm || !strstr(nm, pathFragment)) continue;
+
+        const struct mach_header_64 *h =
+            (const struct mach_header_64 *)_dyld_get_image_header(i);
+        if (!h) continue;
+        intptr_t slide = _dyld_get_image_vmaddr_slide(i);
+
+        [out appendFormat:@"\n--- %s ---\n", nm];
+
+        // 找 __LINKEDIT / LC_SYMTAB / LC_DYSYMTAB
+        const struct symtab_command  *symtab  = NULL;
+        const struct dysymtab_command *dysym  = NULL;
+        uintptr_t linkeditVM = 0, linkeditOff = 0;
+
+        const struct load_command *cmd =
+            (const struct load_command *)(h + 1);
+        for (uint32_t c = 0; c < h->ncmds; c++) {
+            if (cmd->cmd == LC_SEGMENT_64) {
+                const struct segment_command_64 *seg =
+                    (const struct segment_command_64 *)cmd;
+                if (strncmp(seg->segname, "__LINKEDIT", 16) == 0) {
+                    linkeditVM  = seg->vmaddr;
+                    linkeditOff = seg->fileoff;
+                }
+            } else if (cmd->cmd == LC_SYMTAB) {
+                symtab = (const struct symtab_command *)cmd;
+            } else if (cmd->cmd == LC_DYSYMTAB) {
+                dysym = (const struct dysymtab_command *)cmd;
+            }
+            cmd = (const struct load_command *)((const char *)cmd + cmd->cmdsize);
+        }
+
+        if (!symtab || !dysym || !linkeditVM) {
+            [out appendString:@"  (找不到符号表)\n"];
+            continue;
+        }
+
+        intptr_t base = (intptr_t)(linkeditVM - linkeditOff) + slide;
+        const struct nlist_64 *syms = (const struct nlist_64 *)(base + symtab->symoff);
+        const char *strs = (const char *)(base + symtab->stroff);
+        const uint32_t *indirect = (const uint32_t *)(base + dysym->indirectsymoff);
+
+        // 只关心音频相关的导入
+        static const char *kw[] = { "Audio", "audio", "AURemote", "AudioUnit",
+                                     "AudioQueue", "AVAudio", "Mic", "PCM" };
+        int shown = 0;
+
+        // 直接扫 indirect symbol table 的全部条目
+        for (uint32_t idx = 0;
+             idx < dysym->nindirectsyms && shown < 60; idx++) {
+            uint32_t symIdx = indirect[idx];
+            if (symIdx == INDIRECT_SYMBOL_LOCAL || symIdx == INDIRECT_SYMBOL_ABS) continue;
+            if (symIdx >= symtab->nsyms) continue;
+
+            const struct nlist_64 *s = &syms[symIdx];
+            if (!s->n_un.n_strx) continue;
+
+            const char *name = strs + s->n_un.n_strx;
+            if (!name || !*name) continue;
+            if (*name == '_') name++;
+
+            BOOL hit = NO;
+            for (size_t k = 0; k < sizeof(kw) / sizeof(kw[0]); k++) {
+                if (strstr(name, kw[k])) { hit = YES; break; }
+            }
+            if (!hit) continue;
+
+            [out appendFormat:@"  %s\n", name];
+            shown++;
+        }
+
+        if (shown == 0) {
+            [out appendString:@"  (没有音频相关的导入符号)\n"];
+        }
+    }
+}
+
 static NSString *VCRunAudioDiagnosis(void)
 {
     NSMutableString *out = [NSMutableString string];
@@ -868,6 +961,10 @@ static NSString *VCRunAudioDiagnosis(void)
     free(classes);
 
     [out appendFormat:@"\n=== 共 %d 个音频相关类 ===\n", classHits];
+
+    // ---- 2.5 byteaudio 导入了哪些音频 API（最关键的证据）----
+    [out appendString:@"\n=== byteaudio 导入的音频符号 ===\n"];
+    VCDumpImageImports("byteaudio", out);
 
     // ---- 3. 只列 App 自己的镜像（系统库太多，会把报告撑爆）----
     [out appendString:@"\n=== App 内镜像 ===\n"];

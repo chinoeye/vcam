@@ -3,6 +3,7 @@
 //
 
 #import "VCOverlay.h"
+#import "VCAudioSource.h"
 #import "VCamConfig.h"
 #import "VCFrameSource.h"
 #import "VCLiveSource.h"
@@ -403,6 +404,7 @@ static UIWindow *gVCamPanelWindow = nil;
     NSError *err = nil;
     NSURL *url = [VCamConfig.shared assetURL];
     if (url && [[VCFrameSource shared] reloadWithURL:url error:&err]) {
+        [[VCAudioSource shared] loadURL:url error:NULL];
         VCLog(@"切素材: %@", name);
     } else {
         VCLog(@"切素材失败: %@", err);

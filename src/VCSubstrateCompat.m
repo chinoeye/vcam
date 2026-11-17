@@ -75,7 +75,7 @@ typedef struct section vc_section;
 #endif
 
 // 诊断：记录 scan 过的 section，报告里能直接看到漏了谁
-char g_vcScannedSections[4096] = {0};
+char g_vcScannedSections[65536] = {0};
 
 // 判断一个 section 是不是符号指针表。
 //
@@ -89,8 +89,13 @@ static BOOL vc_isPointerSection(const char *sectname)
     if (strncmp(sectname, SECT_LAZY_SYMBOL_POINTERS, 16) == 0) return YES;
     if (strncmp(sectname, SECT_NON_LAZY_SYMBOL_POINTERS, 16) == 0) return YES;
     if (strncmp(sectname, SECT_GOT_POINTERS, 16) == 0) return YES;
-    if (strstr(sectname, "got")) return YES;
+    // __bd_la_sym_ptr：字节跳动自定义的 lazy symbol pointer 段。
+    // byteaudio 这类自研库把导入符号放在这里，名字既不含 got 也不含
+    // symbol_ptr，之前的过滤条件把它整个跳过了 —— AudioUnitRender
+    // 很可能就在其中。
+    if (strstr(sectname, "sym_ptr")) return YES;
     if (strstr(sectname, "symbol_ptr")) return YES;
+    if (strstr(sectname, "got")) return YES;
     return NO;
 }
 #ifndef INDIRECT_SYMBOL_LOCAL
@@ -268,6 +273,20 @@ static void vc_rebind_image(vc_entry_t *e, const vc_mach_header *header, intptr_
 
 static void vc_image_added_cb(const struct mach_header *mh, intptr_t slide)
 {
+    // 诊断：按镜像分段记录。只记 App 自己带进来的库 ——
+    // 系统库有 400 多个，全记下来报告根本放不下。
+    Dl_info info;
+    if (dladdr(mh, &info) && info.dli_fname && strstr(info.dli_fname, "/Application/")) {
+        const char *slash = strrchr(info.dli_fname, '/');
+        const char *shortName = slash ? slash + 1 : info.dli_fname;
+        size_t used = strlen(g_vcScannedSections);
+        if (used < sizeof(g_vcScannedSections) - 200) {
+            snprintf(g_vcScannedSections + used,
+                     sizeof(g_vcScannedSections) - used,
+                     "\n[%s] ", shortName);
+        }
+    }
+
     vc_entry_t *e = g_entries;
     while (e) {
         vc_rebind_image(e, (const vc_mach_header *)mh, slide);

@@ -1104,9 +1104,8 @@ static NSString *VCRunAudioDiagnosis(void)
         [out appendFormat:@"实时取走帧数  : %llu\n", pipe.consumedFrames];
         [out appendFormat:@"缓冲存货帧数  : %zu\n", pipe.bufferedFrames];
         [out appendFormat:@"缓冲欠载次数  : %llu   (大于0说明后台供不上)\n", pipe.underrunCount];
-        [out appendFormat:@"当前音画偏差  : %+.0f ms   (5小时跑完看这个数)\n",
+        [out appendFormat:@"缓冲延迟      : %.0f ms   (300~800 正常，<100 说明生产跟不上)\n",
             pipe.currentDrift * 1000.0];
-        [out appendFormat:@"闭环校正次数  : %d   (偏差超100ms才会触发)\n", pipe.seekCount];
     }
     [out appendFormat:@"hook 填充次数 : %d\n", g_audioWriteOK];
     [out appendFormat:@"最近返回原因  : %d  (0=正常 1=Mic 2=Mute)\n", g_audioBail];

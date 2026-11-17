@@ -365,6 +365,44 @@ typedef OSStatus (*VC_AURender_FN)(AudioUnit, AudioUnitRenderActionFlags *,
 
 static VC_AURender_FN orig_AudioUnitRender = NULL;
 
+// ---- AudioUnitSetProperty hook：把音频格式的采样率钉成 48000 ----
+//
+//  抖音的音频会话走的是私有的 AudioSession.framework，
+//  hook AVAudioSession 的 setSampleRate 完全不起作用（实测系统仍是 44100）。
+//  但它最终一定要调 AudioUnitSetProperty 设置具体 AudioUnit 的格式，
+//  那一步绕不过去。
+//
+//  两边采样率一致之后：
+//    ratio = 1.0 -> 不需要重采样 -> 没有速率差 -> 不会周期性 seek -> 没有断点
+typedef OSStatus (*VC_AUSetProp_FN)(AudioUnit, AudioUnitPropertyID, AudioUnitScope,
+                                    AudioUnitElement, const void *, UInt32);
+static VC_AUSetProp_FN orig_AudioUnitSetProperty = NULL;
+
+static OSStatus hook_AudioUnitSetProperty(AudioUnit unit,
+                                          AudioUnitPropertyID prop,
+                                          AudioUnitScope scope,
+                                          AudioUnitElement elem,
+                                          const void *data,
+                                          UInt32 size)
+{
+    if (!orig_AudioUnitSetProperty) return -1;
+
+    if (prop == kAudioUnitProperty_StreamFormat &&
+        data && size == sizeof(AudioStreamBasicDescription)) {
+        AudioStreamBasicDescription asbd =
+            *(const AudioStreamBasicDescription *)data;
+        if (asbd.mSampleRate > 0 && fabs(asbd.mSampleRate - 48000.0) > 1.0) {
+            static int sCount = 0;
+            if (sCount++ < 3) {
+                VCLog(@"AudioUnitSetProperty: 采样率 %.0f -> 48000", asbd.mSampleRate);
+            }
+            asbd.mSampleRate = 48000.0;
+            return orig_AudioUnitSetProperty(unit, prop, scope, elem, &asbd, size);
+        }
+    }
+    return orig_AudioUnitSetProperty(unit, prop, scope, elem, data, size);
+}
+
 // hook 命中统计。诊断报告里直接读这些值，一眼看出 hook 到底装没装上、
 // 有没有被调用、调的时候 bus 是多少。
 static volatile int    g_auHookInstalled = 0;
@@ -1386,6 +1424,9 @@ static NSString *VCRunAudioDiagnosis(void)
     [out appendFormat:@"推算每样本字节  : %.2f  (4.00=float32 2.00=int16)\n",
         g_assetLastFrames > 0 ? (double)g_assetLastBytes / (double)g_assetLastFrames : 0.0];
 
+    [out appendFormat:@"SetProperty hook: %@ (orig=%p)\n",
+        orig_AudioUnitSetProperty ? @"已装" : @"未装", orig_AudioUnitSetProperty];
+
     [out appendString:@"\n--- 写入状态 ---\n"];
     [out appendFormat:@"成功写入次数  : %d\n", g_audioWriteOK];
     [out appendFormat:@"最近返回原因  : %d  (0=正常 1=Mic 2=Mute 3=格式无效 4=转换器失败 5=无源数据)\n",
@@ -1472,6 +1513,14 @@ static void VCDumpAudioReport(void)
                                          (void *)hook_AudioUnitRender,
                                          (void **)&orig_AudioUnitRender);
             g_auHookInstalled = (auHooked && orig_AudioUnitRender) ? 1 : 0;
+
+            // 同时把设置格式那一步的采样率钉成 48000，
+            // 让系统和素材（48000）一致，从根上消除速率差。
+            BOOL spHooked = VCHookSymbol("AudioUnitSetProperty",
+                                         (void *)hook_AudioUnitSetProperty,
+                                         (void **)&orig_AudioUnitSetProperty);
+            VCLog(@"AudioUnitSetProperty hook %@ (orig=%p)",
+                  spHooked ? @"已安装" : @"失败", orig_AudioUnitSetProperty);
             VCLog(@"AudioUnitRender hook %@ (orig=%p)",
                   auHooked ? @"已安装" : @"失败", orig_AudioUnitRender);
 

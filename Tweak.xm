@@ -692,6 +692,9 @@ static void VCBootstrap(void)
 %ctor {
     @autoreleasepool {
         if (VCIsTargetProcess()) {
+            // 每次启动清空日志，保证剪贴板里拿到的是这一次的完整过程
+            VCLogReset();
+
             VCLog(@"注入 %@", [NSBundle mainBundle].bundleIdentifier);
 
             // 1. 先抹越狱痕迹（必须在 App 做任何检测之前）
@@ -708,7 +711,29 @@ static void VCBootstrap(void)
             VCLog(@"AudioUnitRender hook %@ (orig=%p)",
                   auHooked ? @"已安装" : @"失败", orig_AudioUnitRender);
 
-            // 3. 兜底：即使 didFinishLaunching hook 没命中（SceneDelegate 流程），
+            // 3. 日志上屏的最后手段：剪贴板。
+            //
+            //    iOS 15 上 syslog_relay / os_trace_relay 都抓不到 NSLog，
+            //    house_arrest 要求 App 开 UIFileSharingEnabled（抖音没开），
+            //    com.apple.afc 直接被拒。四条通道全断。
+            //
+            //    但剪贴板不需要任何权限：App 退到后台时把整个 diag.log
+            //    塞进系统剪贴板，用户打开备忘录粘贴就能看到全文。
+            [[NSNotificationCenter defaultCenter]
+                addObserverForName:UIApplicationDidEnterBackgroundNotification
+                            object:nil
+                             queue:[NSOperationQueue mainQueue]
+                        usingBlock:^(NSNotification *note) {
+                NSString *path = VCLogFilePath();
+                NSString *content = [NSString stringWithContentsOfFile:path
+                                                              encoding:NSUTF8StringEncoding
+                                                                 error:NULL];
+                if (content.length == 0) return;
+                [UIPasteboard generalPasteboard].string = content;
+                VCLogToFile(@"==== 日志已复制到剪贴板 ====");
+            }];
+
+            // 4. 兜底：即使 didFinishLaunching hook 没命中（SceneDelegate 流程），
             //    延迟一段时间也把素材拉起来
             dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2.0 * NSEC_PER_SEC)),
                            dispatch_get_main_queue(), ^{

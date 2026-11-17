@@ -1,0 +1,10 @@
+Package: com.yg.vcam
+Name: VCam
+Version: 1.0.0
+Architecture: iphoneos-arm64
+Description: 摄像头硬改 —— 把 OBS 成片注入为 iPhone 后置摄像头画面，支持音频源切换与局域网实时源
+Maintainer: YG
+Author: YG
+Section: Tweaks
+Depends: ellekit (>= 1.0) | mobilesubstrate
+Tag: purpose::extension

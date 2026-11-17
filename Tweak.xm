@@ -344,8 +344,6 @@ static volatile UInt32 g_assetLastFrames    = 0;
 static volatile UInt32 g_assetLastBytes     = 0;
 static volatile int    g_assetProbed        = 0;
 
-// 已输出的目标采样帧数累计。用来算真实播放时间，避免按源样本数推算的速率偏差。
-static volatile UInt64 g_audioOutFrames = 0;
 
 // 音频写入每次提前返回的原因。
 // 报告里直接读，一眼看出卡在哪一步 —— 比猜省事。

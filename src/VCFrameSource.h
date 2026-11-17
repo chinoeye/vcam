@@ -65,6 +65,14 @@ NS_ASSUME_NONNULL_BEGIN
 /// 音频侧靠它对表，保证音画不会各跑各的。
 @property (nonatomic, readonly) NSTimeInterval currentVideoSourceTime;
 
+/// 音频实际已播放到的位置（秒），由外部每写完一块就更新。
+///
+/// 为什么需要它：音频输出的是 44100Hz，而内部按「已读样本数 / 48000」
+/// 推算时间 —— 两者相差 8.8%，偏差累积到 VC_AV_MAX_DRIFT 就 return nil，
+/// 上层补静音，听感是「每隔几秒断一下」。
+/// 用真实的输出帧数换算时间，才能和系统播放进度严格一致。
+@property (nonatomic, assign) double audioPlaybackSeconds;
+
 /// 把音频轨道跳到视频当前所在的位置。
 /// 从「真麦」切到「素材」时必须调用，否则声音会从很久以前的地方接上。
 - (void)seekAudioToVideoTime;

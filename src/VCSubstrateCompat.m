@@ -26,6 +26,7 @@
 #include <dlfcn.h>
 #include <stdbool.h>
 #include <stdlib.h>
+#include <stdio.h>
 #include <string.h>
 #include <sys/mman.h>
 #include <sys/types.h>
@@ -72,6 +73,26 @@ typedef struct section vc_section;
 #ifndef SECT_GOT_POINTERS
 #define SECT_GOT_POINTERS "__got"
 #endif
+
+// 诊断：记录 scan 过的 section，报告里能直接看到漏了谁
+char g_vcScannedSections[4096] = {0};
+
+// 判断一个 section 是不是符号指针表。
+//
+// 原来是硬匹配 __la_symbol_ptr / __nl_symbol_ptr 两个名字，
+// 结果 AudioUnitRender 既不在 __la 也不在 __got（这台机器的
+// byteaudio 把它放在别的 section 里），导致怎么都绑不上。
+// 现在放宽到名字里带 got / symbol_ptr 的一律处理。
+static BOOL vc_isPointerSection(const char *sectname)
+{
+    if (!sectname || !*sectname) return NO;
+    if (strncmp(sectname, SECT_LAZY_SYMBOL_POINTERS, 16) == 0) return YES;
+    if (strncmp(sectname, SECT_NON_LAZY_SYMBOL_POINTERS, 16) == 0) return YES;
+    if (strncmp(sectname, SECT_GOT_POINTERS, 16) == 0) return YES;
+    if (strstr(sectname, "got")) return YES;
+    if (strstr(sectname, "symbol_ptr")) return YES;
+    return NO;
+}
 #ifndef INDIRECT_SYMBOL_LOCAL
 #define INDIRECT_SYMBOL_LOCAL 0x80000000
 #endif
@@ -208,10 +229,18 @@ static void vc_rebind_image(vc_entry_t *e, const vc_mach_header *header, intptr_
         for (uint32_t k = 0; k < dataSeg->nsects; k++) {
             const vc_section *cs = &sec[k];
 
-            BOOL isLazy = (strncmp(cs->sectname, SECT_LAZY_SYMBOL_POINTERS, 16) == 0);
-            BOOL isNL   = (strncmp(cs->sectname, SECT_NON_LAZY_SYMBOL_POINTERS, 16) == 0)
-                       || (strncmp(cs->sectname, SECT_GOT_POINTERS, 16) == 0);
-            if (!isLazy && !isNL) continue;
+            // 诊断：把每个 section 都记下来，报告里能看出扫了什么
+            size_t used = strlen(g_vcScannedSections);
+            if (used < sizeof(g_vcScannedSections) - 80) {
+                snprintf(g_vcScannedSections + used,
+                         sizeof(g_vcScannedSections) - used,
+                         "%s/%s(%u)%s ",
+                         kPointerSegs[ds], cs->sectname,
+                         (unsigned)cs->size,
+                         vc_isPointerSection(cs->sectname) ? "*" : "");
+            }
+
+            if (!vc_isPointerSection(cs->sectname)) continue;
 
             uint32_t n = (uint32_t)(cs->size / sizeof(void *));
             for (uint32_t i = 0; i < n; i++) {

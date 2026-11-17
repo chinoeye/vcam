@@ -5,13 +5,16 @@
 #import "VCHide.h"
 #import "VCamConfig.h"
 #import "VCLog.h"
+#import "VCSubstrateCompat.h"
 
-#import <substrate.h>
 #import <UIKit/UIKit.h>
 #import <sys/stat.h>
 #import <unistd.h>
 #import <errno.h>
 #import <string.h>
+#import <stdlib.h>
+#import <mach-o/dyld.h>
+#import <dlfcn.h>
 
 // ------------------------------------------------------------------ 黑名单
 
@@ -189,6 +192,120 @@ static pid_t hook_fork(void)
     return -1;
 }
 
+// ==================================================================
+#pragma mark - dyld 镜像隐藏
+// ==================================================================
+//
+//  这是最容易被抓的一条：
+//  任何 App 都能用 _dyld_image_count() 遍历自己加载的所有动态库，
+//  一眼就能看到 /var/jb/.../VCam.dylib。
+//  标准做法是 hook 这几个函数，把越狱相关条目从列表里过滤掉。
+//
+//  注意：_dyld_get_image_name 和 _dyld_get_image_header 的索引必须
+//  经过同一套映射，否则调用方拿到的名字和 header 会对不上。
+
+static BOOL VCShouldHideImage(const char *name)
+{
+    if (!name) return NO;
+    if (strstr(name, "VCam.dylib"))  return YES;
+    if (strstr(name, "/var/jb/"))    return YES;
+    if (strstr(name, "MobileSubstrate")) return YES;
+    if (strstr(name, "TweakInject")) return YES;
+    if (strstr(name, "ElleKit"))     return YES;
+    if (strstr(name, "libhooker"))   return YES;
+    if (strstr(name, "Substrate"))   return YES;
+    if (strstr(name, "libsubstitute")) return YES;
+    return NO;
+}
+
+static uint32_t (*orig_dyld_image_count)(void);
+static const char *(*orig_dyld_get_image_name)(uint32_t);
+static const struct mach_header *(*orig_dyld_get_image_header)(uint32_t);
+
+static uint32_t hook_dyld_image_count(void)
+{
+    // MSHookFunction 替换过程中若被内部逻辑反调，orig 可能尚未赋值
+    if (!orig_dyld_image_count || !orig_dyld_get_image_name) return 0;
+
+    uint32_t total = orig_dyld_image_count();
+    uint32_t visible = 0;
+    for (uint32_t i = 0; i < total; i++) {
+        const char *n = orig_dyld_get_image_name(i);
+        if (!VCShouldHideImage(n)) visible++;
+    }
+    return visible;
+}
+
+/// 把"调用方看到的第 idx 个可见镜像"换算成"真实索引"，找不到返回 -1
+static int VCRealIndexFor(uint32_t idx)
+{
+    if (!orig_dyld_image_count || !orig_dyld_get_image_name) return -1;
+
+    uint32_t total = orig_dyld_image_count();
+    uint32_t visible = 0;
+    for (uint32_t i = 0; i < total; i++) {
+        const char *n = orig_dyld_get_image_name(i);
+        if (VCShouldHideImage(n)) continue;
+        if (visible == idx) return (int)i;
+        visible++;
+    }
+    return -1;
+}
+
+static const char *hook_dyld_get_image_name(uint32_t idx)
+{
+    if (!orig_dyld_get_image_name) return NULL;
+    int real = VCRealIndexFor(idx);
+    if (real < 0) return NULL;
+    return orig_dyld_get_image_name((uint32_t)real);
+}
+
+static const struct mach_header *hook_dyld_get_image_header(uint32_t idx)
+{
+    if (!orig_dyld_get_image_header) return NULL;
+    int real = VCRealIndexFor(idx);
+    if (real < 0) return NULL;
+    return orig_dyld_get_image_header((uint32_t)real);
+}
+
+static int (*orig_dladdr)(const void *, Dl_info *);
+static int hook_dladdr(const void *addr, Dl_info *info)
+{
+    if (!orig_dladdr) return 0;
+    int r = orig_dladdr(addr, info);
+    if (r != 0 && info && info->dli_fname && VCShouldHideImage(info->dli_fname)) {
+        // 查询到的是我们的 dylib：伪装成系统库，抹掉符号信息
+        info->dli_fname = "/usr/lib/libSystem.B.dylib";
+        info->dli_sname = NULL;
+        info->dli_saddr = NULL;
+    }
+    return r;
+}
+
+/// ObjC 运行时也有一条独立路径能列出镜像名
+static const char **(*orig_objc_copyImageNames)(unsigned int *);
+static const char **hook_objc_copyImageNames(unsigned int *outCount)
+{
+    if (!orig_objc_copyImageNames) return NULL;
+    const char **names = orig_objc_copyImageNames(outCount);
+    if (!names || !outCount) return names;
+
+    unsigned int total = *outCount;
+    unsigned int visible = 0;
+
+    // 原地压缩：把要隐藏的条目往后挪，最后返回时截断计数
+    const char **kept = (const char **)malloc(sizeof(char *) * (total + 1));
+    if (!kept) return names;
+    for (unsigned int i = 0; i < total; i++) {
+        if (!VCShouldHideImage(names[i])) {
+            kept[visible++] = names[i];
+        }
+    }
+    kept[visible] = NULL;
+    *outCount = visible;
+    return kept;
+}
+
 // ------------------------------------------------------------------ 安装
 
 + (void)installHooks
@@ -216,12 +333,28 @@ static pid_t hook_fork(void)
                         (IMP)&hook_canOpenURL,
                         (IMP *)&orig_canOpenURL);
 
-        MSHookFunction((void *)access, (void *)hook_access, (void **)&orig_access);
-        MSHookFunction((void *)stat,   (void *)hook_stat,   (void **)&orig_stat);
-        MSHookFunction((void *)lstat,  (void *)hook_lstat,  (void **)&orig_lstat);
-        MSHookFunction((void *)fork,   (void *)hook_fork,   (void **)&orig_fork);
+        // ---- C 函数：按符号名重绑定 ----
+        // 不再用 MSHookFunction —— TrollStore 环境没有 substrate。
+        // stat/lstat 在 64 位 iOS 上导出的名字带 $INODE64 后缀，两个都挂上。
+        VCSymbolHook symHooks[] = {
+            { "access",                 (void *)hook_access,                 (void **)&orig_access },
+            { "stat",                   (void *)hook_stat,                   (void **)&orig_stat },
+            { "stat$INODE64",           (void *)hook_stat,                   (void **)&orig_stat },
+            { "lstat",                  (void *)hook_lstat,                  (void **)&orig_lstat },
+            { "lstat$INODE64",          (void *)hook_lstat,                  (void **)&orig_lstat },
+            { "fork",                   (void *)hook_fork,                   (void **)&orig_fork },
 
-        VCLog(@"越狱痕迹隐藏已安装");
+            // dyld 镜像隐藏
+            { "_dyld_image_count",      (void *)hook_dyld_image_count,       (void **)&orig_dyld_image_count },
+            { "_dyld_get_image_name",   (void *)hook_dyld_get_image_name,    (void **)&orig_dyld_get_image_name },
+            { "_dyld_get_image_header", (void *)hook_dyld_get_image_header,  (void **)&orig_dyld_get_image_header },
+            { "dladdr",                 (void *)hook_dladdr,                 (void **)&orig_dladdr },
+            { "objc_copyImageNames",    (void *)hook_objc_copyImageNames,    (void **)&orig_objc_copyImageNames },
+            { NULL, NULL, NULL }
+        };
+        VCHookSymbols(symHooks);
+
+        VCLog(@"越狱痕迹隐藏已安装（路径 + dyld 镜像，无 substrate 依赖）");
     });
 }
 

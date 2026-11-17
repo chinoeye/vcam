@@ -358,6 +358,9 @@ static volatile UInt32 g_assetLastFrames    = 0;
 static volatile UInt32 g_assetLastBytes     = 0;
 static volatile int    g_assetProbed        = 0;
 
+// 已输出的目标采样帧数累计。用来算真实播放时间，避免按源样本数推算的速率偏差。
+static volatile UInt64 g_audioOutFrames = 0;
+
 // ==================================================================
 #pragma mark - PCM 格式转换
 // ==================================================================
@@ -654,6 +657,15 @@ static void VCRewriteAudioBufferList(AudioBufferList *ioData, UInt32 frames)
                              withBytes:NULL
                                 length:0];
         }
+
+        // ---- 回报真实播放进度 ----
+        // 用实际输出的帧数换算，而不是源样本数 —— 这是消除周期性断音的关键。
+        // 源 48k、目标 44.1k，用源算会差 8.8%，几秒就撞阈值。
+        g_audioOutFrames += outPackets;
+        VCamConfig *cfgRef = VCamConfig.shared;
+        (void)cfgRef;
+        [VCFrameSource shared].audioPlaybackSeconds =
+            (double)g_audioOutFrames / dst.mSampleRate;
     } @finally {
         [carryLock unlock];
     }

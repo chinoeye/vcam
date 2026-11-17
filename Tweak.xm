@@ -6,6 +6,7 @@
 //  新增 App 只需要往 VCam.plist 的 Filter.Bundles 里加 bundle id。
 //
 
+#include <dlfcn.h>   // dlsym / RTLD_NEXT
 #import <Foundation/Foundation.h>
 #import <UIKit/UIKit.h>
 #import <AVFoundation/AVFoundation.h>

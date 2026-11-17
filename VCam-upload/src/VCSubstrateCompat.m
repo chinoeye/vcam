@@ -41,6 +41,27 @@ typedef struct section vc_section;
 
 #define VC_MAX_REBIND 32
 
+// iOS SDK 的 <mach-o/loader.h> 没有导出 SEG_* / SECT_* 这批宏
+// （它们在 macOS SDK 里才有），所以自己定义，避免 use of undeclared identifier。
+#ifndef SEG_LINKEDIT
+#define SEG_LINKEDIT "__LINKEDIT"
+#endif
+#ifndef SEG_DATA
+#define SEG_DATA "__DATA"
+#endif
+#ifndef SECT_LAZY_SYMBOL_POINTERS
+#define SECT_LAZY_SYMBOL_POINTERS "__la_symbol_ptr"
+#endif
+#ifndef SECT_NON_LAZY_SYMBOL_POINTERS
+#define SECT_NON_LAZY_SYMBOL_POINTERS "__nl_symbol_ptr"
+#endif
+#ifndef INDIRECT_SYMBOL_LOCAL
+#define INDIRECT_SYMBOL_LOCAL 0x80000000
+#endif
+#ifndef INDIRECT_SYMBOL_ABS
+#define INDIRECT_SYMBOL_ABS 0x40000000
+#endif
+
 // ==================================================================
 #pragma mark - MSHookMessageEx
 // ==================================================================

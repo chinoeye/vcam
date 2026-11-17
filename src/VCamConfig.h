@@ -63,4 +63,21 @@ typedef NS_ENUM(NSInteger, VCAudioMode) {
 
 @end
 
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+/// 把一行诊断日志回传到电脑（pc/serve_assets.py 的 /vcam-log 端点）。
+///
+/// 为什么需要它：真机沙盒里的 NSLog 电脑根本看不到，爱思助手的实时日志
+/// 又不落盘 —— 出问题时等于两眼一抹黑。这里让 dylib 直接把自己看到的
+/// 情况发回电脑，落在 pc/vcam-device.log 里。
+///
+/// 内部异步发送，任何线程都能调，不会阻塞调用方。
+void VCRemoteLog(NSString *fmt, ...) NS_FORMAT_FUNCTION(1, 2);
+
+#ifdef __cplusplus
+}
+#endif
+
 #endif /* VCamConfig_h */

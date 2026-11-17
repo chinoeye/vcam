@@ -137,7 +137,7 @@
                 AVLinearPCMBitDepthKey: @32,
                 AVLinearPCMIsFloatKey: @YES,
                 AVLinearPCMIsBigEndianKey: @NO,
-                AVLinearPCMIsNonInterleaved: @NO,
+                AVLinearPCMIsNonInterleavedKey: @NO,   // 必须带 Key 后缀，否则整个 outputSettings 会被判无效
                 AVSampleRateKey: @48000,
                 AVNumberOfChannelsKey: @1,
             };
@@ -408,7 +408,7 @@
         AVLinearPCMBitDepthKey: @32,
         AVLinearPCMIsFloatKey: @YES,
         AVLinearPCMIsBigEndianKey: @NO,
-        AVLinearPCMIsNonInterleaved: @NO,
+        AVLinearPCMIsNonInterleavedKey: @NO,   // 必须带 Key 后缀，否则整个 outputSettings 会被判无效
         AVSampleRateKey: @48000,
         AVNumberOfChannelsKey: @1,
     };
@@ -452,7 +452,7 @@
             AVLinearPCMBitDepthKey: @32,
             AVLinearPCMIsFloatKey: @YES,
             AVLinearPCMIsBigEndianKey: @NO,
-            AVLinearPCMIsNonInterleaved: @NO,
+            AVLinearPCMIsNonInterleavedKey: @NO,   // 必须带 Key 后缀，否则整个 outputSettings 会被判无效
             AVSampleRateKey: @48000,
             AVNumberOfChannelsKey: @1,
         };

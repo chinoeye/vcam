@@ -32,6 +32,15 @@ NS_ASSUME_NONNULL_BEGIN
 /// 移除所有覆盖层（关闭注入时）
 + (void)detachAll;
 
+/// 隐藏/显示所有覆盖层，但**保留** layer 对象。
+///
+/// 为什么需要这个：AVSampleBufferDisplayLayer 是 opaque 的全屏层，
+/// 即使不往里推帧，它仍然要参与 GPU 合成 —— 相当于凭空多合成一整屏。
+/// 关闭注入时必须把它 hidden 掉，否则「不注入也卡」。
+/// 用 hidden 而不是 detachAll，是为了重新开注入时能立刻恢复，
+/// 不用等 App 下次 setSession:。
++ (void)setOverlaysHidden:(BOOL)hidden;
+
 /// 显示悬浮控制面板
 + (void)installPanelIfNeeded;
 

@@ -30,9 +30,16 @@
 // 环形缓冲容量。
 //
 //  这个值**直接等于音频延迟**：缓冲里存多少，声音就比画面晚多少。
-//  1 秒（48000 帧）延迟太大，直播时口型对不上；200ms（9600 帧）
-//  既能扛住解码抖动，延迟又可以接受。
-static const size_t kRingFrames = 9600;
+//
+//  取 400ms（19200 帧）的实测依据：
+//    · copyNextAudioPCM 和视频解码共用 VCFrameSource 的锁，
+//      视频解码忙的时候音频生产会被挡，单次可能耗时 20~30ms
+//    · 定时器 10ms 一次，被拖慢后实际间隔可能翻倍
+//    · 消费侧 1024 帧/21ms = 48.8 帧/ms
+//      → 30ms 的生产间隔要吃掉 1464 帧存货
+//      → 万一连续两次被挡就要 3000 帧
+//    200ms（9600 帧）余量太薄，实测欠载率 20%；400ms 有 4 倍余量。
+static const size_t kRingFrames = 19200;
 
 // ------------------------------------------------------------------ 转换输入回调
 
@@ -218,10 +225,12 @@ static OSStatus VCPipeInputProc(AudioConverterRef cvt,
     _running = YES;
 
     _timer = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0, _queue);
+    // 5ms 一次而不是 10ms：单次生产被视频解码挡住时，
+    // 靠更高的触发频率把产量补回来。
     dispatch_source_set_timer(_timer,
                               dispatch_time(DISPATCH_TIME_NOW, 0),
-                              10 * NSEC_PER_MSEC,
-                              2 * NSEC_PER_MSEC);
+                              5 * NSEC_PER_MSEC,
+                              1 * NSEC_PER_MSEC);
 
     __weak typeof(self) weakSelf = self;
     dispatch_source_set_event_handler(_timer, ^{
@@ -270,7 +279,9 @@ static OSStatus VCPipeInputProc(AudioConverterRef cvt,
     // 水位控制：低于 50% 就补到接近满。
     // 之前是「余量小于 2048 就完全不干活」，结果缓冲长期在低位徘徊，
     // 消费端一不小心就取空 —— 听感是密集的咔哒（打电报）。
-    if (count >= kRingFrames * 9 / 10) return;      // 已经够满，别占 CPU
+    // 只补到 70% 水位就停手：留 30% 的余量给定时器抖动，
+    // 比「补到接近满才停」更能应付突发的慢一次。
+    if (count >= kRingFrames * 7 / 10) return;
     size_t freeFrames = kRingFrames - count;
 
     // 一次最多补 0.5 秒，别长时间占着后台队列

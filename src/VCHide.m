@@ -407,6 +407,39 @@ static const char **hook_objc_copyImageNames(unsigned int *outCount)
         VCBlockedBuild();
         if (!gImageMapLock) gImageMapLock = [[NSLock alloc] init];
 
+        // ==========================================================
+        // 第一部分：dyld 镜像隐藏 —— **始终安装**
+        //
+        // TrollFools 注入改的是 App 主二进制，VCam.dylib 会出现在
+        // _dyld_image_count() 的列表里。不藏起来，App 一条
+        // dyld_image_count 就能发现多了一个来路不明的库。
+        // 这层跟越狱没关系，任何注入方式都需要。
+        // ==========================================================
+        VCSymbolHook imageHooks[] = {
+            { "_dyld_image_count",      (void *)hook_dyld_image_count,       (void **)&orig_dyld_image_count },
+            { "_dyld_get_image_name",   (void *)hook_dyld_get_image_name,    (void **)&orig_dyld_get_image_name },
+            { "_dyld_get_image_header", (void *)hook_dyld_get_image_header,  (void **)&orig_dyld_get_image_header },
+            { "dladdr",                 (void *)hook_dladdr,                 (void **)&orig_dladdr },
+            { "objc_copyImageNames",    (void *)hook_objc_copyImageNames,    (void **)&orig_objc_copyImageNames },
+            { NULL, NULL, NULL }
+        };
+        VCHookSymbols(imageHooks);
+        VCLog(@"dyld 镜像隐藏已安装（映射缓存 %u 条可见镜像）", gImageMapCount);
+
+        // ==========================================================
+        // 第二部分：路径遮蔽 —— **只在越狱环境下才装**
+        //
+        // stat / lstat / access 是 App 运行期调用量最大的三个系统调用，
+        // hook 它们等于给每一次文件操作都套一遍路径匹配。
+        // 越狱解除后系统里根本没有 /var/jb 可藏，这层纯属负担，
+        // 所以默认关闭（见 VCamConfig.applyDefaults 里 hideJailbreak = NO）。
+        // 真要重新越狱了，把那个默认值改回 YES 即可。
+        // ==========================================================
+        if (!VCamConfig.shared.hideJailbreak) {
+            VCLog(@"路径遮蔽已跳过（hideJailbreak=NO，当前没有越狱环境可藏）");
+            return;
+        }
+
         MSHookMessageEx([NSFileManager class],
                         @selector(fileExistsAtPath:),
                         (IMP)&hook_fileExistsAtPath,
@@ -430,26 +463,18 @@ static const char **hook_objc_copyImageNames(unsigned int *outCount)
         // ---- C 函数：按符号名重绑定 ----
         // 不再用 MSHookFunction —— TrollStore 环境没有 substrate。
         // stat/lstat 在 64 位 iOS 上导出的名字带 $INODE64 后缀，两个都挂上。
-        VCSymbolHook symHooks[] = {
+        VCSymbolHook pathHooks[] = {
             { "access",                 (void *)hook_access,                 (void **)&orig_access },
             { "stat",                   (void *)hook_stat,                   (void **)&orig_stat },
             { "stat$INODE64",           (void *)hook_stat,                   (void **)&orig_stat },
             { "lstat",                  (void *)hook_lstat,                  (void **)&orig_lstat },
             { "lstat$INODE64",          (void *)hook_lstat,                  (void **)&orig_lstat },
             { "fork",                   (void *)hook_fork,                   (void **)&orig_fork },
-
-            // dyld 镜像隐藏
-            { "_dyld_image_count",      (void *)hook_dyld_image_count,       (void **)&orig_dyld_image_count },
-            { "_dyld_get_image_name",   (void *)hook_dyld_get_image_name,    (void **)&orig_dyld_get_image_name },
-            { "_dyld_get_image_header", (void *)hook_dyld_get_image_header,  (void **)&orig_dyld_get_image_header },
-            { "dladdr",                 (void *)hook_dladdr,                 (void **)&orig_dladdr },
-            { "objc_copyImageNames",    (void *)hook_objc_copyImageNames,    (void **)&orig_objc_copyImageNames },
             { NULL, NULL, NULL }
         };
-        VCHookSymbols(symHooks);
+        VCHookSymbols(pathHooks);
 
-        VCLog(@"越狱痕迹隐藏已安装：%zu 条黑名单（纯 C 匹配），dyld 映射已缓存",
-              gBlockedCount);
+        VCLog(@"路径遮蔽已安装：%zu 条黑名单（纯 C 匹配）", gBlockedCount);
     });
 }
 

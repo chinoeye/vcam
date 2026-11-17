@@ -998,6 +998,11 @@ static NSString *VCRunAudioDiagnosis(void)
     [out appendFormat:@"audioMode         : %ld  (0=真麦 1=素材 2=静音)\n",
         (long)VCamConfig.shared.audioMode];
 
+    // ---- 2.45 hook 扫描过哪些 section（排查绑不上的原因）----
+    [out appendString:@"\n=== 扫描过的 section ===\n"];
+    extern char g_vcScannedSections[4096];
+    [out appendFormat:@"%s\n", g_vcScannedSections];
+
     // ---- 2.5 byteaudio 导入了哪些音频 API（最关键的证据）----
     [out appendString:@"\n=== byteaudio 导入的音频符号 ===\n"];
     VCDumpImageImports("byteaudio", out);

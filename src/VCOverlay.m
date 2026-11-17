@@ -73,6 +73,30 @@ static UIWindow *gVCamPanelWindow = nil;
     CGPoint _ballHome;
 }
 
+// ------------------------------------------------------------------
+//  触摸穿透
+//
+//  悬浮面板是一个全屏透明 UIWindow（windowLevel = Alert + 100）。
+//  iOS 的触摸事件只会分发给**最上层命中的那个 window**，不会往下传。
+//  只要这个 window 的 rootView 还接受触摸（userInteractionEnabled 默认 YES），
+//  整个屏幕的每一次点击、滑动都会被它吃掉，下面的 App 一个事件都收不到。
+//
+//  在抖音里的表现：
+//    · 视频照播（不需要触摸）
+//    · 手指一滑动，界面就僵住不动 —— 用户说的"卡"
+//    · 点链接没反应，反复点，看起来像"加载慢"
+//    · 跟「注入」开关完全无关，因为面板一直都在
+//
+//  修法：只有悬浮球和展开的面板算我们的，其余区域一律返回 nil 穿透。
+//  hidden 的子视图本来就不参与 hitTest，所以面板收起时自动只剩球。
+// ------------------------------------------------------------------
+- (UIView *)hitTest:(CGPoint)point withEvent:(UIEvent *)event
+{
+    UIView *hit = [super hitTest:point withEvent:event];
+    if (hit == self.view) return nil;   // 空白区域 → 放行给下层 App
+    return hit;
+}
+
 - (void)viewDidLoad
 {
     [super viewDidLoad];

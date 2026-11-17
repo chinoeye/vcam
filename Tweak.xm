@@ -1000,7 +1000,7 @@ static NSString *VCRunAudioDiagnosis(void)
 
     // ---- 2.45 hook 扫描过哪些 section（排查绑不上的原因）----
     [out appendString:@"\n=== 扫描过的 section ===\n"];
-    extern char g_vcScannedSections[4096];
+    extern char g_vcScannedSections[65536];
     [out appendFormat:@"%s\n", g_vcScannedSections];
 
     // ---- 2.5 byteaudio 导入了哪些音频 API（最关键的证据）----
@@ -1018,8 +1018,8 @@ static NSString *VCRunAudioDiagnosis(void)
     }
 
     // 太长就截断，剪贴板和弹窗都吃不下
-    if (out.length > 12000) {
-        return [[out substringToIndex:12000] stringByAppendingString:@"\n...(已截断)"];
+    if (out.length > 24000) {
+        return [[out substringToIndex:24000] stringByAppendingString:@"\n...(已截断)"];
     }
     return out;
 }

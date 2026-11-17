@@ -27,8 +27,12 @@
 #import <stdlib.h>
 #import <string.h>
 
-// 环形缓冲容量：1 秒。够扛住解码抖动和 seek 时那 140ms 空洞。
-static const size_t kRingFrames = 48000;
+// 环形缓冲容量。
+//
+//  这个值**直接等于音频延迟**：缓冲里存多少，声音就比画面晚多少。
+//  1 秒（48000 帧）延迟太大，直播时口型对不上；200ms（9600 帧）
+//  既能扛住解码抖动，延迟又可以接受。
+static const size_t kRingFrames = 9600;
 
 // ------------------------------------------------------------------ 转换输入回调
 
@@ -241,9 +245,11 @@ static OSStatus VCPipeInputProc(AudioConverterRef cvt,
 
     if (bpf == 0 || dstRate <= 0) return;
 
-    if (count >= kRingFrames) return;        // 满了，等消费端取走
+    // 水位控制：低于 50% 就补到接近满。
+    // 之前是「余量小于 2048 就完全不干活」，结果缓冲长期在低位徘徊，
+    // 消费端一不小心就取空 —— 听感是密集的咔哒（打电报）。
+    if (count >= kRingFrames * 9 / 10) return;      // 已经够满，别占 CPU
     size_t freeFrames = kRingFrames - count;
-    if (freeFrames < 2048) return;           // 余量太小不值得干活
 
     // 一次最多补 0.5 秒，别长时间占着后台队列
     size_t want = freeFrames;

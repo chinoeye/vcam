@@ -194,6 +194,8 @@ static BOOL hook_isReadableFile(id self, SEL _cmd, NSString *path)
     return orig_isReadableFile(self, _cmd, path);
 }
 
+static BOOL (*orig_canOpenURL)(id, SEL, NSURL *);
+
 // 每次调用都 [NSSet setWithObjects:] 会分配 7 个对象 —— 改成一次性常量。
 static BOOL hook_canOpenURL(id self, SEL _cmd, NSURL *url)
 {

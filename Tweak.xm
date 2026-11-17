@@ -333,6 +333,17 @@ static volatile UInt32 g_auLastFrames    = 0;
 static volatile UInt32 g_auLastBuffers   = 0;
 static volatile UInt32 g_auLastChannels  = 0;
 static volatile UInt32 g_auLastBytes     = 0;
+static volatile uintptr_t g_auFirstUnit  = 0;      // 第一个 AudioUnit 实例
+static volatile int    g_auUnitSwitches  = 0;      // 换过几个不同实例
+static volatile UInt32 g_auMinFrames     = 0xFFFFFFFF;
+static volatile UInt32 g_auMaxFrames     = 0;
+static volatile double g_auSumFrames     = 0;
+static volatile UInt32 g_auSysSampleRate = 0;      // 系统实际采样率
+static volatile UInt32 g_auSysChannels   = 0;
+static volatile UInt32 g_auSysBits       = 0;
+static volatile UInt32 g_auSysFlags      = 0;
+static volatile UInt32 g_auSysBytesPerFrame = 0;
+static volatile int    g_auAsbdProbed    = 0;
 
 static void VCRewriteAudioBufferList(AudioBufferList *ioData, UInt32 frames)
 {
@@ -408,6 +419,39 @@ static OSStatus hook_AudioUnitRender(AudioUnit unit,
     if (!orig_AudioUnitRender) return -1;
 
     g_auRenderHits++;
+
+    // 记录 AudioUnit 实例：如果换过实例，说明抖音开了多条音频通路
+    if (g_auFirstUnit == 0) {
+        g_auFirstUnit = (uintptr_t)unit;
+    } else if ((uintptr_t)unit != g_auFirstUnit) {
+        g_auUnitSwitches++;
+    }
+
+    // 帧数分布：判断是不是变长 buffer
+    if (frames < g_auMinFrames) g_auMinFrames = frames;
+    if (frames > g_auMaxFrames) g_auMaxFrames = frames;
+    g_auSumFrames += (double)frames;
+
+    // 只查一次系统音频格式 —— 采样率对不上会导致变速、变调、沙沙声
+    if (!g_auAsbdProbed) {
+        AudioStreamBasicDescription asbd;
+        UInt32 sz = sizeof(asbd);
+        OSStatus r = AudioUnitGetProperty(unit,
+                                          kAudioUnitProperty_StreamFormat,
+                                          kAudioUnitScope_Input,
+                                          bus,
+                                          &asbd,
+                                          &sz);
+        if (r == noErr) {
+            g_auAsbdProbed    = 1;
+            g_auSysSampleRate = (UInt32)asbd.mSampleRate;
+            g_auSysChannels   = asbd.mChannelsPerFrame;
+            g_auSysBits       = asbd.mBitsPerChannel;
+            g_auSysFlags      = asbd.mFormatFlags;
+            g_auSysBytesPerFrame = asbd.mBytesPerFrame;
+        }
+    }
+
     g_auLastBus      = bus;
     g_auLastFrames   = frames;
     g_auLastBuffers  = ioData ? ioData->mNumberBuffers : 0;
@@ -849,6 +893,7 @@ static void VCDumpLogAlert(void)
 /// byteaudio 没有 ObjC 类名（纯 C++），但它的 __la_symbol_ptr / __got
 /// 里存着它调用的每个系统函数名 —— AudioUnitRender 还是 AudioQueueNewInput，
 /// 一眼就能看出来，不用再逐个 hook 试探。
+__attribute__((unused))
 static void VCDumpImageImports(const char *pathFragment, NSMutableString *out)
 {
     if (!pathFragment || !out) return;
@@ -937,98 +982,41 @@ static NSString *VCRunAudioDiagnosis(void)
 {
     NSMutableString *out = [NSMutableString string];
 
-    // ---- 1. 音频相关类（放最前面，这是最要紧的信息）----
-    [out appendString:@"=== 音频相关类 ===\n"];
-    unsigned int clsCount = 0;
-    Class *classes = objc_copyClassList(&clsCount);
+    // 精简版：只留判断依据。
+    // 类名列表、section 扫描记录、镜像清单这些一次性排查用的内容
+    // 已经完成使命，留着只会让人复制不动。
+    [out appendString:@"=== VCam 音频诊断 ===\n\n"];
 
-    NSArray<NSString *> *classKw = @[@"Audio", @"audio", @"Mic", @"Voice",
-                                     @"Record", @"Capture", @"PCM", @"Sound",
-                                     @"Unit", @"Speaker", @"TTM"];
-    NSArray<NSString *> *methodKw = @[@"capture", @"Capture", @"render", @"Render",
-                                      @"tap", @"Tap", @"record", @"Record",
-                                      @"output", @"Output", @"input", @"Input"];
+    [out appendFormat:@"hook 已安装   : %@\n", g_auHookInstalled ? @"是" : @"否"];
+    [out appendFormat:@"orig          : %p\n", orig_AudioUnitRender];
+    [out appendFormat:@"调用次数      : %d\n", g_auRenderHits];
+    [out appendFormat:@"bus==1 次数   : %d\n", g_auBus1Hits];
+    [out appendFormat:@"最近 bus      : %u\n", (unsigned)g_auLastBus];
+    [out appendFormat:@"frames 最小/最大 : %u / %u\n",
+        (unsigned)(g_auMinFrames == 0xFFFFFFFF ? 0 : g_auMinFrames),
+        (unsigned)g_auMaxFrames];
+    [out appendFormat:@"frames 平均   : %.1f\n",
+        g_auRenderHits > 0 ? g_auSumFrames / g_auRenderHits : 0.0];
+    [out appendFormat:@"buffers       : %u\n", (unsigned)g_auLastBuffers];
+    [out appendFormat:@"声道数        : %u\n", (unsigned)g_auLastChannels];
+    [out appendFormat:@"字节数        : %u\n", (unsigned)g_auLastBytes];
 
-    int classHits = 0;
-    for (unsigned int i = 0; i < clsCount; i++) {
-        NSString *cn = NSStringFromClass(classes[i]);
-        if (cn.length == 0) continue;
+    [out appendString:@"\n--- 系统音频格式 ---\n"];
+    [out appendFormat:@"采样率        : %u Hz\n", (unsigned)g_auSysSampleRate];
+    [out appendFormat:@"声道          : %u\n", (unsigned)g_auSysChannels];
+    [out appendFormat:@"位深          : %u bit\n", (unsigned)g_auSysBits];
+    [out appendFormat:@"formatFlags   : 0x%x\n", (unsigned)g_auSysFlags];
+    [out appendFormat:@"bytesPerFrame : %u\n", (unsigned)g_auSysBytesPerFrame];
 
-        BOOL hit = NO;
-        for (NSString *k in classKw) {
-            if ([cn containsString:k]) { hit = YES; break; }
-        }
-        if (!hit) continue;
+    [out appendString:@"\n--- 音频实例 ---\n"];
+    [out appendFormat:@"首个实例      : 0x%lx\n", (unsigned long)g_auFirstUnit];
+    [out appendFormat:@"实例切换      : %d\n", g_auUnitSwitches];
 
-        // 只关心抖音和第三方 SDK，跳过苹果系统类
-        if ([cn hasPrefix:@"NS"] || [cn hasPrefix:@"UI"] ||
-            [cn hasPrefix:@"AV"] || [cn hasPrefix:@"CA"] ||
-            [cn hasPrefix:@"CF"] || [cn hasPrefix:@"__"]) {
-            continue;
-        }
+    [out appendString:@"\n--- 配置 ---\n"];
+    [out appendFormat:@"audioMode     : %ld\n", (long)VCamConfig.shared.audioMode];
+    [out appendFormat:@"已注入帧数    : %lu\n",
+        (unsigned long)[VCFrameSource shared].frameCount];
 
-        classHits++;
-        if (classHits > 80) break;   // 防止报告爆炸
-
-        [out appendFormat:@"\n[%@]\n", cn];
-
-        unsigned int mc = 0;
-        Method *methods = class_copyMethodList(classes[i], &mc);
-        int shown = 0;
-        for (unsigned int j = 0; j < mc && shown < 24; j++) {
-            NSString *sn = NSStringFromSelector(method_getName(methods[j]));
-            BOOL mhit = NO;
-            for (NSString *k in methodKw) {
-                if ([sn containsString:k]) { mhit = YES; break; }
-            }
-            if (!mhit) continue;
-            [out appendFormat:@"  - %@\n", sn];
-            shown++;
-        }
-        free(methods);
-    }
-    free(classes);
-
-    [out appendFormat:@"\n=== 共 %d 个音频相关类 ===\n", classHits];
-
-    // ---- 2.4 AudioUnit hook 运行状态（决定性）----
-    [out appendString:@"\n=== AudioUnitRender hook 状态 ===\n"];
-    [out appendFormat:@"已安装            : %@\n",
-        g_auHookInstalled ? @"是" : @"否（fishhook 没绑上）"];
-    [out appendFormat:@"orig 指针         : %p\n", orig_AudioUnitRender];
-    [out appendFormat:@"被调用次数        : %d\n", g_auRenderHits];
-    [out appendFormat:@"其中 bus==1 次数  : %d\n", g_auBus1Hits];
-    [out appendFormat:@"最近一次 bus      : %u\n", (unsigned)g_auLastBus];
-    [out appendFormat:@"最近一次 frames   : %u\n", (unsigned)g_auLastFrames];
-    [out appendFormat:@"最近一次 buffers  : %u\n", (unsigned)g_auLastBuffers];
-    [out appendFormat:@"最近一次 声道数   : %u\n", (unsigned)g_auLastChannels];
-    [out appendFormat:@"最近一次 字节数   : %u\n", (unsigned)g_auLastBytes];
-    [out appendFormat:@"audioMode         : %ld  (0=真麦 1=素材 2=静音)\n",
-        (long)VCamConfig.shared.audioMode];
-
-    // ---- 2.45 hook 扫描过哪些 section（排查绑不上的原因）----
-    [out appendString:@"\n=== 扫描过的 section ===\n"];
-    extern char g_vcScannedSections[65536];
-    [out appendFormat:@"%s\n", g_vcScannedSections];
-
-    // ---- 2.5 byteaudio 导入了哪些音频 API（最关键的证据）----
-    [out appendString:@"\n=== byteaudio 导入的音频符号 ===\n"];
-    VCDumpImageImports("byteaudio", out);
-
-    // ---- 3. 只列 App 自己的镜像（系统库太多，会把报告撑爆）----
-    [out appendString:@"\n=== App 内镜像 ===\n"];
-    uint32_t imgCount = _dyld_image_count();
-    for (uint32_t i = 0; i < imgCount; i++) {
-        const char *nm = _dyld_get_image_name(i);
-        if (!nm) continue;
-        if (!strstr(nm, "/Application/")) continue;
-        [out appendFormat:@"%s\n", nm];
-    }
-
-    // 太长就截断，剪贴板和弹窗都吃不下
-    if (out.length > 24000) {
-        return [[out substringToIndex:24000] stringByAppendingString:@"\n...(已截断)"];
-    }
     return out;
 }
 

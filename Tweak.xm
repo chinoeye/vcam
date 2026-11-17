@@ -634,7 +634,9 @@ static void VCRewriteAudioBufferList(AudioBufferList *ioData, UInt32 frames)
         // 系统要 frames 帧（目标采样率），源采样率是 48000，
         // 按比例算出要消耗多少源帧。这是重采样必须的一步。
         const double ratio = g_convSrc.mSampleRate / dst.mSampleRate;
-        size_t needSrcFrames = (size_t)((double)frames * ratio) + 2;  // +2 补偿取整
+        // 不加额外补偿：ratio == 1.0 时多要的样本会一直攒在 carry 里，
+        // 攒到上限又得丢最旧的，反而成了新的断点来源。
+        size_t needSrcFrames = (size_t)((double)frames * ratio) + 1;
         const size_t needBytes = needSrcFrames * sizeof(float);
 
         // ---- 从解码器补足 carry ----
@@ -1426,6 +1428,8 @@ static NSString *VCRunAudioDiagnosis(void)
 
     [out appendFormat:@"SetProperty hook: %@ (orig=%p)\n",
         orig_AudioUnitSetProperty ? @"已装" : @"未装", orig_AudioUnitSetProperty];
+
+    [out appendFormat:@"seek 校正次数   : %d\n", g_vcSeekCount];
 
     [out appendString:@"\n--- 写入状态 ---\n"];
     [out appendFormat:@"成功写入次数  : %d\n", g_audioWriteOK];

@@ -1,0 +1,390 @@
+//
+//  VCSampleBufferFactory.m
+//
+
+#import "VCSampleBufferFactory.h"
+#import "VCamConfig.h"
+#import "VCLog.h"
+
+#import <ImageIO/ImageIO.h>
+#import <VideoToolbox/VTPixelTransferSession.h>
+#import <CoreImage/CoreImage.h>
+#import <AudioToolbox/AudioToolbox.h>
+#import <stdlib.h>
+
+@interface VCSampleBufferFactory ()
+{
+    CMTime _lastPTS;
+    CIContext *_ciContext;
+    CVPixelBufferPoolRef _jpegPool;
+    NSData *_lastJPEG;
+    CFTimeInterval _lastJPEGTime;
+    CFMutableDataRef _jpegScratch;
+    VTPixelTransferSessionRef _transfer;
+    NSLock *_lock;
+
+    // ---- 视频格式描述缓存 ----
+    // 旧实现每帧都 CMVideoFormatDescriptionCreateForImageBuffer，
+    // 30fps 就是每秒 30 次 CF 对象分配/销毁。同一素材的宽高/格式恒定，
+    // 缓存一份复用即可（CMSampleBufferCreateReadyWithImageBuffer 会自行 retain）。
+    CMVideoFormatDescriptionRef _cachedFormat;
+    size_t _cachedW;
+    size_t _cachedH;
+    OSType _cachedType;
+    NSLock *_formatLock;
+
+    // ---- JPEG 快照：后台生成，绝不占采集线程 ----
+    dispatch_queue_t _jpegQueue;
+    volatile BOOL _jpegBusy;
+}
+
+- (CMVideoFormatDescriptionRef)copyFormatForPixelBuffer:(CVPixelBufferRef)pixelBuffer
+                                     CF_RETURNS_RETAINED;
+- (void)encodeJPEGNow:(CVPixelBufferRef)pixelBuffer;
+@end
+
+@implementation VCSampleBufferFactory
+
++ (instancetype)shared
+{
+    static VCSampleBufferFactory *inst = nil;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        inst = [[VCSampleBufferFactory alloc] init];
+    });
+    return inst;
+}
+
+- (instancetype)init
+{
+    if ((self = [super init])) {
+        _requestedVideoFormat = kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange;
+        _fps = 30.0;
+        _lastPTS = kCMTimeInvalid;
+        _lock = [[NSLock alloc] init];
+        _formatLock = [[NSLock alloc] init];
+
+        // CIContext 创建很贵，必须复用
+        _ciContext = [CIContext contextWithOptions:@{
+            kCIContextUseSoftwareRenderer: @NO,
+            kCIContextWorkingColorSpace: (id)kCFNull,
+        }];
+        _jpegScratch = CFDataCreateMutable(kCFAllocatorDefault, 0);
+
+        // 快照走独立低优先级串行队列：采集线程只投递，不等结果
+        _jpegQueue = dispatch_queue_create("com.yg.vcam.jpeg", DISPATCH_QUEUE_SERIAL);
+        dispatch_set_target_queue(_jpegQueue,
+            dispatch_get_global_queue(QOS_CLASS_UTILITY, 0));
+        _jpegBusy = NO;
+    }
+    return self;
+}
+
+- (void)dealloc
+{
+    if (_jpegPool) CVPixelBufferPoolRelease(_jpegPool);
+    if (_jpegScratch) CFRelease(_jpegScratch);
+    if (_cachedFormat) CFRelease(_cachedFormat);
+    if (_transfer) VTPixelTransferSessionInvalidate(_transfer);
+    if (_transfer) CFRelease(_transfer);
+}
+
+- (void)resetTimeline
+{
+    [_lock lock];
+    _lastPTS = kCMTimeInvalid;
+    [_lock unlock];
+}
+
+// ------------------------------------------------------------------ 时间戳
+
+/// 真摄像头的帧间隔不是完美 33.333ms：自动曝光/增益调整会让它上下浮动。
+/// 完美等间隔的帧序是「这是本地文件」最明显的一个统计特征。
+- (CMTime)nextPresentationTime
+{
+    CMTime host = CMClockGetTime(CMClockGetHostTimeClock());
+
+    if (VCamConfig.shared.jitterTimestamps) {
+        // -2.0ms ~ +2.0ms 均匀分布
+        int32_t r = (int32_t)arc4random_uniform(4001) - 2000;
+        host = CMTimeAdd(host, CMTimeMake(r, 1000000));
+    }
+
+    [_lock lock];
+    if (CMTIME_IS_VALID(_lastPTS) && CMTimeCompare(host, _lastPTS) <= 0) {
+        // 严格单调递增，VideoToolbox 编码器遇到非单调 PTS 会直接报错
+        host = CMTimeAdd(_lastPTS, CMTimeMake(1, 1000));
+    }
+    _lastPTS = host;
+    [_lock unlock];
+
+    return host;
+}
+
+- (CMTime)frameDuration
+{
+    double fps = self.fps > 0 ? self.fps : 30.0;
+    return CMTimeMakeWithSeconds(1.0 / fps, 1000000000);
+}
+
+// ------------------------------------------------------------------ 视频
+
+/// 取（并 retain）一份格式描述。同尺寸同格式直接复用缓存。
+- (CMVideoFormatDescriptionRef)copyFormatForPixelBuffer:(CVPixelBufferRef)pixelBuffer
+{
+    if (!pixelBuffer) return NULL;
+
+    size_t w = CVPixelBufferGetWidth(pixelBuffer);
+    size_t h = CVPixelBufferGetHeight(pixelBuffer);
+    OSType type = CVPixelBufferGetPixelFormatType(pixelBuffer);
+
+    [_formatLock lock];
+
+    if (_cachedFormat && _cachedW == w && _cachedH == h && _cachedType == type) {
+        CMVideoFormatDescriptionRef hit = (CMVideoFormatDescriptionRef)CFRetain(_cachedFormat);
+        [_formatLock unlock];
+        return hit;
+    }
+
+    CMVideoFormatDescriptionRef created = NULL;
+    OSStatus st = CMVideoFormatDescriptionCreateForImageBuffer(
+        kCFAllocatorDefault, pixelBuffer, &created);
+    if (st != noErr || !created) {
+        [_formatLock unlock];
+        VCLog(@"CMVideoFormatDescription 创建失败: %d", (int)st);
+        return NULL;
+    }
+
+    if (_cachedFormat) CFRelease(_cachedFormat);
+    _cachedFormat = created;
+    _cachedW = w;
+    _cachedH = h;
+    _cachedType = type;
+
+    CMVideoFormatDescriptionRef out = (CMVideoFormatDescriptionRef)CFRetain(_cachedFormat);
+    [_formatLock unlock];
+    return out;
+}
+
+- (CMSampleBufferRef)createVideoSampleBufferFrom:(CVPixelBufferRef)pixelBuffer
+                              presentationOverride:(NSValue *)ptsOrNil
+{
+    if (!pixelBuffer) return NULL;
+
+    // 同尺寸同格式的素材：这里命中缓存，不再每帧新建格式描述
+    CMVideoFormatDescriptionRef fmt = [self copyFormatForPixelBuffer:pixelBuffer];
+    if (!fmt) return NULL;
+
+    // 真机后置摄像头输出的 buffer 一定带这三个色彩附件；
+    // 缺了的话某些 App 会走"非摄像头来源"的回退分支。
+    CVBufferSetAttachment(pixelBuffer, kCVImageBufferYCbCrMatrixKey,
+                          kCVImageBufferYCbCrMatrix_ITU_R_709_2,
+                          kCVAttachmentMode_ShouldNotPropagate);
+    CVBufferSetAttachment(pixelBuffer, kCVImageBufferColorPrimariesKey,
+                          kCVImageBufferColorPrimaries_ITU_R_709_2,
+                          kCVAttachmentMode_ShouldNotPropagate);
+    CVBufferSetAttachment(pixelBuffer, kCVImageBufferTransferFunctionKey,
+                          kCVImageBufferTransferFunction_ITU_R_709_2,
+                          kCVAttachmentMode_ShouldNotPropagate);
+
+    CMTime pts = ptsOrNil ? [ptsOrNil CMTimeValue] : [self nextPresentationTime];
+
+    CMSampleTimingInfo timing;
+    timing.duration              = [self frameDuration];
+    timing.presentationTimeStamp = pts;
+    timing.decodeTimeStamp       = kCMTimeInvalid;
+
+    CMSampleBufferRef sbuf = NULL;
+    OSStatus st = CMSampleBufferCreateReadyWithImageBuffer(
+        kCFAllocatorDefault, pixelBuffer, fmt, &timing, &sbuf);
+    CFRelease(fmt);
+
+    if (st != noErr) {
+        VCLog(@"CMSampleBufferCreateReadyWithImageBuffer 失败: %d", (int)st);
+        return NULL;
+    }
+    return sbuf;
+}
+
+- (CMSampleBufferRef)retimeSampleBuffer:(CMSampleBufferRef)src
+{
+    if (!src) return NULL;
+
+    CVPixelBufferRef pb = CMSampleBufferGetImageBuffer(src);
+    if (!pb) return NULL;
+
+    // 解码器出来的 buffer 已经是 IOSurface-backed、420v/420f，
+    // 形状和真摄像头几乎一样，只需要重打时间戳。
+    return [self createVideoSampleBufferFrom:pb presentationOverride:nil];
+}
+
+// ------------------------------------------------------------------ 音频
+
+- (CMSampleBufferRef)createAudioSampleBufferWithData:(NSData *)pcm
+                                                asbd:(const AudioStreamBasicDescription *)asbd
+                                          frameCount:(CMItemCount)frames
+{
+    if (!pcm.length || !asbd || frames <= 0) return NULL;
+
+    size_t total = pcm.length;
+    CMBlockBufferRef block = NULL;
+    OSStatus st = CMBlockBufferCreateWithMemoryBlock(
+        kCFAllocatorDefault, NULL, total, kCFAllocatorDefault, NULL,
+        0, total, kCMBlockBufferAssureMemoryNowFlag, &block);
+    if (st != noErr || !block) return NULL;
+
+    st = CMBlockBufferReplaceDataBytes(pcm.bytes, block, 0, total);
+    if (st != noErr) {
+        CFRelease(block);
+        return NULL;
+    }
+
+    CMFormatDescriptionRef fmt = NULL;
+    st = CMAudioFormatDescriptionCreate(kCFAllocatorDefault, asbd,
+                                        0, NULL, 0, NULL, NULL, &fmt);
+    if (st != noErr || !fmt) {
+        CFRelease(block);
+        return NULL;
+    }
+
+    CMSampleTimingInfo timing;
+    timing.duration              = CMTimeMake(1, (int32_t)asbd->mSampleRate);
+    timing.presentationTimeStamp = [self nextPresentationTime];
+    timing.decodeTimeStamp       = kCMTimeInvalid;
+
+    CMSampleBufferRef sbuf = NULL;
+    st = CMSampleBufferCreateReady(kCFAllocatorDefault, block, fmt,
+                                   frames, 1, &timing, 1, NULL, &sbuf);
+    CFRelease(fmt);
+    CFRelease(block);
+
+    if (st != noErr) {
+        VCLog(@"音频 CMSampleBuffer 创建失败: %d", (int)st);
+        return NULL;
+    }
+    return sbuf;
+}
+
+// ------------------------------------------------------------------ 像素格式
+
+- (CVPixelBufferRef)transferPixelBuffer:(CVPixelBufferRef)src toFormat:(OSType)format
+{
+    if (!src) return NULL;
+    if (CVPixelBufferGetPixelFormatType(src) == format) {
+        return CVPixelBufferRetain(src);
+    }
+
+    if (!_transfer) {
+        if (VTPixelTransferSessionCreate(kCFAllocatorDefault, &_transfer) != noErr) {
+            return NULL;
+        }
+        // 这里原本想显式开硬件加速，但 kVTPixelTransferPropertyKey_EnableHardwareAcceleratedTransfer
+        // 在 iOS SDK 里并不存在（那是 macOS 侧的常量），写了直接编译失败。
+        // 而且 VTPixelTransferSession 默认就走硬件路径，不需要手动开。
+    }
+
+    size_t w = CVPixelBufferGetWidth(src);
+    size_t h = CVPixelBufferGetHeight(src);
+
+    NSDictionary *attrs = @{
+        (id)kCVPixelBufferIOSurfacePropertiesKey: @{},
+        (id)kCVPixelBufferPixelFormatTypeKey: @(format),
+        (id)kCVPixelBufferWidthKey: @(w),
+        (id)kCVPixelBufferHeightKey: @(h),
+    };
+
+    CVPixelBufferRef dst = NULL;
+    if (CVPixelBufferCreate(kCFAllocatorDefault, w, h, format,
+                            (__bridge CFDictionaryRef)attrs, &dst) != kCVReturnSuccess) {
+        return NULL;
+    }
+
+    OSStatus st = VTPixelTransferSessionTransferImage(_transfer, src, dst);
+    if (st != noErr) {
+        VCLog(@"像素格式转换失败: %d", (int)st);
+        CVPixelBufferRelease(dst);
+        return NULL;
+    }
+    return dst;
+}
+
+// ------------------------------------------------------------------ 快照
+
+/// 采集线程只做一件事：把这一帧 retain 后扔进后台队列，立刻返回。
+///
+/// 旧实现在采集回调里同步跑 CIContext → CGImage → JPEG，
+/// 1080p 一次约 30~60ms（GPU→CPU 回读是同步的），每秒一次，
+/// 表现为「抖音每秒固定顿一下」，并且这段时间采集回调被完全堵死、直接丢帧。
+- (void)updateJPEGFromPixelBuffer:(CVPixelBufferRef)pixelBuffer
+{
+    if (!pixelBuffer || !_jpegQueue) return;
+
+    // 上一次还没做完 → 直接丢弃（快照本来就不需要每帧新鲜）
+    if (_jpegBusy) return;
+
+    // 结果够新就不重做，2 秒一次对拍照出口足够
+    if (_lastJPEG) {
+        CFTimeInterval now = CFAbsoluteTimeGetCurrent();
+        if (now - _lastJPEGTime < 2.0) return;
+    }
+
+    _jpegBusy = YES;
+    CVPixelBufferRetain(pixelBuffer);
+    dispatch_async(_jpegQueue, ^{
+        [self encodeJPEGNow:pixelBuffer];
+        CVPixelBufferRelease(pixelBuffer);
+        self->_jpegBusy = NO;
+    });
+}
+
+/// 真正的编码，跑在 _jpegQueue 上。
+- (void)encodeJPEGNow:(CVPixelBufferRef)pixelBuffer
+{
+    if (!pixelBuffer) return;
+
+    @autoreleasepool {
+        NSData *encoded = nil;
+        @try {
+            CIImage *ci = [CIImage imageWithCVPixelBuffer:pixelBuffer];
+            CGImageRef cg = [_ciContext createCGImage:ci fromRect:ci.extent];
+            if (cg) {
+                CFMutableDataRef data = CFDataCreateMutable(kCFAllocatorDefault, 0);
+                if (data) {
+                    CGImageDestinationRef dest = CGImageDestinationCreateWithData(
+                        data, CFSTR("public.jpeg"), 1, NULL);
+                    if (dest) {
+                        CGImageDestinationAddImage(dest, cg, (__bridge CFDictionaryRef)@{
+                            (id)kCGImageDestinationLossyCompressionQuality: @0.9,
+                        });
+                        if (CGImageDestinationFinalize(dest)) {
+                            encoded = [NSData dataWithBytes:CFDataGetBytePtr(data)
+                                                     length:CFDataGetLength(data)];
+                        }
+                        CFRelease(dest);
+                    }
+                    CFRelease(data);
+                }
+                CGImageRelease(cg);
+            }
+        } @catch (NSException *e) {
+            VCLog(@"JPEG 快照失败: %@", e.reason);
+        }
+
+        if (encoded.length > 0) {
+            [_lock lock];
+            _lastJPEG = encoded;
+            _lastJPEGTime = CFAbsoluteTimeGetCurrent();
+            [_lock unlock];
+        }
+    }
+}
+
+- (NSData *)currentJPEG
+{
+    [_lock lock];
+    NSData *d = _lastJPEG;
+    [_lock unlock];
+    return d;
+}
+
+@end

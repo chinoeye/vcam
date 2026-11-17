@@ -60,7 +60,18 @@ static NSString *VCJailbreakRoot(void)
     _loopEnabled       = YES;
     _paused            = NO;
     _jitterTimestamps  = YES;
-    _hideJailbreak     = YES;
+    // 路径遮蔽（stat/lstat/access + fileExistsAtPath 那一套）默认关。
+    //
+    // 为什么：这三个是 App 运行期调用量最大的系统调用，hook 它们等于给
+    // 每次文件操作都套一遍路径匹配。而它存在的意义只有一个 —— 藏起
+    // /var/jb 那套越狱目录。现在走的是 TrollStore + TrollFools 注入，
+    // 系统里根本没有 /var/jb 可藏，这层是纯负担。
+    //
+    // dyld 镜像隐藏是另一回事（防止 App 发现 VCam.dylib 本身），
+    // 那部分在 VCHide 里始终安装，不受这个开关影响。
+    //
+    // 将来真要重新越狱用 ellekit 加载，把这里改回 YES。
+    _hideJailbreak     = NO;
     _letRealCameraRun  = YES;
     _hideOverlayQuickly = NO;
 }
@@ -111,7 +122,9 @@ static NSString *VCJailbreakRoot(void)
     if ([d objectForKey:@"loopEnabled"])      _loopEnabled = [d boolForKey:@"loopEnabled"];
     if ([d objectForKey:@"paused"])           _paused = [d boolForKey:@"paused"];
     if ([d objectForKey:@"jitterTimestamps"]) _jitterTimestamps = [d boolForKey:@"jitterTimestamps"];
-    if ([d objectForKey:@"hideJailbreak"])    _hideJailbreak = [d boolForKey:@"hideJailbreak"];
+    // 用新 key：老版本 persist 过 hideJailbreak=YES，直接沿用旧 key 会把
+    // 新的默认值 NO 覆盖掉，路径遮蔽又装回来了。
+    if ([d objectForKey:@"hideJailbreakV2"])  _hideJailbreak = [d boolForKey:@"hideJailbreakV2"];
     if ([d objectForKey:@"letRealCameraRun"]) _letRealCameraRun = [d boolForKey:@"letRealCameraRun"];
     if ([d objectForKey:@"hideOverlayQuickly"]) _hideOverlayQuickly = [d boolForKey:@"hideOverlayQuickly"];
 
@@ -139,7 +152,7 @@ static NSString *VCJailbreakRoot(void)
     [d setBool:_loopEnabled forKey:@"loopEnabled"];
     [d setBool:_paused forKey:@"paused"];
     [d setBool:_jitterTimestamps forKey:@"jitterTimestamps"];
-    [d setBool:_hideJailbreak forKey:@"hideJailbreak"];
+    [d setBool:_hideJailbreak forKey:@"hideJailbreakV2"];
     [d setBool:_letRealCameraRun forKey:@"letRealCameraRun"];
     [d setBool:_hideOverlayQuickly forKey:@"hideOverlayQuickly"];
     [d synchronize];

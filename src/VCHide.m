@@ -266,8 +266,6 @@ static uint32_t  gImageMapCount  = 0;      // 可见镜像数
 static uint32_t  gImageMapTotal  = 0;      // 建立映射时的真实镜像总数
 static NSLock   *gImageMapLock   = nil;
 
-static dispatch_once_t gImageMapOnce = 0;
-
 static BOOL VCShouldHideImage(const char *name)
 {
     if (!name) return NO;
@@ -296,21 +294,12 @@ static uint32_t (*orig_dyld_image_count)(void);
 static const char *(*orig_dyld_get_image_name)(uint32_t);
 static const struct mach_header *(*orig_dyld_get_image_header)(uint32_t);
 
-/// 建一次「可见索引 → 真实索引」映射表。
-///
-/// 为什么不学之前那样「每次比对总数、变了就重建」：
-/// 那样每次调用都要 加锁 + 一次 _dyld_image_count() 系统调用。
-/// 而 dyld_image_count / dladdr 在 App 里可能是每秒几万次的热路径
-/// （符号化、堆栈展开、崩溃捕获、各种 SDK 的自检），
-/// 等于给每一次符号查询都套一层锁加一次系统调用 —— 这才是"点哪卡哪"的来源。
-///
-/// 镜像列表在启动完成后基本不变，建一次表读到底就行。
-/// 即使之后动态加载了新库，最坏结果只是那个库不被过滤，不影响功能。
-static void VCImageMapBuildOnce(void)
+/// 重建映射表。调用方必须持 gImageMapLock。
+static void VCImageMapRebuildLocked(uint32_t total)
 {
-    if (!orig_dyld_image_count || !orig_dyld_get_image_name) return;
-
-    uint32_t total = orig_dyld_image_count();
+    free(gImageMap);
+    gImageMap = NULL;
+    gImageMapCount = 0;
     gImageMapTotal = total;
     if (total == 0) return;
 
@@ -319,26 +308,33 @@ static void VCImageMapBuildOnce(void)
 
     uint32_t visible = 0;
     for (uint32_t i = 0; i < total; i++) {
-        const char *n = orig_dyld_get_image_name(i);
-        if (VCShouldHideImage(n)) continue;
+        if (VCShouldHideImage(orig_dyld_get_image_name(i))) continue;
         map[visible++] = i;
     }
-
     gImageMap = map;
     gImageMapCount = visible;
 
-    // 注意：这里绝对不能写日志。
-    // 本函数跑在 dispatch_once 的 block 里，而 NSLog 内部可能反过来调用
-    // dladdr / _dyld_image_count，那会重入同一个 dispatch_once —— 直接死锁。
-    // （之前版本用 NSLock 没这个问题，换成 dispatch_once 之后就有了。）
+    // 这里不能写日志：本函数可能被 dladdr 的调用链间接触发，
+    // 而 NSLog 内部又会回头调 dladdr，容易绕成递归。
 }
 
-/// 热路径：首次之后就是一个 dispatch_once 的原子判断，无锁、无系统调用。
-static inline void VCImageMapEnsure(void)
+/// 确保映射表与当前镜像数一致。
+///
+/// 旧实现用 dispatch_once 只建一次 —— 那是错的：
+/// App 动态加载新库之后表里永远没有它们，可见索引与真实索引全部错位。
+/// _dyld_image_count() 只是读一个全局变量，非常便宜，
+/// 所以每次比对一次计数、变了才加锁重建，热路径上依然是零锁。
+static void VCImageMapEnsure(void)
 {
-    dispatch_once(&gImageMapOnce, ^{
-        VCImageMapBuildOnce();
-    });
+    if (!orig_dyld_image_count || !orig_dyld_get_image_name) return;
+    uint32_t total = orig_dyld_image_count();
+    if (gImageMap && total == gImageMapTotal) return;   // 热路径：无锁返回
+
+    [gImageMapLock lock];
+    if (!gImageMap || total != gImageMapTotal) {
+        VCImageMapRebuildLocked(total);
+    }
+    [gImageMapLock unlock];
 }
 
 static uint32_t hook_dyld_image_count(void)
@@ -350,7 +346,7 @@ static uint32_t hook_dyld_image_count(void)
 }
 
 /// 可见索引 → 真实索引。热路径只做一次数组读取。
-static inline int VCRealIndexFor(uint32_t idx)
+static int VCRealIndexFor(uint32_t idx)
 {
     if (!orig_dyld_get_image_name) return -1;
     VCImageMapEnsure();
@@ -413,6 +409,23 @@ static const char **hook_objc_copyImageNames(unsigned int *outCount)
 }
 
 // ------------------------------------------------------------------ 安装
+//
+//  dyld 镜像隐藏的开关。
+//
+//  这层是给**越狱环境**设计的：藏起 /var/jb 下的 substrate，
+//  防 App 用 _dyld_image_count() 发现越狱痕迹。
+//
+//  走 TrollFools 注入时它是纯负资产：
+//    · 篡改 _dyld_image_count / _dyld_get_image_name 的返回值
+//    · App 一旦动态加载新库（点开视频会加载播放器 / 直播 SDK），
+//      可见索引和真实索引就错位，拿到手的可能是完全不相干的库
+//    · dladdr 在符号化热路径上，每次都要过一遍过滤
+//  实测「点开视频画面卡死、但 HOME 键有响应」就是这条引起的。
+//
+//  真要回到越狱 + ellekit 加载，把下面改成 1。
+#ifndef VC_ENABLE_DYLD_HIDING
+#define VC_ENABLE_DYLD_HIDING 0
+#endif
 
 + (void)installHooks
 {
@@ -424,13 +437,9 @@ static const char **hook_objc_copyImageNames(unsigned int *outCount)
         if (!gImageMapLock) gImageMapLock = [[NSLock alloc] init];
 
         // ==========================================================
-        // 第一部分：dyld 镜像隐藏 —— **始终安装**
-        //
-        // TrollFools 注入改的是 App 主二进制，VCam.dylib 会出现在
-        // _dyld_image_count() 的列表里。不藏起来，App 一条
-        // dyld_image_count 就能发现多了一个来路不明的库。
-        // 这层跟越狱没关系，任何注入方式都需要。
+        // 第一部分：dyld 镜像隐藏 —— 默认**不装**（见文件上方的宏）
         // ==========================================================
+#if VC_ENABLE_DYLD_HIDING
         VCSymbolHook imageHooks[] = {
             { "_dyld_image_count",      (void *)hook_dyld_image_count,       (void **)&orig_dyld_image_count },
             { "_dyld_get_image_name",   (void *)hook_dyld_get_image_name,    (void **)&orig_dyld_get_image_name },
@@ -440,7 +449,10 @@ static const char **hook_objc_copyImageNames(unsigned int *outCount)
             { NULL, NULL, NULL }
         };
         VCHookSymbols(imageHooks);
-        VCLog(@"dyld 镜像隐藏已安装（映射缓存 %u 条可见镜像）", gImageMapCount);
+        VCLog(@"dyld 镜像隐藏已安装");
+#else
+        VCLog(@"dyld 镜像隐藏未启用（TrollStore 注入不需要，且会污染镜像索引）");
+#endif
 
         // ==========================================================
         // 第二部分：路径遮蔽 —— **只在越狱环境下才装**

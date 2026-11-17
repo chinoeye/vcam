@@ -55,10 +55,16 @@ static BOOL VCInjectionActive(void)
     return cfg.injectEnabled && cfg.sourceKind != VCSourceKindNone;
 }
 
-/// 判断某个 device 是不是我们要伪装的那颗后置摄像头
+/// 判断某个 device 是不是我们要伪装的那颗后置摄像头。
+///
+/// 注入未启用时一律返回 NO —— 这一行的作用是把 AVCaptureDevice 上
+/// 那 9 个属性 hook（ISO / exposureDuration / lensPosition /
+/// activeVideoMinFrameDuration / 白平衡 ...）全部压回 %orig 透传，
+/// 等于「静默模式」下这些 hook 完全不存在。
 static BOOL VCIsBackCamera(AVCaptureDevice *d)
 {
     if (!d) return NO;
+    if (!VCInjectionActive()) return NO;
     if (d.position != AVCaptureDevicePositionBack) return NO;
     return [d hasMediaType:AVMediaTypeVideo];
 }
@@ -84,6 +90,14 @@ static double VCDrift(double amplitude, double speed)
     // 只要是有效 delegate 就一律挂代理，装不装由代理内部按「实时配置」决定。
     // 这里如果按当前模式做判断，之后在面板里切换音频模式就再也装不上了。
     if (!delegate) {
+        [VCCaptureProxy releaseProxyForOutput:self];
+        %orig(delegate, queue);
+        return;
+    }
+
+    // 注入未启用：不挂代理，保持 App 原始回调通路。
+    // 静默模式下 NSInvocation 转发这层完全不参与，用来判断问题是否出在代理层。
+    if (!VCInjectionActive()) {
         [VCCaptureProxy releaseProxyForOutput:self];
         %orig(delegate, queue);
         return;
@@ -121,6 +135,13 @@ static double VCDrift(double amplitude, double speed)
         return;
     }
 
+    // 同视频：静默模式下不挂代理
+    if (!VCInjectionActive()) {
+        [VCCaptureProxy releaseProxyForOutput:self];
+        %orig(delegate, queue);
+        return;
+    }
+
     VCCaptureProxy *proxy = [VCCaptureProxy proxyForTarget:delegate
                                                      kind:VCProxyKindAudio
                                                    output:self];
@@ -140,13 +161,17 @@ static double VCDrift(double amplitude, double speed)
 - (instancetype)initWithSession:(AVCaptureSession *)session
 {
     id layer = %orig;
-    if (layer) [VCOverlay attachToPreviewLayer:layer];
+    if (layer && VCInjectionActive()) [VCOverlay attachToPreviewLayer:layer];
     return layer;
 }
 
 - (void)setSession:(AVCaptureSession *)session
 {
     %orig;
+    // 注入未启用：不往预览层上挂任何东西。
+    // 那个 AVSampleBufferDisplayLayer 是 opaque 全屏层，
+    // 挂在 AVCaptureVideoPreviewLayer 上会改变它的合成路径。
+    if (!VCInjectionActive()) return;
     [VCOverlay attachToPreviewLayer:self];
 }
 
@@ -285,20 +310,26 @@ static void VCBootstrap(void)
     dispatch_once(&once, ^{
         VCamConfig *cfg = VCamConfig.shared;
 
-        if (![VCFrameSource shared].isReady) {
-            NSURL *url = [cfg assetURL];
-            if (url) {
-                NSError *err = nil;
-                if (![[VCFrameSource shared] reloadWithURL:url error:&err]) {
-                    VCLog(@"素材装载失败: %@", err);
+        // 静默模式：注入没开就完全不碰素材、不连实时源、不解码。
+        // 面板照常挂 —— 否则关了注入就再也打不开了。
+        if (VCInjectionActive()) {
+            if (![VCFrameSource shared].isReady) {
+                NSURL *url = [cfg assetURL];
+                if (url) {
+                    NSError *err = nil;
+                    if (![[VCFrameSource shared] reloadWithURL:url error:&err]) {
+                        VCLog(@"素材装载失败: %@", err);
+                    }
+                } else {
+                    VCLog(@"没有可用素材，等面板里选");
                 }
-            } else {
-                VCLog(@"没有可用素材，等面板里选");
             }
-        }
 
-        if (cfg.sourceKind == VCSourceKindLive && cfg.liveHost.length > 0) {
-            [[VCLiveSource shared] connectToHost:cfg.liveHost port:cfg.livePort];
+            if (cfg.sourceKind == VCSourceKindLive && cfg.liveHost.length > 0) {
+                [[VCLiveSource shared] connectToHost:cfg.liveHost port:cfg.livePort];
+            }
+        } else {
+            VCLog(@"注入未启用 → 静默模式：不加载素材、不连实时源");
         }
 
         // 面板稍后再挂，等 App 自己的 UI 起来，避免抢 window

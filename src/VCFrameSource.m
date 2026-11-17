@@ -348,44 +348,22 @@ int g_vcSeekCount = 0;
             return nil;
         }
 
-        double videoT = _videoSourceSeconds;
-
-        // 用「已读源样本数 / 源采样率」估算素材内的音频位置。
+        // 这里**不再**限制音频相对视频的偏移。
         //
-        // 曾经试过改用外部回报的「实际播放时间」，但那会造成死锁：
-        // 播放时间只在成功转换后才更新，而它又是判断能否转换的前提 ——
-        // 视频先跑起来后 videoT 已经几百毫秒，音频位置还是 0，
-        // 被判为「严重落后」→ 追赶 → return nil → 时间永不更新 → 彻底无声。
+        //  之前有一段「偏差超过 250ms 就 seek 并 return nil」的逻辑，
+        //  现在必须去掉 —— 它跟管道架构直接冲突：
         //
-        // 所以这里保持按源样本数推算。速率偏差交给下面的阈值兜底。
-        // 用「真正播出去的采样数」而不是「解码进度」。
-        // 解码进度包含攒在 carry 里还没用的数据，用它算会虚高，
-        // 触发无意义的 seek（每次 seek 阻塞 140ms，就是那个大断点）。
-        uint64_t played = _audioConsumedSourceFrames > 0
-                        ? _audioConsumedSourceFrames
-                        : _audioSamplesRead;
-        double readerT = (double)played / _audioSampleRate;
-
-        // ---- 偏差过大：直接 seek 回正 ----
+        //    管道想让后台预生产，好让实时线程永远有货可取
+        //    但预生产会让 _audioSamplesRead 立刻超过 _videoSourceSeconds
+        //    于是被判「音频严重超前」→ return nil → 拒绝供数据
+        //    → 后台产不出 → 环形缓冲被消费空 → 每次调用都欠载 → 打电报
         //
-        //  以前这里分两种处理：
-        //    超前  -> 原地等，return nil（上层补静音 -> 断音）
-        //    落后  -> 循环丢弃数据，return nil（同一块丢掉几百毫秒 -> 断音）
-        //  两种都会让用户听到「中间断一下」，而且不会真正把偏差修掉。
+        //  正确的做法：时间对齐由「环形缓冲的深度」来保证。
+        //  缓冲里存多少帧，就是多少延迟。想让音频不超前，就限制缓冲深度，
+        //  而不是禁止解码器往前读。解码器一旦被限制，生产者就断粮了。
         //
-        //  现在统一改成 seek：把音频 reader 直接定位到视频当前时刻。
-        //  代价只是丢掉当前这一块（约 21ms，人耳察觉不到），
-        //  换来的是「偏差永远不超过 250ms」，15 小时的素材也不会跑偏。
-        double drift = readerT - videoT;
-        if (fabs(drift) > VC_AV_MAX_DRIFT) {
-            g_vcSeekCount++;
-            if (g_vcSeekCount <= 5 || g_vcSeekCount % 100 == 0) {
-                VCLog(@"音频校正 #%d：偏差 %.0fms -> seek 到 %.2fs",
-                      g_vcSeekCount, drift * 1000, videoT);
-            }
-            [self seekAudioToVideoTimeLocked];
-            return nil;
-        }
+        //  视频回绕时仍然会重置音频 reader（见 restartVideoReaderLocked），
+        //  所以长期播放不会越跑越偏。
 
         // ---- 正常区间：读一块输出 ----
         CMSampleBufferRef raw = [_audioOutput copyNextSampleBuffer];

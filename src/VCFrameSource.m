@@ -340,7 +340,16 @@
         }
 
         double videoT = _videoSourceSeconds;
-        double readerT = (double)_audioSamplesRead / _audioSampleRate;
+
+        // 优先用外部回报的「实际已播放时间」。
+        // 按已读样本数推算的话，44100/48000 的速率差会让偏差持续累积，
+        // 每隔几秒就撞到阈值导致断音。
+        double readerT;
+        if (_audioPlaybackSeconds > 0) {
+            readerT = _audioPlaybackSeconds;
+        } else {
+            readerT = (double)_audioSamplesRead / _audioSampleRate;
+        }
 
         // ---- 超前：原地等，不消耗数据 ----
         if (readerT > videoT + VC_AV_MAX_DRIFT) {

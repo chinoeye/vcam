@@ -715,40 +715,43 @@ didFinishLaunchingWithOptions:(NSDictionary *)launchOptions
 {
     %orig;
     VCBootstrap();
+    [self vc_installGesturesIfNeeded];
+}
 
-    // 日志手势：双指长按 1.5 秒。
-    //
-    // 为什么不用摇一摇：抖音自己占了 shake —— 一晃就弹「推送视频给朋友」，
-    // 我们的 motionEnded: 拿不到。
-    // 为什么不用单指长按：会跟播放器的长按菜单打架。
-    // 双指长按在抖音里没有绑定功能，是目前最安全的触发方式。
+/// 给这个 window 装双指/三指长按，重复调用无副作用。
+///
+/// 不能只依赖 makeKeyAndVisible：抖音的窗口可能在我们注入之前就已经可见，
+/// 那个方法之后再也不被调用 —— 手势永远装不上，症状是「长按完全没反应」。
+/// %ctor 里还挂了个定时器反复补装。
+- (void)vc_installGesturesIfNeeded
+{
     static const void *kGestureKey = &kGestureKey;
-    if (!objc_getAssociatedObject(self, kGestureKey)) {
-        // 双指长按 1.5 秒 → 诊断报告
-        UILongPressGestureRecognizer *g2 =
-            [[UILongPressGestureRecognizer alloc]
-                initWithTarget:self
-                        action:@selector(vc_handleTwoFinger:)];
-        g2.numberOfTouchesRequired = 2;
-        g2.minimumPressDuration = 1.5;
-        g2.cancelsTouchesInView = NO;
-        [self addGestureRecognizer:g2];
+    if (objc_getAssociatedObject(self, kGestureKey)) return;
 
-        // 三指长按 1 秒 → 切音频模式（真麦 / 素材 / 静音）
-        // 有了它，调参不需要重新编译 + 注入，测一次只要几秒
-        UILongPressGestureRecognizer *g3 =
-            [[UILongPressGestureRecognizer alloc]
-                initWithTarget:self
-                        action:@selector(vc_handleThreeFinger:)];
-        g3.numberOfTouchesRequired = 3;
-        g3.minimumPressDuration = 1.0;
-        g3.cancelsTouchesInView = NO;
-        [self addGestureRecognizer:g3];
+    UILongPressGestureRecognizer *g2 =
+        [[UILongPressGestureRecognizer alloc]
+            initWithTarget:self
+                    action:@selector(vc_handleTwoFinger:)];
+    g2.numberOfTouchesRequired = 2;
+    g2.minimumPressDuration = 1.5;
+    g2.cancelsTouchesInView = NO;
+    [self addGestureRecognizer:g2];
 
-        objc_setAssociatedObject(self, kGestureKey, g2,
-                                 OBJC_ASSOCIATION_RETAIN_NONATOMIC);
-        VCLog(@"手势已安装：双指=报告，三指=切音频模式");
-    }
+    UILongPressGestureRecognizer *g3 =
+        [[UILongPressGestureRecognizer alloc]
+            initWithTarget:self
+                    action:@selector(vc_handleThreeFinger:)];
+    g3.numberOfTouchesRequired = 3;
+    g3.minimumPressDuration = 1.0;
+    g3.cancelsTouchesInView = NO;
+    [self addGestureRecognizer:g3];
+
+    objc_setAssociatedObject(self, kGestureKey, g2,
+                             OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+
+    VCLog(@"手势已装上: %@ (共 %lu 个手势)",
+          NSStringFromClass([self class]),
+          (unsigned long)self.gestureRecognizers.count);
 }
 
 - (void)vc_handleTwoFinger:(UILongPressGestureRecognizer *)g
@@ -1144,6 +1147,25 @@ static void VCDumpAudioReport(void)
 }
 
 // ==================================================================
+#pragma mark - 手势补装
+// ==================================================================
+//
+//  makeKeyAndVisible 只在窗口第一次显示时调用。抖音的窗口可能在我们
+//  注入之前就已可见，那个方法之后再不被调用 —— 手势永远装不上。
+//  这里每 2 秒找一次 key window 补装，装过就跳过。
+
+static void VCEnsureGesturesInstalled(void)
+{
+    for (UIWindow *w in UIApplication.sharedApplication.windows) {
+        if (!w.isKeyWindow) continue;
+        if ([w respondsToSelector:@selector(vc_installGesturesIfNeeded)]) {
+            [w performSelector:@selector(vc_installGesturesIfNeeded)];
+        }
+        return;
+    }
+}
+
+// ==================================================================
 #pragma mark - 入口
 // ==================================================================
 
@@ -1205,6 +1227,25 @@ static void VCDumpAudioReport(void)
             dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2.0 * NSEC_PER_SEC)),
                            dispatch_get_main_queue(), ^{
                 VCBootstrap();
+            });
+
+            // 5. 手势补装定时器。
+            //    makeKeyAndVisible 可能永远不会被调用（窗口早在注入前就显示了），
+            //    所以这里独立起一个定时器，每 2 秒找 key window 补装。
+            //    装过之后靠 associated object 去重，不会重复添加。
+            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.0 * NSEC_PER_SEC)),
+                           dispatch_get_main_queue(), ^{
+                __block int tries = 0;
+                dispatch_source_t gtm = dispatch_source_create(
+                    DISPATCH_SOURCE_TYPE_TIMER, 0, 0, dispatch_get_main_queue());
+                dispatch_source_set_timer(gtm,
+                    dispatch_time(DISPATCH_TIME_NOW, 0),
+                    2 * NSEC_PER_SEC, 1 * NSEC_PER_SEC);
+                dispatch_source_set_event_handler(gtm, ^{
+                    if (++tries > 90) { dispatch_source_cancel(gtm); return; }
+                    VCEnsureGesturesInstalled();
+                });
+                dispatch_resume(gtm);
             });
         }
     }

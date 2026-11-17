@@ -24,6 +24,7 @@
 #import <math.h>
 #import <stdlib.h>
 #import <objc/runtime.h>
+#import <mach-o/dyld.h>
 
 // ------------------------------------------------------------------ 工具
 
@@ -50,10 +51,38 @@ static BOOL VCIsTargetProcess(void)
     return bid && [VCTargetBundles() containsObject:bid];
 }
 
-// 前向声明：定义在文件末尾（日志上屏那一段），
-// 但 %hook UIWindow 里的摇一摇要先用到它。
+// 前向声明：这两个定义在文件末尾，但 %hook UIWindow 里要先用到。
 // 忘了这一行就是 "call to undeclared function" 编译错误。
 static void VCDumpLogAlert(void);
+static void VCDumpAudioReport(void);
+
+/// 取当前 key window。
+///
+/// UIApplication.windows 在 iOS 15 被标记废弃，而本项目开了 -Werror，
+/// 分散在各个函数里写会把 deprecation 警告升成编译错误。
+/// 统一收口到这里，用 pragma 局部关掉警告，其余代码照常严格。
+static UIWindow *VCKeyWindow(void)
+{
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wdeprecated-declarations"
+    UIWindow *win = nil;
+    for (UIWindow *w in UIApplication.sharedApplication.windows) {
+        if (w.isKeyWindow) { win = w; break; }
+    }
+    if (!win) win = UIApplication.sharedApplication.windows.firstObject;
+    return win;
+#pragma clang diagnostic pop
+}
+
+/// 从 key window 找到最顶层的 view controller，用来弹 alert。
+static UIViewController *VCTopViewController(void)
+{
+    UIViewController *vc = VCKeyWindow().rootViewController;
+    while (vc.presentedViewController) {
+        vc = vc.presentedViewController;
+    }
+    return vc;
+}
 
 static BOOL VCInjectionActive(void)
 {
@@ -290,6 +319,10 @@ typedef OSStatus (*VC_AURender_FN)(AudioUnit, AudioUnitRenderActionFlags *,
 
 static VC_AURender_FN orig_AudioUnitRender = NULL;
 
+// 诊断期 hook_AudioUnitRender 走的是「无条件清零」，这条带策略的写入
+// 暂时没有调用者。但它是正式版的实现，不能删 —— 加 unused 标记保留，
+// 否则 -Werror 会以 -Wunused-function 判死。
+__attribute__((unused))
 static void VCRewriteAudioBufferList(AudioBufferList *ioData, UInt32 frames)
 {
     if (!ioData || frames == 0) return;
@@ -646,7 +679,9 @@ didFinishLaunchingWithOptions:(NSDictionary *)launchOptions
 - (void)vc_handleLogGesture:(UILongPressGestureRecognizer *)g
 {
     if (g.state == UIGestureRecognizerStateBegan) {
-        VCDumpLogAlert();
+        // 双指长按跑音频架构诊断（比看日志有用得多），
+        // 结果自动塞进剪贴板。
+        VCDumpAudioReport();
     }
 }
 
@@ -769,21 +804,143 @@ static void VCDumpLogAlert(void)
                                                   style:UIAlertActionStyleCancel
                                                 handler:nil]];
 
-        UIWindow *win = nil;
-        for (UIWindow *w in UIApplication.sharedApplication.windows) {
-            if (w.isKeyWindow) { win = w; break; }
-        }
-        if (!win) win = UIApplication.sharedApplication.windows.firstObject;
-
-        UIViewController *vc = win.rootViewController;
-        while (vc.presentedViewController) {
-            vc = vc.presentedViewController;
-        }
+        UIViewController *vc = VCTopViewController();
         if (vc) {
             [vc presentViewController:alert animated:NO completion:nil];
         } else {
             // 拿不到 viewController 时退回到剪贴板
             [UIPasteboard generalPasteboard].string = content;
+        }
+    });
+}
+
+// ==================================================================
+#pragma mark - 音频架构诊断（一次性看清，不用穷举）
+// ==================================================================
+//
+//  前三次 hook 全部落空（AVCaptureAudioDataOutput / AVAudioEngine tap /
+//  AudioUnitRender），根本问题是：不知道抖音到底用什么采音频，
+//  每次改都是在赌。
+//
+//  这个函数把答案直接读出来：
+//    · 已加载的全部镜像（谁在里面）
+//    · 所有名称里含 Audio/Mic/Voice/Record/Capture/PCM/Sound/Unit 的类
+//    · 这些类里跟采集相关的 selector
+//
+//  抖音的 __TEXT,__text 是加密的（cryptid=1），但 ObjC 的类名和方法名
+//  存在 __objc_classname / __objc_methname 段，**不加密**，
+//  运行时通过 runtime API 就能全部拿到。
+//
+//  结果写文件 + 塞剪贴板，再弹窗提示。
+
+static NSString *VCRunAudioDiagnosis(void)
+{
+    NSMutableString *out = [NSMutableString string];
+
+    // ---- 1. 已加载镜像 ----
+    [out appendString:@"=== 已加载镜像 ===\n"];
+    uint32_t imgCount = _dyld_image_count();
+    for (uint32_t i = 0; i < imgCount; i++) {
+        const char *nm = _dyld_get_image_name(i);
+        if (!nm) continue;
+        [out appendFormat:@"%s\n", nm];
+    }
+
+    // ---- 2. 音频相关类 + 采集相关方法 ----
+    [out appendString:@"\n=== 音频相关类 ===\n"];
+    unsigned int clsCount = 0;
+    Class *classes = objc_copyClassList(&clsCount);
+
+    NSArray<NSString *> *classKw = @[@"Audio", @"audio", @"Mic", @"Voice",
+                                     @"Record", @"Capture", @"PCM", @"Sound",
+                                     @"Unit", @"Speaker", @"TTM"];
+    NSArray<NSString *> *methodKw = @[@"capture", @"Capture", @"render", @"Render",
+                                      @"tap", @"Tap", @"record", @"Record",
+                                      @"output", @"Output", @"input", @"Input"];
+
+    int classHits = 0;
+    for (unsigned int i = 0; i < clsCount; i++) {
+        NSString *cn = NSStringFromClass(classes[i]);
+        if (cn.length == 0) continue;
+
+        BOOL hit = NO;
+        for (NSString *k in classKw) {
+            if ([cn containsString:k]) { hit = YES; break; }
+        }
+        if (!hit) continue;
+
+        // 只关心抖音和第三方 SDK，跳过苹果系统类
+        if ([cn hasPrefix:@"NS"] || [cn hasPrefix:@"UI"] ||
+            [cn hasPrefix:@"AV"] || [cn hasPrefix:@"CA"] ||
+            [cn hasPrefix:@"CF"] || [cn hasPrefix:@"__"]) {
+            continue;
+        }
+
+        classHits++;
+        if (classHits > 80) break;   // 防止报告爆炸
+
+        [out appendFormat:@"\n[%@]\n", cn];
+
+        unsigned int mc = 0;
+        Method *methods = class_copyMethodList(classes[i], &mc);
+        int shown = 0;
+        for (unsigned int j = 0; j < mc && shown < 24; j++) {
+            NSString *sn = NSStringFromSelector(method_getName(methods[j]));
+            BOOL mhit = NO;
+            for (NSString *k in methodKw) {
+                if ([sn containsString:k]) { mhit = YES; break; }
+            }
+            if (!mhit) continue;
+            [out appendFormat:@"  - %@\n", sn];
+            shown++;
+        }
+        free(methods);
+    }
+    free(classes);
+
+    [out appendFormat:@"\n=== 共 %d 个音频相关类 ===\n", classHits];
+
+    // 太长就截断，剪贴板和弹窗都吃不下
+    if (out.length > 12000) {
+        return [[out substringToIndex:12000] stringByAppendingString:@"\n...(已截断)"];
+    }
+    return out;
+}
+
+static void VCDumpAudioReport(void)
+{
+    dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+        @autoreleasepool {
+            NSString *report = VCRunAudioDiagnosis();
+
+            // 写文件（方便以后用别的办法取）
+            NSString *logPath = VCLogFilePath();
+            NSString *diagPath = [logPath stringByAppendingString:@".audio"];
+            [report writeToFile:diagPath
+                     atomically:YES
+                       encoding:NSUTF8StringEncoding
+                          error:NULL];
+
+            VCLog(@"音频诊断完成，%lu 字符，已存 %@",
+                  (unsigned long)report.length, diagPath);
+
+            dispatch_async(dispatch_get_main_queue(), ^{
+                // 塞剪贴板：用户可以粘到备忘录/微信发出来
+                [UIPasteboard generalPasteboard].string = report;
+
+                UIAlertController *a =
+                    [UIAlertController alertControllerWithTitle:@"音频诊断（已复制到剪贴板）"
+                                                       message:[NSString stringWithFormat:
+                                    @"报告 %lu 字符，已复制到剪贴板。\n\n捏到备忘录里粘贴，或直接发出来。\n\n文件：Documents/VCam/diag.log.audio",
+                                    (unsigned long)report.length]
+                                                preferredStyle:UIAlertControllerStyleAlert];
+                [a addAction:[UIAlertAction actionWithTitle:@"好"
+                                                      style:UIAlertActionStyleCancel
+                                                    handler:nil]];
+
+                UIViewController *vc = VCTopViewController();
+                [vc presentViewController:a animated:NO completion:nil];
+            });
         }
     });
 }

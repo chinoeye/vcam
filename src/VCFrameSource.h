@@ -35,6 +35,14 @@ NS_ASSUME_NONNULL_BEGIN
 /// 内部线程安全，可以在任意线程调用。
 - (nullable CMSampleBufferRef)copyNextVideoSampleBuffer CF_RETURNS_RETAINED;
 
+/// 只解码并返回像素缓冲，不造 CMSampleBuffer、不改时间戳。
+///
+/// 供「原地改写系统 buffer」路线使用：调用方拿到 pixelBuffer 后，
+/// 用 VCSampleBufferFactory 的 copyPixelBuffer:into: 把内容画进
+/// 系统摄像头给的那个 buffer 里，buffer 本身原样转发给 App。
+/// 调用方负责 CVPixelBufferRelease。
+- (nullable CVPixelBufferRef)copyNextPixelBuffer CF_RETURNS_RETAINED;
+
 /// 取下一块音频 PCM（float32 / 48k / 单声道）。
 /// 返回 nil 表示暂无可读数据。
 - (nullable NSData *)copyNextAudioPCMWithFrameCount:(CMItemCount *)frameCountOut

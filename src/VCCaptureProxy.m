@@ -167,13 +167,34 @@ static NSLock *VCProxyLock(void)
         CMSampleBufferRef replacement = [self replacementForBuffer:original drop:&drop];
 
         if (replacement) {
+            // ---- 关键：必须额外 retain 一次 ----
+            //
+            // AVFoundation 的 -[AVCaptureVideoDataOutput _processSampleBuffer:]
+            // 在把 buffer 交给 delegate 之后，自己还会 release 一份 ——
+            // 它默认那个 buffer 是系统创建的、由它持有。
+            //
+            // 我们这里换成了自己的 buffer（引用计数 1，由我们持有）。
+            // 如果不额外 retain，就变成「系统 release + 我们 release」的
+            // 双重释放，之后任何一次访问都是野指针。
+            //
+            // 崩溃现场的堆栈正好是：
+            //   CFRelease.cold.1 <- CFRelease <- AwemeCore <- __invoking___
+            //   <- ... <- VCam.dylib forwardInvocation: <- AVFCapture
+            // CoreFoundation 报的是 "CFRelease() called with NULL"。
+            //
+            // 引用计数账：
+            //   copyNextVideoSampleBuffer 返回        +1（我们的）
+            //   CFRetain 给系统                       +1 = 2
+            //   系统调用完 delegate 后 release        -1 = 1
+            //   我们 @finally release                 -1 = 0  ✓
+            CFRetain(replacement);
             [invocation setArgument:&replacement atIndex:3];
             @try {
                 [invocation invokeWithTarget:target];
             } @catch (NSException *e) {
                 VCLog(@"转发 delegate 异常: %@", e.reason);
             } @finally {
-                CFRelease(replacement);
+                CFRelease(replacement);   // 只释放我们自己那一份
             }
             return;
         }
@@ -236,14 +257,26 @@ static NSLock *VCProxyLock(void)
             fresh = [[VCFrameSource shared] copyNextVideoSampleBuffer];
         }
         if (fresh) {
+            // 拿不到图像数据的 buffer 交给 App 一定出事 ——
+            // 抖音那边会 CMSampleBufferGetImageBuffer 拿到 NULL，
+            // 然后对它 CFRelease，直接触发 "CFRelease() called with NULL"。
+            // 宁可丢这一帧。
+            CVPixelBufferRef pb = CMSampleBufferGetImageBuffer(fresh);
+            if (!pb) {
+                VCLog(@"帧没有图像数据，丢弃（避免 App 侧空指针崩溃）");
+                CFRelease(fresh);
+                if (dropOut) *dropOut = YES;
+                return NULL;
+            }
+
             if (!_loggedFirstReplacement) {
                 _loggedFirstReplacement = YES;
-                VCLog(@"首帧注入成功");
+                VCLog(@"首帧注入成功 %zux%zu fmt=0x%x",
+                      CVPixelBufferGetWidth(pb), CVPixelBufferGetHeight(pb),
+                      (unsigned)CVPixelBufferGetPixelFormatType(pb));
             }
-            CVPixelBufferRef pb = CMSampleBufferGetImageBuffer(fresh);
-            if (pb) {
-                [[VCSampleBufferFactory shared] updateJPEGFromPixelBuffer:pb];
-            }
+
+            [[VCSampleBufferFactory shared] updateJPEGFromPixelBuffer:pb];
             // 同一帧也喂给预览覆盖层 —— 只解码一次，两处共用
             [VCOverlay pushVideoSampleBuffer:fresh];
             return fresh;

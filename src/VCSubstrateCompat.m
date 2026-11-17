@@ -6,10 +6,19 @@
 //    2) fishhook 精简实现 —— 按符号名重绑定 C 函数
 //
 //  fishhook 思路来自 facebook/fishhook (BSD)，做了大幅裁剪：
-//    - 只处理 __DATA 段的 lazy/non-lazy symbol pointers
-//    - 不碰 __DATA_CONST / __AUTH_CONST —— iOS 15+ 这两处带指针认证(PAC)，
-//      直接改写会让内核在下次校验时踢掉进程，得不偿失。
+//    - 处理 __DATA 和 __DATA_CONST 两段的 lazy/non-lazy symbol pointers
+//    - 不碰 __AUTH_CONST（那一段的指针确实带认证，且没有我们需要 hook 的符号）
 //    - 只保留 rebind 主路径，去掉 image 过滤等用不到的入口
+//
+//  关于 __DATA_CONST：
+//    早先这里只扫 __DATA，注释说 __DATA_CONST 带 PAC 不能改。这个判断是错的 ——
+//    iOS 13 之后 __la_symbol_ptr / __got 大多搬到了 __DATA_CONST，
+//    byteaudio.framework 这类第三方库的符号指针全在那儿。
+//    只扫 __DATA 的结果是：主二进制里残留的少量指针能 hook 上（视频那条链），
+//    而 framework 里的全部碰不到（音频走 byteaudio，怎么都拦不住）。
+//
+//    A11 是 arm64，指针不带 PAC，改完不需要重签名；
+//    __DATA_CONST 原本只读，靠 vc_rebind_one 里的 VM_PROT_COPY 做写时复制。
 //
 
 #import "VCSubstrateCompat.h"
@@ -170,37 +179,51 @@ static void vc_rebind_image(vc_entry_t *e, const vc_mach_header *header, intptr_
     const char     *strs = (const char *)(base + symtab->stroff);
     const uint32_t *indirect = (const uint32_t *)(base + dysymtab->indirectsymoff);
 
-    // 只处理 __DATA。__DATA_CONST / __AUTH_CONST 带 PAC，改了会触发内核保护。
-    vc_segment_command *dataSeg = vc_find_segment(header, SEG_DATA);
-    if (!dataSeg) return;
+    // 处理 __DATA 和 __DATA_CONST 两段。
+    //
+    // 之前只处理 __DATA，导致对第三方 framework 的 hook 全部失效：
+    // iOS 13 之后 __la_symbol_ptr / __got 大多搬到了 __DATA_CONST，
+    // byteaudio.framework、EffectSDKFramework 这类库的符号指针都在那儿。
+    // 主二进制 __DATA 里还残留一部分，所以视频那条链能 hook 上、
+    // 音频（走 byteaudio）却怎么都碰不到 —— 现在补上。
+    //
+    // __DATA_CONST 原本是只读的，vc_rebind_one 里的 VM_PROT_COPY 会做
+    // 写时复制，把这一页改成私有可写，不影响其它进程。
+    // 这台机器是 A11（arm64，非 arm64e），指针不带 PAC，改完不需要重签名。
+    static const char *kPointerSegs[] = { SEG_DATA, "__DATA_CONST" };
 
-    const vc_section *sec = (const vc_section *)(dataSeg + 1);
-    for (uint32_t k = 0; k < dataSeg->nsects; k++) {
-        const vc_section *cs = &sec[k];
+    for (size_t ds = 0; ds < sizeof(kPointerSegs) / sizeof(kPointerSegs[0]); ds++) {
+        vc_segment_command *dataSeg = vc_find_segment(header, kPointerSegs[ds]);
+        if (!dataSeg) continue;
 
-        BOOL isLazy = (strncmp(cs->sectname, SECT_LAZY_SYMBOL_POINTERS, 16) == 0);
-        BOOL isNL   = (strncmp(cs->sectname, SECT_NON_LAZY_SYMBOL_POINTERS, 16) == 0);
-        if (!isLazy && !isNL) continue;
+        const vc_section *sec = (const vc_section *)(dataSeg + 1);
+        for (uint32_t k = 0; k < dataSeg->nsects; k++) {
+            const vc_section *cs = &sec[k];
 
-        uint32_t n = (uint32_t)(cs->size / sizeof(void *));
-        for (uint32_t i = 0; i < n; i++) {
-            uint32_t idx = cs->reserved1 + i;
-            if (idx >= dysymtab->nindirectsyms) break;
+            BOOL isLazy = (strncmp(cs->sectname, SECT_LAZY_SYMBOL_POINTERS, 16) == 0);
+            BOOL isNL   = (strncmp(cs->sectname, SECT_NON_LAZY_SYMBOL_POINTERS, 16) == 0);
+            if (!isLazy && !isNL) continue;
 
-            uint32_t symIndex = indirect[idx];
-            if (symIndex == INDIRECT_SYMBOL_LOCAL ||
-                symIndex == INDIRECT_SYMBOL_ABS) continue;
-            if (symIndex >= symtab->nsyms) continue;
+            uint32_t n = (uint32_t)(cs->size / sizeof(void *));
+            for (uint32_t i = 0; i < n; i++) {
+                uint32_t idx = cs->reserved1 + i;
+                if (idx >= dysymtab->nindirectsyms) break;
 
-            const vc_nlist *sym = &syms[symIndex];
-            if (!sym->n_un.n_strx) continue;
+                uint32_t symIndex = indirect[idx];
+                if (symIndex == INDIRECT_SYMBOL_LOCAL ||
+                    symIndex == INDIRECT_SYMBOL_ABS) continue;
+                if (symIndex >= symtab->nsyms) continue;
 
-            const char *name = strs + sym->n_un.n_strx;
-            if (!name || !*name) continue;
+                const vc_nlist *sym = &syms[symIndex];
+                if (!sym->n_un.n_strx) continue;
 
-            // 关键：段内地址 = section 虚拟地址 + slide + 表内偏移
-            void **slot = (void **)(cs->addr + slide + i * sizeof(void *));
-            vc_rebind_one(e, name, slot);
+                const char *name = strs + sym->n_un.n_strx;
+                if (!name || !*name) continue;
+
+                // 关键：段内地址 = section 虚拟地址 + slide + 表内偏移
+                void **slot = (void **)(cs->addr + slide + i * sizeof(void *));
+                vc_rebind_one(e, name, slot);
+            }
         }
     }
 }

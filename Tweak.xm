@@ -557,6 +557,25 @@ static void VCRewriteAudioBufferList(AudioBufferList *ioData, UInt32 frames)
         }
 
         size_t availFrames = carry.length / sizeof(float);
+
+        // 源数据不够时，用「最后一个样本」把它补满。
+        //
+        // 不能留空：AudioConverter 拿到的输入不足会输出不足，
+        // 我们再把剩余部分静音填上，听感就是一阵阵断音。
+        // 用最后样本延音是最平滑的补法 —— 幅度连续，不会有咔哒声。
+        if (availFrames < needSrcFrames) {
+            size_t padCount = needSrcFrames - availFrames;
+            NSMutableData *pad = [NSMutableData dataWithLength:padCount * sizeof(float)];
+            float last = 0.0f;
+            if (availFrames > 0) {
+                last = ((const float *)carry.bytes)[availFrames - 1];
+            }
+            float *pp = (float *)pad.mutableBytes;
+            for (size_t i = 0; i < padCount; i++) pp[i] = last;
+            [carry appendData:pad];
+            availFrames = needSrcFrames;
+        }
+
         size_t useSrcFrames = (availFrames < needSrcFrames) ? availFrames : needSrcFrames;
 
         static BOOL sLogged = NO;

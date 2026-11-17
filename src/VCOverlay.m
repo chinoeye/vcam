@@ -435,6 +435,17 @@ static UIWindow *gVCamPanelWindow = nil;
     [VCOverlayLock() unlock];
 }
 
++ (void)setOverlaysHidden:(BOOL)hidden
+{
+    // CALayer 的 hidden 在后台线程设也行，但和挂载/卸载同一把锁保护才干净
+    [VCOverlayLock() lock];
+    for (id key in VCOverlayTable()) {
+        AVSampleBufferDisplayLayer *v = [VCOverlayTable() objectForKey:key];
+        if (v) v.hidden = hidden;
+    }
+    [VCOverlayLock() unlock];
+}
+
 + (void)installPanelIfNeeded
 {
     static dispatch_once_t once;

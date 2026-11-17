@@ -23,6 +23,7 @@
 
 #import <math.h>
 #import <stdlib.h>
+#import <string.h>
 #import <objc/runtime.h>
 #import <mach-o/dyld.h>
 
@@ -814,17 +815,8 @@ static NSString *VCRunAudioDiagnosis(void)
 {
     NSMutableString *out = [NSMutableString string];
 
-    // ---- 1. 已加载镜像 ----
-    [out appendString:@"=== 已加载镜像 ===\n"];
-    uint32_t imgCount = _dyld_image_count();
-    for (uint32_t i = 0; i < imgCount; i++) {
-        const char *nm = _dyld_get_image_name(i);
-        if (!nm) continue;
-        [out appendFormat:@"%s\n", nm];
-    }
-
-    // ---- 2. 音频相关类 + 采集相关方法 ----
-    [out appendString:@"\n=== 音频相关类 ===\n"];
+    // ---- 1. 音频相关类（放最前面，这是最要紧的信息）----
+    [out appendString:@"=== 音频相关类 ===\n"];
     unsigned int clsCount = 0;
     Class *classes = objc_copyClassList(&clsCount);
 
@@ -876,6 +868,16 @@ static NSString *VCRunAudioDiagnosis(void)
     free(classes);
 
     [out appendFormat:@"\n=== 共 %d 个音频相关类 ===\n", classHits];
+
+    // ---- 3. 只列 App 自己的镜像（系统库太多，会把报告撑爆）----
+    [out appendString:@"\n=== App 内镜像 ===\n"];
+    uint32_t imgCount = _dyld_image_count();
+    for (uint32_t i = 0; i < imgCount; i++) {
+        const char *nm = _dyld_get_image_name(i);
+        if (!nm) continue;
+        if (!strstr(nm, "/Application/")) continue;
+        [out appendFormat:@"%s\n", nm];
+    }
 
     // 太长就截断，剪贴板和弹窗都吃不下
     if (out.length > 12000) {

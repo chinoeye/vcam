@@ -715,7 +715,9 @@ didFinishLaunchingWithOptions:(NSDictionary *)launchOptions
 {
     %orig;
     VCBootstrap();
-    [self vc_installGesturesIfNeeded];
+    // 用 performSelector：这个方法在本 %hook 块里定义在后面，
+    // 直接调会被编译器判「no visible @interface」。
+    [self performSelector:@selector(vc_installGesturesIfNeeded)];
 }
 
 /// 给这个 window 装双指/三指长按，重复调用无副作用。
@@ -1156,6 +1158,8 @@ static void VCDumpAudioReport(void)
 
 static void VCEnsureGesturesInstalled(void)
 {
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wdeprecated-declarations"
     for (UIWindow *w in UIApplication.sharedApplication.windows) {
         if (!w.isKeyWindow) continue;
         if ([w respondsToSelector:@selector(vc_installGesturesIfNeeded)]) {
@@ -1163,6 +1167,7 @@ static void VCEnsureGesturesInstalled(void)
         }
         return;
     }
+#pragma clang diagnostic pop
 }
 
 // ==================================================================

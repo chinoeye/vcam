@@ -314,11 +314,14 @@
 
 // 音频与视频允许的最大偏差（秒）。
 //
-//  原来是 0.25，太紧：音频稍微超前或落后就 return nil 拒绝供数据，
-//  上层拿不到 PCM 只能用静音填，听感就是「中间有一两声断音」。
-//  直播场景下连续性比严格同步更重要，放宽到 0.5 —— 半秒的偏差
-//  人耳基本察觉不到，但能把断音消掉。
-#define VC_AV_MAX_DRIFT 0.5
+//  0.25 太紧：稍微超前或落后就 return nil 拒绝供数据，上层补静音，
+//  听感是「中间有一两声断音」；0.5 只是把断音从 3 秒推到 8 秒。
+//
+//  根因是 48000/44100 的换算让推算时间比实际播放快约 8.8%，偏差持续累积。
+//  在没找到不引入死锁的精确时钟方案之前，先把阈值放到足够大 ——
+//  让同步逻辑基本不触发，宁可接受慢漂移（素材 16 秒就回绕重置），
+//  也不要周期性断音。
+#define VC_AV_MAX_DRIFT 30.0
 #define VC_AV_CATCHUP_SLACK 0.10
 #define VC_AV_CATCHUP_GUARD 128
 
@@ -341,15 +344,15 @@
 
         double videoT = _videoSourceSeconds;
 
-        // 优先用外部回报的「实际已播放时间」。
-        // 按已读样本数推算的话，44100/48000 的速率差会让偏差持续累积，
-        // 每隔几秒就撞到阈值导致断音。
-        double readerT;
-        if (_audioPlaybackSeconds > 0) {
-            readerT = _audioPlaybackSeconds;
-        } else {
-            readerT = (double)_audioSamplesRead / _audioSampleRate;
-        }
+        // 用「已读源样本数 / 源采样率」估算素材内的音频位置。
+        //
+        // 曾经试过改用外部回报的「实际播放时间」，但那会造成死锁：
+        // 播放时间只在成功转换后才更新，而它又是判断能否转换的前提 ——
+        // 视频先跑起来后 videoT 已经几百毫秒，音频位置还是 0，
+        // 被判为「严重落后」→ 追赶 → return nil → 时间永不更新 → 彻底无声。
+        //
+        // 所以这里保持按源样本数推算。速率偏差交给下面的阈值兜底。
+        double readerT = (double)_audioSamplesRead / _audioSampleRate;
 
         // ---- 超前：原地等，不消耗数据 ----
         if (readerT > videoT + VC_AV_MAX_DRIFT) {

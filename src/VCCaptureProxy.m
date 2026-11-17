@@ -198,7 +198,23 @@ static NSLock *VCProxyLock(void)
     if (dropOut) *dropOut = NO;
 
     VCamConfig *cfg = VCamConfig.shared;
-    if (!cfg.injectEnabled || cfg.sourceKind == VCSourceKindNone) {
+    BOOL injecting = (cfg.injectEnabled && cfg.sourceKind != VCSourceKindNone);
+
+    // 注入状态一变，同步覆盖层的可见性。
+    //
+    // 那个 AVSampleBufferDisplayLayer 是 opaque 的全屏层，即便一帧都不推，
+    // 它仍然要参与 GPU 合成 —— 等于凭空多合成一整屏预览。
+    // 「关掉注入还是卡」很大一部分就是这么来的。
+    static BOOL sLastInjecting = YES;
+    if (sLastInjecting != injecting) {
+        sLastInjecting = injecting;
+        [VCOverlay setOverlaysHidden:!injecting];
+        VCLog(@"注入状态切换 -> %@，覆盖层已%@",
+              injecting ? @"开" : @"关",
+              injecting ? @"显示" : @"隐藏");
+    }
+
+    if (!injecting) {
         return NULL;   // 关闭注入，原样透传
     }
 

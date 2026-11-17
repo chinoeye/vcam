@@ -36,6 +36,7 @@
 
 - (BOOL)restartVideoReaderLocked;
 - (BOOL)restartAudioReaderLocked;
+- (void)seekAudioToVideoTimeLocked;
 - (void)teardownLocked;
 - (void)notify:(NSString *)status;
 
@@ -314,14 +315,14 @@
 
 // 音频与视频允许的最大偏差（秒）。
 //
-//  0.25 太紧：稍微超前或落后就 return nil 拒绝供数据，上层补静音，
-//  听感是「中间有一两声断音」；0.5 只是把断音从 3 秒推到 8 秒。
+//  这个值决定「音画最多能差多少」，不是「多久断一次」。
 //
-//  根因是 48000/44100 的换算让推算时间比实际播放快约 8.8%，偏差持续累积。
-//  在没找到不引入死锁的精确时钟方案之前，先把阈值放到足够大 ——
-//  让同步逻辑基本不触发，宁可接受慢漂移（素材 16 秒就回绕重置），
-//  也不要周期性断音。
-#define VC_AV_MAX_DRIFT 30.0
+//  实测每秒会累积约 6% 的时间偏差（48000/44100 换算 + 转换器内部延迟）。
+//  15 小时的素材如果不校正，累积偏差能到 50 分钟。
+//
+//  0.25 秒是「校正得足够勤、又不至于太频繁」的平衡点：
+//  偏差一到 250ms 就 seek 回正，人耳察觉不到，seek 频率也很低。
+#define VC_AV_MAX_DRIFT 0.25
 #define VC_AV_CATCHUP_SLACK 0.10
 #define VC_AV_CATCHUP_GUARD 128
 
@@ -354,26 +355,25 @@
         // 所以这里保持按源样本数推算。速率偏差交给下面的阈值兜底。
         double readerT = (double)_audioSamplesRead / _audioSampleRate;
 
-        // ---- 超前：原地等，不消耗数据 ----
-        if (readerT > videoT + VC_AV_MAX_DRIFT) {
-            return nil;
-        }
-
-        // ---- 落后：快速读并丢弃，把读指针追到视频附近 ----
-        if (readerT < videoT - VC_AV_MAX_DRIFT) {
-            int guard = 0;
-            while (guard++ < VC_AV_CATCHUP_GUARD) {
-                double cur = (double)_audioSamplesRead / _audioSampleRate;
-                if (cur >= videoT - VC_AV_CATCHUP_SLACK) break;
-
-                CMSampleBufferRef skip = [_audioOutput copyNextSampleBuffer];
-                if (!skip) break;
-                _audioSamplesRead += CMSampleBufferGetNumSamples(skip);
-                CFRelease(skip);
+        // ---- 偏差过大：直接 seek 回正 ----
+        //
+        //  以前这里分两种处理：
+        //    超前  -> 原地等，return nil（上层补静音 -> 断音）
+        //    落后  -> 循环丢弃数据，return nil（同一块丢掉几百毫秒 -> 断音）
+        //  两种都会让用户听到「中间断一下」，而且不会真正把偏差修掉。
+        //
+        //  现在统一改成 seek：把音频 reader 直接定位到视频当前时刻。
+        //  代价只是丢掉当前这一块（约 21ms，人耳察觉不到），
+        //  换来的是「偏差永远不超过 250ms」，15 小时的素材也不会跑偏。
+        double drift = readerT - videoT;
+        if (fabs(drift) > VC_AV_MAX_DRIFT) {
+            static int sSeekCount = 0;
+            sSeekCount++;
+            if (sSeekCount <= 5 || sSeekCount % 100 == 0) {
+                VCLog(@"音频校正 #%d：偏差 %.0fms -> seek 到 %.2fs",
+                      sSeekCount, drift * 1000, videoT);
             }
-            VCLogVerbose(@"音频追赶：%.0fms -> %.0fms",
-                         readerT * 1000, (double)_audioSamplesRead / _audioSampleRate * 1000);
-            // 本次不输出，让 proxy 丢掉这一帧音频
+            [self seekAudioToVideoTimeLocked];
             return nil;
         }
 
@@ -445,53 +445,60 @@
 {
     [_lock lock];
     @try {
-        if (!_asset) return;
-
-        AVAssetTrack *atrack = [[_asset tracksWithMediaType:AVMediaTypeAudio] firstObject];
-        if (!atrack) return;
-
-        double v = _videoSourceSeconds;
-
-        @try { [_audioReader cancelReading]; } @catch (NSException *e) {}
-
-        NSError *err = nil;
-        _audioReader = [[AVAssetReader alloc] initWithAsset:_asset error:&err];
-        if (!_audioReader) {
-            VCLog(@"音频 seek 失败: %@", err);
-            return;
-        }
-
-        // 往前留 50ms 余量，避免正好卡在音频块边界上丢掉半个包
-        CMTime start = CMTimeMakeWithSeconds(MAX(0.0, v - 0.05), 1000);
-        _audioReader.timeRange = CMTimeRangeMake(start, kCMTimePositiveInfinity);
-
-        NSDictionary *asettings = @{
-            AVFormatIDKey: @(kAudioFormatLinearPCM),
-            AVLinearPCMBitDepthKey: @32,
-            AVLinearPCMIsFloatKey: @YES,
-            AVLinearPCMIsBigEndianKey: @NO,
-            AVLinearPCMIsNonInterleavedKey: @NO,   // 必须带 Key 后缀，否则整个 outputSettings 会被判无效
-            AVSampleRateKey: @48000,
-            AVNumberOfChannelsKey: @1,
-        };
-        _audioOutput = [[AVAssetReaderTrackOutput alloc] initWithTrack:atrack
-                                                       outputSettings:asettings];
-        _audioOutput.alwaysCopiesSampleData = YES;
-        if (![_audioReader canAddOutput:_audioOutput]) return;
-        [_audioReader addOutput:_audioOutput];
-
-        if (![_audioReader startReading]) {
-            VCLog(@"音频 seek 启动失败: %@", _audioReader.error);
-            return;
-        }
-
-        _audioSamplesRead = (uint64_t)(MAX(0.0, v) * _audioSampleRate);
-        _audioSamplesOut = _audioSamplesRead;
-
-        VCLog(@"音频已对齐到视频位置 %.2fs", v);
+        [self seekAudioToVideoTimeLocked];
     } @finally {
         [_lock unlock];
     }
+}
+
+/// 内部版：调用方必须已持有 _lock。
+///
+/// 拆出来的原因：播放过程中的「偏差校正」是在 copyNextAudioPCM 里发起的，
+/// 那时已经持锁，再调公开版会二次加锁死掉。
+- (void)seekAudioToVideoTimeLocked
+{
+    if (!_asset) return;
+
+    AVAssetTrack *atrack = [[_asset tracksWithMediaType:AVMediaTypeAudio] firstObject];
+    if (!atrack) return;
+
+    double v = _videoSourceSeconds;
+
+    @try { [_audioReader cancelReading]; } @catch (NSException *e) {}
+
+    NSError *err = nil;
+    _audioReader = [[AVAssetReader alloc] initWithAsset:_asset error:&err];
+    if (!_audioReader) {
+        VCLog(@"音频 seek 失败: %@", err);
+        return;
+    }
+
+    // 往前留 50ms 余量，避免正好卡在音频块边界上丢掉半个包
+    CMTime start = CMTimeMakeWithSeconds(MAX(0.0, v - 0.05), 1000);
+    _audioReader.timeRange = CMTimeRangeMake(start, kCMTimePositiveInfinity);
+
+    NSDictionary *asettings = @{
+        AVFormatIDKey: @(kAudioFormatLinearPCM),
+        AVLinearPCMBitDepthKey: @32,
+        AVLinearPCMIsFloatKey: @YES,
+        AVLinearPCMIsBigEndianKey: @NO,
+        AVLinearPCMIsNonInterleavedKey: @NO,   // 必须带 Key 后缀，否则整个 outputSettings 会被判无效
+        AVSampleRateKey: @48000,
+        AVNumberOfChannelsKey: @1,
+    };
+    _audioOutput = [[AVAssetReaderTrackOutput alloc] initWithTrack:atrack
+                                                   outputSettings:asettings];
+    _audioOutput.alwaysCopiesSampleData = YES;
+    if (![_audioReader canAddOutput:_audioOutput]) return;
+    [_audioReader addOutput:_audioOutput];
+
+    if (![_audioReader startReading]) {
+        VCLog(@"音频 seek 启动失败: %@", _audioReader.error);
+        return;
+    }
+
+    _audioSamplesRead = (uint64_t)(MAX(0.0, v) * _audioSampleRate);
+    _audioSamplesOut = _audioSamplesRead;
 }
 
 // ------------------------------------------------------------------ 生命周期

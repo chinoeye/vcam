@@ -14,6 +14,7 @@
 #import "VCamConfig.h"
 #import "VCFrameSource.h"
 #import "VCAudioPipeline.h"
+#import "VCAudioSource.h"
 #import "VCLiveSource.h"
 #import "VCCaptureProxy.h"
 #import "VCOverlay.h"
@@ -677,6 +678,8 @@ static void VCApplyURL(NSURL *url)
             NSURL *u = [cfg assetURL];
             NSError *err = nil;
             if (u && [[VCFrameSource shared] reloadWithURL:u error:&err]) {
+            // 音频走独立模块，需要单独加载同一个素材
+            [[VCAudioSource shared] loadURL:u error:NULL];
                 VCLog(@"URL 控制: 素材切到 %@", name);
             } else {
                 VCLog(@"URL 控制: 素材切换失败 %@", err);
@@ -837,7 +840,8 @@ static void VCLoadAssetNow(void)
     }
 
     NSError *err = nil;
-    if (![[VCFrameSource shared] reloadWithURL:url error:&err]) {
+    [[VCAudioSource shared] loadURL:url error:NULL];
+        if (![[VCFrameSource shared] reloadWithURL:url error:&err]) {
         VCRemoteLog(@"装载失败：%@ (%@)", err.localizedDescription, url.lastPathComponent);
     } else {
         VCRemoteLog(@"装载成功：%@", url.lastPathComponent);

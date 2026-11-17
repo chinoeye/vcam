@@ -358,6 +358,105 @@ static volatile UInt32 g_assetLastFrames    = 0;
 static volatile UInt32 g_assetLastBytes     = 0;
 static volatile int    g_assetProbed        = 0;
 
+// ==================================================================
+#pragma mark - PCM 格式转换
+// ==================================================================
+//
+//  实测（2026-11-18）这台机器上两侧格式完全不同：
+//
+//    素材侧（AVAssetReader 解出来的）
+//      float32 / 单声道 / 48000 Hz / 每样本 4 字节
+//
+//    系统侧（AudioUnit input element 的 output scope）
+//      int16   / 双声道 / 44100 Hz / 每帧 4 字节
+//      formatFlags = 0xc = packed | signed integer
+//
+//  直接把 float 当 int16 塞进去，四个维度全错 —— 听感就是沙沙声。
+//  必须走 AudioConverter 做真正的重采样 + 位深转换 + 声道扩展。
+//
+//  目标格式不能在编译期写死：不同机型/音频会话下可能是 48k 或 44.1k、
+//  单声道或双声道。所以每次从 AudioUnitGetProperty 取实时的格式，
+//  格式变了就重建转换器。
+
+static AudioConverterRef g_conv = NULL;
+static AudioStreamBasicDescription g_convSrc = {0};
+static AudioStreamBasicDescription g_convDst = {0};
+static NSLock *g_convLock = nil;
+
+// 给 AudioConverter 喂源数据的回调
+static OSStatus VCConvInputProc(AudioConverterRef cvt,
+                                UInt32 *ioNumPackets,
+                                AudioBufferList *ioData,
+                                AudioStreamPacketDescription **outDesc,
+                                void *userData)
+{
+    NSData *srcData = (__bridge NSData *)userData;
+    if (!srcData) return 1;
+
+    size_t samples = srcData.length / sizeof(float);
+    UInt32 want = *ioNumPackets;
+    if (want > (UInt32)samples) want = (UInt32)samples;
+    if (want == 0) return 1;
+
+    ioData->mNumberBuffers = 1;
+    ioData->mBuffers[0].mNumberChannels = 1;
+    ioData->mBuffers[0].mData = (void *)srcData.bytes;
+    ioData->mBuffers[0].mDataByteSize = (UInt32)(want * sizeof(float));
+
+    *ioNumPackets = want;
+    return noErr;
+}
+
+// 按系统实际格式准备转换器（格式变了就重建）
+static BOOL VCEnsureConverter(AudioStreamBasicDescription dst)
+{
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        g_convLock = [[NSLock alloc] init];
+    });
+
+    [g_convLock lock];
+    @try {
+        if (g_conv && memcmp(&g_convDst, &dst, sizeof(dst)) == 0) {
+            return YES;
+        }
+
+        if (g_conv) {
+            AudioConverterDispose(g_conv);
+            g_conv = NULL;
+        }
+
+        AudioStreamBasicDescription src = {0};
+        src.mSampleRate       = 48000;
+        src.mFormatID         = kAudioFormatLinearPCM;
+        src.mFormatFlags      = kAudioFormatFlagIsFloat | kAudioFormatFlagIsPacked;
+        src.mBytesPerPacket   = 4;
+        src.mFramesPerPacket  = 1;
+        src.mBytesPerFrame    = 4;
+        src.mChannelsPerFrame = 1;
+        src.mBitsPerChannel   = 32;
+
+        OSStatus st = AudioConverterNew(&src, &dst, &g_conv);
+        if (st != noErr || !g_conv) {
+            g_conv = NULL;
+            VCLog(@"AudioConverterNew 失败: %d (dst %.0fHz x%u %u bit flags=0x%x)",
+                  (int)st, dst.mSampleRate, (unsigned)dst.mChannelsPerFrame,
+                  (unsigned)dst.mBitsPerChannel, (unsigned)dst.mFormatFlags);
+            return NO;
+        }
+
+        g_convSrc = src;
+        g_convDst = dst;
+
+        VCLog(@"音频转换器就绪: 48000Hz/mono/float32 -> %.0fHz/x%u/%u bit",
+              dst.mSampleRate, (unsigned)dst.mChannelsPerFrame,
+              (unsigned)dst.mBitsPerChannel);
+        return YES;
+    } @finally {
+        [g_convLock unlock];
+    }
+}
+
 static void VCRewriteAudioBufferList(AudioBufferList *ioData, UInt32 frames)
 {
     if (!ioData || frames == 0) return;
@@ -393,28 +492,48 @@ static void VCRewriteAudioBufferList(AudioBufferList *ioData, UInt32 frames)
 
     [carryLock lock];
     @try {
-        const size_t needBytes = (size_t)frames * sizeof(float);
+        // ---- 系统要什么格式 ----
+        AudioStreamBasicDescription dst = {0};
+        dst.mSampleRate       = (Float64)g_auSysSampleRate;
+        dst.mFormatID         = kAudioFormatLinearPCM;
+        dst.mFormatFlags      = g_auSysFlags;
+        dst.mChannelsPerFrame = g_auSysChannels;
+        dst.mBitsPerChannel   = g_auSysBits;
+        dst.mBytesPerFrame    = g_auSysBytesPerFrame;
+        dst.mBytesPerPacket   = g_auSysBytesPerFrame;
+        dst.mFramesPerPacket  = 1;
 
-        // 补足：一次可能要多拉几块（系统块比解码块小的时候）
-        // 这些变量要提到循环外面 —— 后面捕获素材格式时还要用
-        AudioStreamBasicDescription asbd = {0};
-        CMItemCount srcFrames = 0;
-        NSUInteger lastBytes = 0;
+        if (dst.mSampleRate <= 0 || dst.mChannelsPerFrame == 0 ||
+            dst.mBytesPerFrame == 0 || !VCEnsureConverter(dst)) {
+            // 还没探到系统格式：宁可静音也不放错数据
+            for (UInt32 b = 0; b < ioData->mNumberBuffers; b++) {
+                AudioBuffer *buf = &ioData->mBuffers[b];
+                if (buf->mData && buf->mDataByteSize) {
+                    memset(buf->mData, 0, buf->mDataByteSize);
+                }
+            }
+            return;
+        }
 
+        // ---- 需要多少源帧 ----
+        // 系统要 frames 帧（目标采样率），源采样率是 48000，
+        // 按比例算出要消耗多少源帧。这是重采样必须的一步。
+        const double ratio = g_convSrc.mSampleRate / dst.mSampleRate;
+        size_t needSrcFrames = (size_t)((double)frames * ratio) + 2;  // +2 补偿取整
+        const size_t needBytes = needSrcFrames * sizeof(float);
+
+        // ---- 从解码器补足 carry ----
         int guard = 0;
-        while (carry.length < needBytes && guard++ < 32) {
+        while (carry.length < needBytes && guard++ < 64) {
             CMItemCount got = 0;
             AudioStreamBasicDescription a = {0};
             NSData *more = [[VCFrameSource shared]
                             copyNextAudioPCMWithFrameCount:&got asbd:&a];
             if (!more || more.length == 0) break;
-            asbd      = a;
-            srcFrames = got;
-            lastBytes = more.length;
             [carry appendData:more];
         }
 
-        // 上限 2 秒：解码比消费快时不能让缓冲无限长，否则延迟越滚越大
+        // 上限 2 秒，防止解码快于消费时延迟无限累积
         const size_t maxBytes = 48000 * 2 * sizeof(float);
         if (carry.length > maxBytes) {
             [carry replaceBytesInRange:NSMakeRange(0, carry.length - maxBytes)
@@ -422,51 +541,80 @@ static void VCRewriteAudioBufferList(AudioBufferList *ioData, UInt32 frames)
                                 length:0];
         }
 
-        const float *src = (const float *)carry.bytes;
-        size_t avail = carry.length / sizeof(float);
-        size_t use = (avail < (size_t)frames) ? avail : (size_t)frames;
-
-        // 捕获素材真实格式（只在第一次成功写入时记一次）
-        if (!g_assetProbed && avail > 0) {
-            g_assetProbed        = 1;
-            g_assetFormatID      = asbd.mFormatID;
-            g_assetFormatFlags   = asbd.mFormatFlags;
-            g_assetSampleRate    = (UInt32)asbd.mSampleRate;
-            g_assetChannels      = asbd.mChannelsPerFrame;
-            g_assetBits          = asbd.mBitsPerChannel;
-            g_assetBytesPerFrame = asbd.mBytesPerFrame;
-            g_assetLastFrames    = (UInt32)srcFrames;
-            g_assetLastBytes     = (UInt32)lastBytes;
-        }
+        size_t availFrames = carry.length / sizeof(float);
+        size_t useSrcFrames = (availFrames < needSrcFrames) ? availFrames : needSrcFrames;
 
         static BOOL sLogged = NO;
-        if (!sLogged) {
+        if (!sLogged && useSrcFrames > 0) {
             sLogged = YES;
-            VCLog(@"音频注入：每块 %u 帧，carry 里 %zu 样本，可用 %zu",
-                  (unsigned)frames, avail, use);
+            VCLog(@"音频转换：系统 %.0fHz x%u %u bit，每块要 %u 帧 -> 消耗源 %zu 帧",
+                  dst.mSampleRate, (unsigned)dst.mChannelsPerFrame,
+                  (unsigned)dst.mBitsPerChannel, (unsigned)frames, useSrcFrames);
         }
 
+        if (useSrcFrames == 0) {
+            for (UInt32 b = 0; b < ioData->mNumberBuffers; b++) {
+                AudioBuffer *buf = &ioData->mBuffers[b];
+                if (buf->mData && buf->mDataByteSize) {
+                    memset(buf->mData, 0, buf->mDataByteSize);
+                }
+            }
+            return;
+        }
+
+        // ---- 走 AudioConverter 做重采样 + 位深 + 声道 ----
+        NSData *srcSlice = [NSData dataWithBytes:carry.bytes
+                                         length:useSrcFrames * sizeof(float)];
+
+        const size_t outBytes = (size_t)frames * dst.mBytesPerFrame;
+        NSMutableData *out = [NSMutableData dataWithLength:outBytes];
+
+        AudioBufferList outABL;
+        outABL.mNumberBuffers = 1;
+        outABL.mBuffers[0].mNumberChannels = dst.mChannelsPerFrame;
+        outABL.mBuffers[0].mData = out.mutableBytes;
+        outABL.mBuffers[0].mDataByteSize = (UInt32)outBytes;
+
+        UInt32 outPackets = frames;
+        OSStatus st = AudioConverterFillComplexBuffer(g_conv,
+                                                      VCConvInputProc,
+                                                      (__bridge void *)srcSlice,
+                                                      &outPackets,
+                                                      &outABL,
+                                                      NULL);
+
+        if (st != noErr && st != 1) {
+            static BOOL sErr = NO;
+            if (!sErr) {
+                sErr = YES;
+                VCLog(@"AudioConverterFillComplexBuffer 失败: %d", (int)st);
+            }
+            for (UInt32 b = 0; b < ioData->mNumberBuffers; b++) {
+                AudioBuffer *buf = &ioData->mBuffers[b];
+                if (buf->mData && buf->mDataByteSize) {
+                    memset(buf->mData, 0, buf->mDataByteSize);
+                }
+            }
+            return;
+        }
+
+        // ---- 写进系统 buffer ----
         for (UInt32 b = 0; b < ioData->mNumberBuffers; b++) {
             AudioBuffer *buf = &ioData->mBuffers[b];
             if (!buf->mData || buf->mDataByteSize == 0) continue;
 
-            UInt32 ch = buf->mNumberChannels ? buf->mNumberChannels : 1;
-            float *dst = (float *)buf->mData;
-
-            // 先整块清零：mDataByteSize 是容量（40960 字节），
-            // 远大于本次要写的 frames 帧，不清零会把上次的残余一起播出去
             memset(buf->mData, 0, buf->mDataByteSize);
 
-            for (size_t i = 0; i < (size_t)frames; i++) {
-                float v = (i < use) ? src[i] : 0.0f;
-                for (UInt32 c = 0; c < ch; c++) {
-                    dst[i * ch + c] = v;
-                }
+            size_t writeLen = outABL.mBuffers[0].mDataByteSize;
+            if (writeLen > buf->mDataByteSize) writeLen = buf->mDataByteSize;
+            if (writeLen > 0) {
+                memcpy(buf->mData, outABL.mBuffers[0].mData, writeLen);
             }
         }
 
-        if (use > 0) {
-            [carry replaceBytesInRange:NSMakeRange(0, use * sizeof(float))
+        // ---- 消费 carry ----
+        if (useSrcFrames > 0) {
+            [carry replaceBytesInRange:NSMakeRange(0, useSrcFrames * sizeof(float))
                              withBytes:NULL
                                 length:0];
         }

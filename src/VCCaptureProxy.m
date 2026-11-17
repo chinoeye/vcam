@@ -12,6 +12,7 @@
 
 #import <AudioToolbox/AudioToolbox.h>
 #import <string.h>
+#import <math.h>
 
 // ------------------------------------------------------------------ 注册表
 
@@ -41,12 +42,11 @@ static NSLock *VCProxyLock(void)
 // ------------------------------------------------------------------ 代理
 
 @interface VCCaptureProxy ()
-- (CMSampleBufferRef)replacementForBuffer:(CMSampleBufferRef)original
-                                     drop:(BOOL *)dropOut;
 - (void)rewriteVideoBufferInPlace:(CMSampleBufferRef)buffer
                              drop:(BOOL *)dropOut;
+- (void)rewriteAudioBufferInPlace:(CMSampleBufferRef)buffer
+                             drop:(BOOL *)dropOut;
 - (BOOL)syncInjectingState;
-- (AudioStreamBasicDescription)standardAudioFormat;
 @end
 
 @implementation VCCaptureProxy
@@ -191,25 +191,24 @@ static NSLock *VCProxyLock(void)
             return;
         }
 
-        // ---- 音频：沿用替换策略 ----
+        // ---- 音频：同样原地改写系统 buffer ----
+        //
+        // 原来是伪造一个新的 CMSampleBuffer 塞给 App，
+        // 跟视频那边是一样的坑，只是音频对附件的依赖没那么多，
+        // 崩得没那么早而已。统一改成原地写内容。
         BOOL drop = NO;
-        CMSampleBufferRef replacement = [self replacementForBuffer:original drop:&drop];
-
-        if (replacement) {
-            [invocation setArgument:&replacement atIndex:3];
-            @try {
-                [invocation invokeWithTarget:target];
-            } @catch (NSException *e) {
-                VCLog(@"转发 delegate 异常: %@", e.reason);
-            } @finally {
-                CFRelease(replacement);
-            }
-            return;
-        }
+        [self rewriteAudioBufferInPlace:original drop:&drop];
 
         if (drop) {
             return;
         }
+
+        @try {
+            [invocation invokeWithTarget:target];
+        } @catch (NSException *e) {
+            VCLog(@"转发 delegate 异常: %@", e.reason);
+        }
+        return;
     }
 
     @try {
@@ -310,26 +309,27 @@ static NSLock *VCProxyLock(void)
     CVPixelBufferRelease(src);
 }
 
-// ------------------------------------------------------------------ 音频：替换
+// ------------------------------------------------------------------ 音频：原地改写
 //
-//  视频走原地改写，这里只剩音频在用替换策略。
-//  音频 buffer 没有视频那边那么多附件要求，替换是安全的。
+//  跟视频同一套思路：保留系统给的 CMSampleBuffer，
+//  用 CMBlockBufferReplaceDataBytes 把里面的 PCM 换掉。
+//
+//  系统麦克风的 buffer 格式由 AURemoteIO 决定，通常是
+//  Float32 / 48kHz / 双声道。素材音轨我们是按单声道 48k 取的，
+//  所以这里做一次「单声道 → N 声道」的复制展开。
+//  采样率不一致的情况没有做重采样，直接丢帧 —— 宁肯短暂静音，
+//  也不要放出一段变速变调的声音。
 
-- (CMSampleBufferRef)replacementForBuffer:(CMSampleBufferRef)original drop:(BOOL *)dropOut
+- (void)rewriteAudioBufferInPlace:(CMSampleBufferRef)buffer drop:(BOOL *)dropOut
 {
     if (dropOut) *dropOut = NO;
+    if (!buffer) return;
 
-    if (![self syncInjectingState]) {
-        return NULL;   // 关闭注入，原样透传
-    }
-
-    if (_kind == VCProxyKindVideo) {
-        return NULL;   // 视频已经走 rewriteVideoBufferInPlace:，这里不处理
-    }
+    if (![self syncInjectingState]) return;   // 不注入，原样透传
+    if (_kind != VCProxyKindAudio) return;
 
     VCamConfig *cfg = VCamConfig.shared;
 
-    // ---------------- 音频 ----------------
     // 从「真麦」切到「素材」的瞬间，音频 reader 还停在很久以前读到的位置。
     // 必须先把它跳到视频当前所在处，否则一开口就是几十秒前的音，口型全错。
     static VCAudioMode sLastAudioMode = VCAudioModeMic;
@@ -338,47 +338,103 @@ static NSLock *VCProxyLock(void)
     }
     sLastAudioMode = cfg.audioMode;
 
-    switch (cfg.audioMode) {
-        case VCAudioModeMic:
-            return NULL;   // 真麦克风透传
+    if (cfg.audioMode == VCAudioModeMic) {
+        return;   // 真麦克风，原样透传
+    }
 
-        case VCAudioModeMute: {
-            const CMItemCount frames = 1024;
-            AudioStreamBasicDescription asbd = [self standardAudioFormat];
-            NSMutableData *silence = [NSMutableData dataWithLength:frames * sizeof(float)];
-            return [[VCSampleBufferFactory shared]
-                    createAudioSampleBufferWithData:silence asbd:&asbd frameCount:frames];
+    CMBlockBufferRef block = CMSampleBufferGetDataBuffer(buffer);
+    if (!block) {
+        if (dropOut) *dropOut = YES;
+        return;
+    }
+
+    size_t dstLen = CMBlockBufferGetDataLength(block);
+    if (dstLen == 0) {
+        if (dropOut) *dropOut = YES;
+        return;
+    }
+
+    // ---- 静音：直接把整块清零 ----
+    if (cfg.audioMode == VCAudioModeMute) {
+        NSMutableData *silence = [NSMutableData dataWithLength:dstLen];
+        if (CMBlockBufferReplaceDataBytes(silence.bytes, block, 0, dstLen) != kCMBlockBufferNoErr) {
+            if (dropOut) *dropOut = YES;
         }
+        return;
+    }
 
-        case VCAudioModeAsset: {
-            CMItemCount frames = 0;
-            AudioStreamBasicDescription asbd = {0};
-            NSData *pcm = [[VCFrameSource shared] copyNextAudioPCMWithFrameCount:&frames asbd:&asbd];
-            if (!pcm || frames <= 0) {
-                if (dropOut) *dropOut = YES;
-                return NULL;
-            }
-            if (asbd.mSampleRate <= 0) asbd = [self standardAudioFormat];
-            return [[VCSampleBufferFactory shared]
-                    createAudioSampleBufferWithData:pcm asbd:&asbd frameCount:frames];
+    // ---- 素材音轨 ----
+    CMFormatDescriptionRef fmt = CMSampleBufferGetFormatDescription(buffer);
+    if (!fmt) {
+        if (dropOut) *dropOut = YES;
+        return;
+    }
+    const AudioStreamBasicDescription *dstAsbd =
+        CMAudioFormatDescriptionGetStreamBasicDescription(fmt);
+    if (!dstAsbd) {
+        if (dropOut) *dropOut = YES;
+        return;
+    }
+
+    // 只处理 32 位浮点。别的格式没法直接搬，丢帧。
+    if ((dstAsbd->mFormatFlags & kAudioFormatFlagIsFloat) == 0 ||
+        dstAsbd->mBitsPerChannel != 32) {
+        static BOOL sWarned = NO;
+        if (!sWarned) {
+            sWarned = YES;
+            VCLog(@"系统音频不是 float32（flags=0x%x bits=%u），素材音轨无法灌入",
+                  (unsigned)dstAsbd->mFormatFlags, (unsigned)dstAsbd->mBitsPerChannel);
+        }
+        if (dropOut) *dropOut = YES;
+        return;
+    }
+
+    CMItemCount srcFrames = 0;
+    AudioStreamBasicDescription srcAsbd = {0};
+    NSData *pcm = [[VCFrameSource shared] copyNextAudioPCMWithFrameCount:&srcFrames asbd:&srcAsbd];
+    if (!pcm || srcFrames <= 0) {
+        if (dropOut) *dropOut = YES;
+        return;
+    }
+
+    // 采样率不同就不放，避免变调
+    if (srcAsbd.mSampleRate > 0 &&
+        fabs(srcAsbd.mSampleRate - dstAsbd->mSampleRate) > 1.0) {
+        if (dropOut) *dropOut = YES;
+        return;
+    }
+
+    UInt32 dstCh = dstAsbd->mChannelsPerFrame ? dstAsbd->mChannelsPerFrame : 1;
+    size_t dstFrames    = dstLen / (sizeof(float) * dstCh);
+    size_t srcFramesUse = (pcm.length / sizeof(float));
+    size_t n = (dstFrames < srcFramesUse) ? dstFrames : srcFramesUse;
+    if (n == 0) {
+        if (dropOut) *dropOut = YES;
+        return;
+    }
+
+    // 展开成 dst 的声道布局，尾部补静音
+    NSMutableData *out = [NSMutableData dataWithLength:dstLen];
+    float *dstp = (float *)out.mutableBytes;
+    const float *srcp = (const float *)pcm.bytes;
+    for (size_t i = 0; i < n; i++) {
+        float v = srcp[i];
+        for (UInt32 c = 0; c < dstCh; c++) {
+            dstp[i * dstCh + c] = v;
         }
     }
-    return NULL;
-}
 
-- (AudioStreamBasicDescription)standardAudioFormat
-{
-    AudioStreamBasicDescription asbd;
-    memset(&asbd, 0, sizeof(asbd));
-    asbd.mSampleRate       = 48000;
-    asbd.mFormatID         = kAudioFormatLinearPCM;
-    asbd.mFormatFlags      = kAudioFormatFlagIsFloat | kAudioFormatFlagIsPacked;
-    asbd.mBytesPerPacket   = 4;
-    asbd.mFramesPerPacket  = 1;
-    asbd.mBytesPerFrame    = 4;
-    asbd.mChannelsPerFrame = 1;
-    asbd.mBitsPerChannel   = 32;
-    return asbd;
+    if (CMBlockBufferReplaceDataBytes(out.bytes, block, 0, dstLen) != kCMBlockBufferNoErr) {
+        if (dropOut) *dropOut = YES;
+        return;
+    }
+
+    static BOOL sLogged = NO;
+    if (!sLogged) {
+        sLogged = YES;
+        VCLog(@"音频注入已接通：素材 %.0fHz mono -> 系统 %.0fHz x%u，每块 %zu 帧",
+              srcAsbd.mSampleRate, dstAsbd->mSampleRate, (unsigned)dstCh, n);
+    }
 }
 
 @end

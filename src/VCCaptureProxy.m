@@ -325,32 +325,26 @@ static NSLock *VCProxyLock(void)
     if (dropOut) *dropOut = NO;
     if (!buffer) return;
 
-    // 第一条到达这里的音频帧打一次日志 —— 用来判断
-    // 「音频 delegate 到底有没有走我们这条代理」。
-    // 如果日志里完全没有这一行，说明抖音压根没用 AVCaptureAudioDataOutput，
-    // 那 hook 再怎么写也拦不到它的麦克风。
-    static BOOL sLoggedArrival = NO;
-    if (!sLoggedArrival) {
-        sLoggedArrival = YES;
-        VCLog(@"音频回调已到达代理（audioMode=%ld kind=%ld）",
-              (long)VCamConfig.shared.audioMode, (long)_kind);
-    }
-
-    if (![self syncInjectingState]) return;   // 不注入，原样透传
+    if (![self syncInjectingState]) return;
     if (_kind != VCProxyKindAudio) return;
 
     VCamConfig *cfg = VCamConfig.shared;
+    if (cfg.audioMode == VCAudioModeMic) return;   // 真麦，原样透传
 
-    // 从「真麦」切到「素材」的瞬间，音频 reader 还停在很久以前读到的位置。
-    // 必须先把它跳到视频当前所在处，否则一开口就是几十秒前的音，口型全错。
-    static VCAudioMode sLastAudioMode = VCAudioModeMic;
-    if (cfg.audioMode == VCAudioModeAsset && sLastAudioMode != VCAudioModeAsset) {
-        [[VCFrameSource shared] seekAudioToVideoTime];
-    }
-    sLastAudioMode = cfg.audioMode;
-
-    if (cfg.audioMode == VCAudioModeMic) {
-        return;   // 真麦克风，原样透传
+    // 只处理「静音」，素材音轨一律交给 AudioUnitRender 那条路。
+    //
+    // 原因：抖音的直播/拍摄音频实际走 AudioUnit（byteaudio），
+    // 我们已经在 hook_AudioUnitRender 里用 AudioConverter 做了
+    // float32/mono/48k -> int16/stereo/44.1k 的完整转换。
+    //
+    // 如果这里也往素材里写，两条路径会抢同一个 VCFrameSource 的读指针：
+    //   · 数据被消耗两次，音频被加速
+    //   · 互相打断连续性，表现为「每隔几秒断一下」
+    //   · 而且这里没有格式转换，写进去的 float 会被当 int16 播
+    //
+    // 所以素材音轨这条路彻底让给 AudioUnitRender，这里只保留静音能力。
+    if (cfg.audioMode != VCAudioModeMute) {
+        return;
     }
 
     CMBlockBufferRef block = CMSampleBufferGetDataBuffer(buffer);
@@ -358,93 +352,15 @@ static NSLock *VCProxyLock(void)
         if (dropOut) *dropOut = YES;
         return;
     }
-
     size_t dstLen = CMBlockBufferGetDataLength(block);
     if (dstLen == 0) {
         if (dropOut) *dropOut = YES;
         return;
     }
 
-    // ---- 静音：直接把整块清零 ----
-    if (cfg.audioMode == VCAudioModeMute) {
-        NSMutableData *silence = [NSMutableData dataWithLength:dstLen];
-        if (CMBlockBufferReplaceDataBytes(silence.bytes, block, 0, dstLen) != kCMBlockBufferNoErr) {
-            if (dropOut) *dropOut = YES;
-        }
-        return;
-    }
-
-    // ---- 素材音轨 ----
-    CMFormatDescriptionRef fmt = CMSampleBufferGetFormatDescription(buffer);
-    if (!fmt) {
+    NSMutableData *silence = [NSMutableData dataWithLength:dstLen];
+    if (CMBlockBufferReplaceDataBytes(silence.bytes, block, 0, dstLen) != kCMBlockBufferNoErr) {
         if (dropOut) *dropOut = YES;
-        return;
-    }
-    const AudioStreamBasicDescription *dstAsbd =
-        CMAudioFormatDescriptionGetStreamBasicDescription(fmt);
-    if (!dstAsbd) {
-        if (dropOut) *dropOut = YES;
-        return;
-    }
-
-    // 只处理 32 位浮点。别的格式没法直接搬，丢帧。
-    if ((dstAsbd->mFormatFlags & kAudioFormatFlagIsFloat) == 0 ||
-        dstAsbd->mBitsPerChannel != 32) {
-        static BOOL sWarned = NO;
-        if (!sWarned) {
-            sWarned = YES;
-            VCLog(@"系统音频不是 float32（flags=0x%x bits=%u），素材音轨无法灌入",
-                  (unsigned)dstAsbd->mFormatFlags, (unsigned)dstAsbd->mBitsPerChannel);
-        }
-        if (dropOut) *dropOut = YES;
-        return;
-    }
-
-    CMItemCount srcFrames = 0;
-    AudioStreamBasicDescription srcAsbd = {0};
-    NSData *pcm = [[VCFrameSource shared] copyNextAudioPCMWithFrameCount:&srcFrames asbd:&srcAsbd];
-    if (!pcm || srcFrames <= 0) {
-        if (dropOut) *dropOut = YES;
-        return;
-    }
-
-    // 采样率不同就不放，避免变调
-    if (srcAsbd.mSampleRate > 0 &&
-        fabs(srcAsbd.mSampleRate - dstAsbd->mSampleRate) > 1.0) {
-        if (dropOut) *dropOut = YES;
-        return;
-    }
-
-    UInt32 dstCh = dstAsbd->mChannelsPerFrame ? dstAsbd->mChannelsPerFrame : 1;
-    size_t dstFrames    = dstLen / (sizeof(float) * dstCh);
-    size_t srcFramesUse = (pcm.length / sizeof(float));
-    size_t n = (dstFrames < srcFramesUse) ? dstFrames : srcFramesUse;
-    if (n == 0) {
-        if (dropOut) *dropOut = YES;
-        return;
-    }
-
-    // 展开成 dst 的声道布局，尾部补静音
-    NSMutableData *out = [NSMutableData dataWithLength:dstLen];
-    float *dstp = (float *)out.mutableBytes;
-    const float *srcp = (const float *)pcm.bytes;
-    for (size_t i = 0; i < n; i++) {
-        float v = srcp[i];
-        for (UInt32 c = 0; c < dstCh; c++) {
-            dstp[i * dstCh + c] = v;
-        }
-    }
-
-    if (CMBlockBufferReplaceDataBytes(out.bytes, block, 0, dstLen) != kCMBlockBufferNoErr) {
-        if (dropOut) *dropOut = YES;
-        return;
-    }
-
-    static BOOL sLogged = NO;
-    if (!sLogged) {
-        sLogged = YES;
-        VCLog(@"音频注入已接通：素材 %.0fHz mono -> 系统 %.0fHz x%u，每块 %zu 帧",
-              srcAsbd.mSampleRate, dstAsbd->mSampleRate, (unsigned)dstCh, n);
     }
 }
 

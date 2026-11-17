@@ -452,6 +452,12 @@ static volatile UInt64 g_audioOutFrames = 0;
 static volatile int g_audioBail = 0;
 static volatile int g_audioWriteOK = 0;
 
+// 上一块成功写给系统的音频数据。
+// 当这一轮拿不到新数据（seek 校正期间、解码器重启）时，
+// 用它填充而不是写静音 —— 静音会造成幅度突降到 0，听感是「啪」一声；
+// 延音保持幅度连续，140ms 的阻塞也听不出来。
+static NSMutableData *g_lastAudioOut = nil;
+
 // ==================================================================
 #pragma mark - PCM 格式转换
 // ==================================================================
@@ -690,9 +696,20 @@ static void VCRewriteAudioBufferList(AudioBufferList *ioData, UInt32 frames)
 
         if (useSrcFrames == 0) {
             g_audioBail = 5;
+            // 没数据时重复上一块，而不是静音。
+            // 静音会造成幅度突降到 0，听感是「啪」一声断掉；
+            // 延音保持幅度连续，140ms 的阻塞也听不出来。
             for (UInt32 b = 0; b < ioData->mNumberBuffers; b++) {
                 AudioBuffer *buf = &ioData->mBuffers[b];
-                if (buf->mData && buf->mDataByteSize) {
+                if (!buf->mData || buf->mDataByteSize == 0) continue;
+                if (g_lastAudioOut.length > 0) {
+                    size_t n = g_lastAudioOut.length < buf->mDataByteSize
+                             ? g_lastAudioOut.length : buf->mDataByteSize;
+                    memcpy(buf->mData, g_lastAudioOut.bytes, n);
+                    if (n < buf->mDataByteSize) {
+                        memset((uint8_t *)buf->mData + n, 0, buf->mDataByteSize - n);
+                    }
+                } else {
                     memset(buf->mData, 0, buf->mDataByteSize);
                 }
             }
@@ -753,12 +770,18 @@ static void VCRewriteAudioBufferList(AudioBufferList *ioData, UInt32 frames)
 
         g_audioWriteOK++;
         g_audioBail = 0;
+        {
+            if (!g_lastAudioOut) g_lastAudioOut = [NSMutableData data];
+            [g_lastAudioOut setData:out];
+        }
 
-        // ---- 消费 carry：按转换器实际吃掉的量，不再按比例估算 ----
+        // ---- 消费 carry：按转换器实际吃掉的量 ----
         if (ctx.consumed > 0) {
             [carry replaceBytesInRange:NSMakeRange(0, ctx.consumed * sizeof(float))
                              withBytes:NULL
                                 length:0];
+            // 回报真实播放进度：avc 用它算音画偏差，避免因解码超前而误 seek
+            [VCFrameSource shared].audioConsumedSourceFrames += ctx.consumed;
         }
 
         // 统计实际输出帧数（诊断用）。

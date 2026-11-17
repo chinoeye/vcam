@@ -54,6 +54,10 @@ NS_ASSUME_NONNULL_BEGIN
 @property (nonatomic, readonly) BOOL     isRunning;
 @property (nonatomic, readonly) size_t   bufferedFrames;   // 当前缓冲里的帧数
 
+/// 当前音画偏差（秒）。正值 = 视频比音频快（音频落后）。
+/// 5 小时长跑时随时读它，判断闭环校正有没有把偏差钳住。
+@property (nonatomic, readonly) double   currentDrift;
+
 @end
 
 NS_ASSUME_NONNULL_END

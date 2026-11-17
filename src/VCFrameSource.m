@@ -357,7 +357,13 @@ int g_vcSeekCount = 0;
         // 被判为「严重落后」→ 追赶 → return nil → 时间永不更新 → 彻底无声。
         //
         // 所以这里保持按源样本数推算。速率偏差交给下面的阈值兜底。
-        double readerT = (double)_audioSamplesRead / _audioSampleRate;
+        // 用「真正播出去的采样数」而不是「解码进度」。
+        // 解码进度包含攒在 carry 里还没用的数据，用它算会虚高，
+        // 触发无意义的 seek（每次 seek 阻塞 140ms，就是那个大断点）。
+        uint64_t played = _audioConsumedSourceFrames > 0
+                        ? _audioConsumedSourceFrames
+                        : _audioSamplesRead;
+        double readerT = (double)played / _audioSampleRate;
 
         // ---- 偏差过大：直接 seek 回正 ----
         //

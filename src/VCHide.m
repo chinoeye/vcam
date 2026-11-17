@@ -266,9 +266,21 @@ static uint32_t  gImageMapCount  = 0;      // 可见镜像数
 static uint32_t  gImageMapTotal  = 0;      // 建立映射时的真实镜像总数
 static NSLock   *gImageMapLock   = nil;
 
+static dispatch_once_t gImageMapOnce = 0;
+
 static BOOL VCShouldHideImage(const char *name)
 {
     if (!name) return NO;
+
+    // 快速剪枝：系统库路径不可能命中下面的黑名单。
+    // dladdr 是热路径（符号化 / 堆栈展开 / 崩溃捕获都会密集调用），
+    // 省掉这 8 次 strstr 收益很明显。
+    // 注意不能用 "/usr/lib/" 剪枝 —— /usr/lib/libsubstrate.dylib 就在那底下。
+    if (name[0] == '/') {
+        if (strncmp(name, "/System/Library/", 16) == 0) return NO;
+        if (strncmp(name, "/usr/lib/system/", 16) == 0) return NO;
+    }
+
     if (strstr(name, "VCam.dylib"))  return YES;
     if (strstr(name, "/var/jb/"))    return YES;
     if (strstr(name, "MobileSubstrate")) return YES;
@@ -284,12 +296,21 @@ static uint32_t (*orig_dyld_image_count)(void);
 static const char *(*orig_dyld_get_image_name)(uint32_t);
 static const struct mach_header *(*orig_dyld_get_image_header)(uint32_t);
 
-/// 调用方必须持 gImageMapLock。
-static void VCImageMapRebuildLocked(uint32_t total)
+/// 建一次「可见索引 → 真实索引」映射表。
+///
+/// 为什么不学之前那样「每次比对总数、变了就重建」：
+/// 那样每次调用都要 加锁 + 一次 _dyld_image_count() 系统调用。
+/// 而 dyld_image_count / dladdr 在 App 里可能是每秒几万次的热路径
+/// （符号化、堆栈展开、崩溃捕获、各种 SDK 的自检），
+/// 等于给每一次符号查询都套一层锁加一次系统调用 —— 这才是"点哪卡哪"的来源。
+///
+/// 镜像列表在启动完成后基本不变，建一次表读到底就行。
+/// 即使之后动态加载了新库，最坏结果只是那个库不被过滤，不影响功能。
+static void VCImageMapBuildOnce(void)
 {
-    free(gImageMap);
-    gImageMap = NULL;
-    gImageMapCount = 0;
+    if (!orig_dyld_image_count || !orig_dyld_get_image_name) return;
+
+    uint32_t total = orig_dyld_image_count();
     gImageMapTotal = total;
     if (total == 0) return;
 
@@ -298,48 +319,43 @@ static void VCImageMapRebuildLocked(uint32_t total)
 
     uint32_t visible = 0;
     for (uint32_t i = 0; i < total; i++) {
-        if (VCShouldHideImage(orig_dyld_get_image_name(i))) continue;
+        const char *n = orig_dyld_get_image_name(i);
+        if (VCShouldHideImage(n)) continue;
         map[visible++] = i;
     }
+
     gImageMap = map;
     gImageMapCount = visible;
+
+    // 注意：这里绝对不能写日志。
+    // 本函数跑在 dispatch_once 的 block 里，而 NSLog 内部可能反过来调用
+    // dladdr / _dyld_image_count，那会重入同一个 dispatch_once —— 直接死锁。
+    // （之前版本用 NSLock 没这个问题，换成 dispatch_once 之后就有了。）
 }
 
-/// 调用方必须持 gImageMapLock。
-static void VCImageMapEnsureLocked(void)
+/// 热路径：首次之后就是一个 dispatch_once 的原子判断，无锁、无系统调用。
+static inline void VCImageMapEnsure(void)
 {
-    if (!orig_dyld_image_count || !orig_dyld_get_image_name) return;
-    uint32_t total = orig_dyld_image_count();
-    if (gImageMap && total == gImageMapTotal) return;
-    VCImageMapRebuildLocked(total);
+    dispatch_once(&gImageMapOnce, ^{
+        VCImageMapBuildOnce();
+    });
 }
 
 static uint32_t hook_dyld_image_count(void)
 {
     // MSHookFunction 替换过程中若被内部逻辑反调，orig 可能尚未赋值
     if (!orig_dyld_image_count || !orig_dyld_get_image_name) return 0;
-
-    uint32_t visible;
-    [gImageMapLock lock];
-    VCImageMapEnsureLocked();
-    visible = gImageMapCount;
-    [gImageMapLock unlock];
-    return visible;
+    VCImageMapEnsure();
+    return gImageMapCount;
 }
 
-/// 可见索引 → 真实索引。命中缓存后是 O(1)。
-static int VCRealIndexFor(uint32_t idx)
+/// 可见索引 → 真实索引。热路径只做一次数组读取。
+static inline int VCRealIndexFor(uint32_t idx)
 {
-    if (!orig_dyld_image_count || !orig_dyld_get_image_name) return -1;
-
-    int real = -1;
-    [gImageMapLock lock];
-    VCImageMapEnsureLocked();
-    if (gImageMap && idx < gImageMapCount) {
-        real = (int)gImageMap[idx];
-    }
-    [gImageMapLock unlock];
-    return real;
+    if (!orig_dyld_get_image_name) return -1;
+    VCImageMapEnsure();
+    if (!gImageMap || idx >= gImageMapCount) return -1;
+    return (int)gImageMap[idx];
 }
 
 static const char *hook_dyld_get_image_name(uint32_t idx)

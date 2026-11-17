@@ -376,12 +376,20 @@ static void VCRewriteAudioBufferList(AudioBufferList *ioData, UInt32 frames)
 
         UInt32 ch = buf->mNumberChannels ? buf->mNumberChannels : 1;
         float *dst = (float *)buf->mData;
-        size_t total = buf->mDataByteSize / sizeof(float);
-        size_t frameCount = total / ch;
-        if (frameCount > frames) frameCount = frames;
 
-        // 单声道素材展开到 N 声道交错布局，尾部补静音
-        for (size_t i = 0; i < frameCount; i++) {
+        // ★ 先整块清零。
+        //
+        // mDataByteSize 是 buffer 的**容量**（这台机器是 40960 字节
+        // = 5120 帧 × 2 声道 × 4 字节），而本次真正要渲染的只有
+        // frames 帧（实测在 941~1024 之间浮动）。
+        //
+        // 如果只覆盖前 frames 帧，后面几千帧的原始麦克风数据会原封不动
+        // 留在 buffer 里被一起播出去 —— 听感就是「素材声 + 沙沙杂音」。
+        // buffer 是复用的，每次都必须先清干净。
+        memset(buf->mData, 0, buf->mDataByteSize);
+
+        // 单声道素材展开到 N 声道交错布局
+        for (size_t i = 0; i < (size_t)frames; i++) {
             float v = (i < avail) ? src[i] : 0.0f;
             for (UInt32 c = 0; c < ch; c++) {
                 dst[i * ch + c] = v;

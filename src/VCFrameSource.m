@@ -214,9 +214,50 @@
     return result;
 }
 
-- (BOOL)restartVideoReaderLocked
+// 只解码，不造 CMSampleBuffer、不重打时间戳。
+// 供「原地改写系统摄像头 buffer」路线使用 —— 时间戳由系统那份 buffer 提供，
+// 我们只负责把像素换掉。
+- (CVPixelBufferRef)copyNextPixelBuffer
 {
-    AVAssetTrack *vtrack = [[_asset tracksWithMediaType:AVMediaTypeVideo] firstObject];
+    if (!_ready || VCamConfig.shared.paused) return NULL;
+
+    CVPixelBufferRef result = NULL;
+    [_lock lock];
+    @try {
+        for (int attempt = 0; attempt < 2 && !result; attempt++) {
+            if (!_videoReader || _videoReader.status != AVAssetReaderStatusReading) {
+                if (![self restartVideoReaderLocked]) break;
+            }
+
+            CMSampleBufferRef raw = [_videoOutput copyNextSampleBuffer];
+            if (raw) {
+                CMTime srcPTS = CMSampleBufferGetPresentationTimeStamp(raw);
+                if (CMTIME_IS_VALID(srcPTS)) {
+                    double t = CMTimeGetSeconds(srcPTS);
+                    if (isfinite(t) && t >= 0) {
+                        _videoSourceSeconds = t;
+                    }
+                }
+                CVPixelBufferRef pb = CMSampleBufferGetImageBuffer(raw);
+                if (pb) result = CVPixelBufferRetain(pb);
+                CFRelease(raw);
+                _frameCount++;
+            } else {
+                if (VCamConfig.shared.loopEnabled) {
+                    [self restartVideoReaderLocked];
+                } else {
+                    break;
+                }
+            }
+        }
+    } @finally {
+        [_lock unlock];
+    }
+    return result;
+}
+
+- (BOOL)restartVideoReaderLocked
+{    AVAssetTrack *vtrack = [[_asset tracksWithMediaType:AVMediaTypeVideo] firstObject];
     if (!vtrack) return NO;
 
     @try {

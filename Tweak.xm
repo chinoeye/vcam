@@ -383,27 +383,42 @@ static AudioStreamBasicDescription g_convSrc = {0};
 static AudioStreamBasicDescription g_convDst = {0};
 static NSLock *g_convLock = nil;
 
-// 给 AudioConverter 喂源数据的回调
+// AudioConverter 的喂数据上下文。
+//
+//  之前的实现每次都把整块数据从头返回、且永远 return noErr ——
+//  转换器需要更多数据时会重复拿到同一段，边界处就出错，
+//  听感是持续的低度杂音。
+//
+//  改成记录「已经喂到哪儿」，吃完返回 1 告诉转换器没数据了。
+//  同时 consumed 让我们知道转换器到底吃了多少源帧，
+//  消费 carry 时按实际值扣，不再按比例估算（估不准会累积漂移）。
+typedef struct {
+    const float *data;
+    size_t       totalFrames;
+    size_t       consumed;
+} VCConvCtx;
+
 static OSStatus VCConvInputProc(AudioConverterRef cvt,
                                 UInt32 *ioNumPackets,
                                 AudioBufferList *ioData,
                                 AudioStreamPacketDescription **outDesc,
                                 void *userData)
 {
-    NSData *srcData = (__bridge NSData *)userData;
-    if (!srcData) return 1;
+    VCConvCtx *ctx = (VCConvCtx *)userData;
+    if (!ctx || !ctx->data) return 1;
 
-    size_t samples = srcData.length / sizeof(float);
+    size_t remaining = ctx->totalFrames - ctx->consumed;
     UInt32 want = *ioNumPackets;
-    if (want > (UInt32)samples) want = (UInt32)samples;
-    if (want == 0) return 1;
+    if (want > (UInt32)remaining) want = (UInt32)remaining;
+    if (want == 0) return 1;   // 喂完了
 
     ioData->mNumberBuffers = 1;
     ioData->mBuffers[0].mNumberChannels = 1;
-    ioData->mBuffers[0].mData = (void *)srcData.bytes;
+    ioData->mBuffers[0].mData = (void *)(ctx->data + ctx->consumed);
     ioData->mBuffers[0].mDataByteSize = (UInt32)(want * sizeof(float));
 
     *ioNumPackets = want;
+    ctx->consumed += want;
     return noErr;
 }
 
@@ -563,9 +578,6 @@ static void VCRewriteAudioBufferList(AudioBufferList *ioData, UInt32 frames)
         }
 
         // ---- 走 AudioConverter 做重采样 + 位深 + 声道 ----
-        NSData *srcSlice = [NSData dataWithBytes:carry.bytes
-                                         length:useSrcFrames * sizeof(float)];
-
         const size_t outBytes = (size_t)frames * dst.mBytesPerFrame;
         NSMutableData *out = [NSMutableData dataWithLength:outBytes];
 
@@ -575,10 +587,15 @@ static void VCRewriteAudioBufferList(AudioBufferList *ioData, UInt32 frames)
         outABL.mBuffers[0].mData = out.mutableBytes;
         outABL.mBuffers[0].mDataByteSize = (UInt32)outBytes;
 
+        VCConvCtx ctx;
+        ctx.data        = (const float *)carry.bytes;
+        ctx.totalFrames = useSrcFrames;
+        ctx.consumed    = 0;
+
         UInt32 outPackets = frames;
         OSStatus st = AudioConverterFillComplexBuffer(g_conv,
                                                       VCConvInputProc,
-                                                      (__bridge void *)srcSlice,
+                                                      &ctx,
                                                       &outPackets,
                                                       &outABL,
                                                       NULL);
@@ -612,9 +629,9 @@ static void VCRewriteAudioBufferList(AudioBufferList *ioData, UInt32 frames)
             }
         }
 
-        // ---- 消费 carry ----
-        if (useSrcFrames > 0) {
-            [carry replaceBytesInRange:NSMakeRange(0, useSrcFrames * sizeof(float))
+        // ---- 消费 carry：按转换器实际吃掉的量，不再按比例估算 ----
+        if (ctx.consumed > 0) {
+            [carry replaceBytesInRange:NSMakeRange(0, ctx.consumed * sizeof(float))
                              withBytes:NULL
                                 length:0];
         }

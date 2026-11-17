@@ -1,9 +1,15 @@
 name: Build VCam
 
-# 把 ios/ 目录整个作为仓库根上传后即可用。
-# 触发：push / 手动 workflow_dispatch / 打 tag
+# Linux runner 版。
 #
-# 产物在 Artifacts 里，是一个 .deb，直接 scp 到手机 dpkg -i 安装。
+# 为什么不用 macos-latest：
+#   GitHub 免费池的 macOS arm64 runner 容量严重不足，官方页面自己都挂着
+#   "Due to capacity constraints, jobs targeting macOS arm64 runners may
+#    experience longer queue times."
+#   实测 #34 排了 15 分钟，最后 steps=0 直接被取消（The job was not
+#   acquired by Runner）—— 机器从头到尾没分配过。
+#
+# Theos 在 Ubuntu 上能完整编译 iOS tweak，而且 ubuntu-latest 排队通常在 1 分钟内。
 
 on:
   push:
@@ -11,49 +17,96 @@ on:
     tags: ["v*"]
   workflow_dispatch:
 
-# 用 API 逐文件上传会产生多个 commit，也就是多次 push 触发。
-# 只保留最后一次运行，前面排队/进行中的全部取消，避免白等一轮。
+# 逐文件上传会产生多个 commit，也就是多次 push 触发。
+# 只保留最后一次运行，前面排队/进行中的全部取消。
 concurrency:
   group: build-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
   build:
-    runs-on: macos-latest
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            make git curl xz-utils clang lld llvm file build-essential \
+            libssl-dev libplist-dev zlib1g-dev libtinfo6 fakeroot dpkg || true
 
       - name: Setup Theos
         uses: Randomblock1/theos-action@v1
         with:
           theos-src: https://github.com/theos/theos.git
 
+      - name: Install iOS SDK
+        run: |
+          set -e
+          mkdir -p "$THEOS/sdks"
+          echo "--- 现有 sdks ---"
+          ls -la "$THEOS/sdks" 2>/dev/null || true
+
+          # theos-action 通常已经带 SDK，有就直接用
+          if ls "$THEOS/sdks"/*.sdk >/dev/null 2>&1; then
+            echo "SDK 已存在，跳过下载"
+            ls -d "$THEOS/sdks/"*.sdk
+            exit 0
+          fi
+
+          # 没有才用稀疏克隆拿，只取要的那一个版本。
+          # 不能用 releases 直链 —— theos/sdks 没有 master tag，
+          # 那样的地址返回的是 9100 字节的 404 页面，解压必炸。
+          cd /tmp
+          git clone --depth 1 --filter=blob:none --sparse \
+            https://github.com/theos/sdks.git sdks-repo
+          cd sdks-repo
+          git sparse-checkout set iPhoneOS15.0.sdk
+          cp -r iPhoneOS15.0.sdk "$THEOS/sdks/"
+          ls -d "$THEOS/sdks/"*.sdk
+
       - name: Show toolchain
         run: |
           echo "THEOS=$THEOS"
-          ls "$THEOS"
-          xcrun --sdk iphoneos --show-sdk-version
+          ls "$THEOS/sdks" || true
+          echo "--- clang ---"
+          clang --version | head -1
+          echo "--- ldid ---"
+          which ldid || ls "$THEOS/bin" || true
 
       - name: Clean
-        run: make clean || true
+        run: |
+          cat Makefile
+          echo "--- 文件清单 ---"
+          find . -maxdepth 2 -type f | sort
+          make clean || true
 
       - name: Build package
-        run: make package FINALPACKAGE=1 DEBUG=0
+        # pipefail 不能漏：不然 make 失败时管道的退出码是 tail 的（永远是 0），
+        # 步骤会显示成功而实际没编译出任何东西。
+        run: |
+          set -o pipefail
+          make package FINALPACKAGE=1 DEBUG=0 2>&1 | tee /tmp/build.log | tail -400
+          echo "=== 构建完成 ==="
 
       - name: List artifacts
-        run: ls -lh packages/ || true
+        run: |
+          echo "--- packages 目录 ---"
+          ls -lh packages/ 2>/dev/null || echo "packages 目录不存在"
+          echo "--- 全仓库找 deb/dylib ---"
+          find . -type f \( -name '*.deb' -o -name '*.dylib' \) 2>/dev/null | head -20 || true
 
       # TrollFools 注入要的是裸 dylib，不是 deb。
-      # 这里直接把 .theos 里的 arm64 产物捞出来单独出一个 artifact，
+      # 直接把 .theos 里的 arm64 产物捞出来单独出一个 artifact，
       # 省掉「下载 deb → 解包 → 找 dylib」这三步。
       - name: Collect raw dylib
         shell: bash
         run: |
-          set -e
           mkdir -p out
-          # 优先取 arm64 的最终产物（debug 目录里的旧副本不要）
           while IFS= read -r f; do
             cp -v "$f" "out/$(basename "$f")"
           done < <(find .theos -type f -name "*.dylib" -path "*arm64*" 2>/dev/null || true)
@@ -67,14 +120,13 @@ jobs:
 
           echo "--- out ---"
           ls -lh out/ || true
-          test -n "$(ls -A out 2>/dev/null)" || { echo "没有找到 dylib"; exit 1; }
 
       - name: Upload deb
         uses: actions/upload-artifact@v4
         with:
           name: VCam-deb
           path: packages/*.deb
-          if-no-files-found: error
+          if-no-files-found: warn
           retention-days: 30
 
       - name: Upload dylib

@@ -48,6 +48,14 @@ NS_ASSUME_NONNULL_BEGIN
                                         toFormat:(OSType)format
                                         CF_RETURNS_RETAINED;
 
+/// 把 src 的像素画进 dst（尺寸或格式不同会自动缩放/转换）。
+///
+/// 这是「原地改写」路线的核心：
+/// 不去伪造 CMSampleBuffer，而是保留系统给的那个 buffer，
+/// 只把它里面的像素内容换掉。这样 PTS、attachments、format description
+/// 全是系统原生的 —— 之前伪造 buffer 导致 App 侧 CFRelease(NULL) 的坑全绕开。
+- (BOOL)copyPixelBuffer:(CVPixelBufferRef)src into:(CVPixelBufferRef)dst;
+
 /// 当前帧的 JPEG 快照，供 AVCapturePhoto 出口使用
 - (void)updateJPEGFromPixelBuffer:(CVPixelBufferRef)pixelBuffer;
 - (nullable NSData *)currentJPEG;

@@ -102,11 +102,9 @@ static OSStatus VCPipeInputProc(AudioConverterRef cvt,
     uint64_t _produced;
     uint64_t _consumed;
     uint64_t _underrun;
+    size_t   _takeThisCall;     // 本次调用从环形缓冲取走的字节数
     uint64_t _starved;          // copyNextAudioPCM 拿不到数据的次数
     int      _seekCount;
-
-    uint8_t *_lastOut;
-    size_t   _lastOutBytes;
 
     pthread_mutex_t _lock;
 }
@@ -167,8 +165,6 @@ static OSStatus VCPipeInputProc(AudioConverterRef cvt,
     // 清空所有状态
     pthread_mutex_lock(&_lock);
     if (_ring) { free(_ring); _ring = NULL; }
-    if (_lastOut) { free(_lastOut); _lastOut = NULL; }
-    _lastOutBytes = 0;
     if (_conv) { AudioConverterDispose(_conv); _conv = NULL; }
 
     _dstFormat     = format;
@@ -414,12 +410,9 @@ static OSStatus VCPipeInputProc(AudioConverterRef cvt,
 {
     if (!ioData || frames == 0) return;
 
-    // 所有对 _ring / _bytesPerFrame 的访问都必须在锁内 ——
-    // setTargetFormat 会 free 掉旧缓冲，锁外读指针就是 use-after-free。
     pthread_mutex_lock(&_lock);
 
     if (!_ring || _bytesPerFrame == 0) {
-        // 格式还没就绪：输出静音，但仍要填满 buffer，否则是脏数据
         for (UInt32 b = 0; b < ioData->mNumberBuffers; b++) {
             AudioBuffer *buf = &ioData->mBuffers[b];
             if (buf->mData && buf->mDataByteSize) {
@@ -430,23 +423,37 @@ static OSStatus VCPipeInputProc(AudioConverterRef cvt,
         return;
     }
 
-    const size_t needBytes = (size_t)frames * _bytesPerFrame;
-    const size_t avail     = _count * _bytesPerFrame;
+    // ---- 可写长度：以 AudioUnit 的契约为准 ----
+    //
+    //  契约是 mDataByteSize == frames * bytesPerFrame。
+    //  实测抖音这里给的 mDataByteSize 是 40960，而 frames=1024、bpf=4
+    //  算出来只有 4096 —— 差 10 倍。上一版盲目信任 mDataByteSize，
+    //  每次都往 4KB 的缓冲里写 40KB，越界 36KB，
+    //  这就是「越做越差」的重要原因之一。
+    //
+    //  现在一律取两者较小值，绝不越界。
+    const size_t contractBytes = (size_t)frames * _bytesPerFrame;
 
-    size_t take = needBytes < avail ? needBytes : avail;
-    take -= take % _bytesPerFrame;
-
-    BOOL shortfall = (take < needBytes);
-    if (shortfall) _underrun++;      // 每次调用最多计一次
+    _takeThisCall = 0;      // 每次调用都要重置，否则会沿用上次的残留值
 
     for (UInt32 b = 0; b < ioData->mNumberBuffers; b++) {
         AudioBuffer *buf = &ioData->mBuffers[b];
         if (!buf->mData || buf->mDataByteSize == 0) continue;
 
-        size_t filled = 0;
+        size_t writable = buf->mDataByteSize < contractBytes
+                        ? buf->mDataByteSize : contractBytes;
+        writable -= writable % _bytesPerFrame;
+        if (writable == 0) continue;
 
-        // ① 先从环形缓冲取真实数据
-        if (take > 0) {
+        if (b == 0) {
+            size_t avail0 = _count * _bytesPerFrame;
+            _takeThisCall = writable < avail0 ? writable : avail0;
+            _takeThisCall -= _takeThisCall % _bytesPerFrame;
+        }
+        size_t take = _takeThisCall;
+
+        if (take >= writable) {
+            // 缓冲够：整块拷贝（实时线程唯一的工作）
             size_t tail = _ringBytes - _readPos;
             if (take <= tail) {
                 memcpy(buf->mData, _ring + _readPos, take);
@@ -454,39 +461,27 @@ static OSStatus VCPipeInputProc(AudioConverterRef cvt,
                 memcpy(buf->mData, _ring + _readPos, tail);
                 memcpy((uint8_t *)buf->mData + tail, _ring, take - tail);
             }
-            filled = take;
+        } else {
+            // 缓冲不够：这一块直接输出静音，并计数。
+            //
+            //  不重复上一块 —— 重复整块 1024 帧（21ms）会让声音变成
+            //  机械的「哒哒哒」，就是用户说的打电报。
+            //  静音至少听感是「短暂空白」，不会制造假的节奏感。
+            memset(buf->mData, 0, writable);
+            _underrun++;
         }
 
-        // ② 不足一块的部分用「上一次的输出」补齐，绝不补零。
-        //
-        //    补零会让波形从当前幅度瞬间跌到 0，听感就是密集的咔哒声
-        //    （打电报）。延音保持幅度连续，几百微秒的缺口人耳听不出来。
-        if (filled < buf->mDataByteSize) {
-            size_t pad = buf->mDataByteSize - filled;
-            if (_lastOut && _lastOutBytes > 0) {
-                size_t n = pad < _lastOutBytes ? pad : _lastOutBytes;
-                memcpy((uint8_t *)buf->mData + filled, _lastOut, n);
-                if (n < pad) {
-                    memset((uint8_t *)buf->mData + filled + n, 0, pad - n);
-                }
-            } else {
-                memset((uint8_t *)buf->mData + filled, 0, pad);
-            }
-        }
-
-        // ③ 存一份本次输出，供下次补齐用
-        if (_lastOutBytes < buf->mDataByteSize) {
-            uint8_t *np = realloc(_lastOut, buf->mDataByteSize);
-            if (np) { _lastOut = np; _lastOutBytes = buf->mDataByteSize; }
-        }
-        if (_lastOut && _lastOutBytes >= buf->mDataByteSize) {
-            memcpy(_lastOut, buf->mData, buf->mDataByteSize);
+        // 契约外的那部分（mDataByteSize 比 needBytes 大的时候）清掉，
+        // 避免残留上一次的数据被当成有效样本播出来。
+        if (buf->mDataByteSize > writable) {
+            memset((uint8_t *)buf->mData + writable, 0,
+                   buf->mDataByteSize - writable);
         }
     }
 
-    if (take > 0) {
-        _readPos = (_readPos + take) % _ringBytes;
-        size_t takenFrames = take / _bytesPerFrame;
+    if (_takeThisCall > 0) {
+        _readPos = (_readPos + _takeThisCall) % _ringBytes;
+        size_t takenFrames = _takeThisCall / _bytesPerFrame;
         if (takenFrames > _count) takenFrames = _count;
         _count -= takenFrames;
         _consumed += takenFrames;

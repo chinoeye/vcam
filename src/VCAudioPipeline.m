@@ -31,15 +31,13 @@
 //
 //  这个值**直接等于音频延迟**：缓冲里存多少，声音就比画面晚多少。
 //
-//  取 400ms（19200 帧）的实测依据：
-//    · copyNextAudioPCM 和视频解码共用 VCFrameSource 的锁，
-//      视频解码忙的时候音频生产会被挡，单次可能耗时 20~30ms
-//    · 定时器 10ms 一次，被拖慢后实际间隔可能翻倍
-//    · 消费侧 1024 帧/21ms = 48.8 帧/ms
-//      → 30ms 的生产间隔要吃掉 1464 帧存货
-//      → 万一连续两次被挡就要 3000 帧
-//    200ms（9600 帧）余量太薄，实测欠载率 20%；400ms 有 4 倍余量。
-static const size_t kRingFrames = 19200;
+//  取 800ms（38400 帧）的依据：
+//    · 实测欠载 103 次 / 713 次调用 = 14.5%，每次欠载会让实时线程
+//      重复上一块 21ms，听感是「哒哒哒」——就是用户说的打电报
+//    · 生产端单次耗时被视频解码拖到 20~50ms，定时器 5ms 一次会堆积
+//    · 800ms 有 16 倍余量，即使连续卡几次也不会取空
+//    · 录播场景 800ms 延迟完全可接受（不是实时互动）
+static const size_t kRingFrames = 38400;
 
 // ------------------------------------------------------------------ 转换输入回调
 
@@ -104,6 +102,7 @@ static OSStatus VCPipeInputProc(AudioConverterRef cvt,
     uint64_t _produced;
     uint64_t _consumed;
     uint64_t _underrun;
+    uint64_t _starved;          // copyNextAudioPCM 拿不到数据的次数
     int      _seekCount;
 
     uint8_t *_lastOut;
@@ -289,56 +288,25 @@ static OSStatus VCPipeInputProc(AudioConverterRef cvt,
     if (count >= kRingFrames * 7 / 10) return;
     size_t freeFrames = kRingFrames - count;
 
-    // ---- 闭环校正：音频追视频 ----
+    // ---- 不做「音画时间对齐」----
     //
-    //  视频时间 currentVideoSourceTime 是唯一权威时钟。
-    //  每块生产前比一次「已解码到的素材时间」和视频时间的差：
+    //  这里曾经有一段闭环校正：拿 currentVideoSourceTime（视频**解码**进度）
+    //  和音频已解码位置比对，偏差超 100ms 就 seek。
+    //  实测是错的，而且很糟：
     //
-    //    > 100ms  → seek 对齐（在后台线程做，缓冲有 400ms 存货，
-    //               重建 reader 的 100 多毫秒实时线程完全察觉不到）
-    //    ≤ 100ms  → 不管它，正常生产
+    //    视频解码天生超前播放（预解码 + 抖音按 30fps 取帧，解码器跑得更快），
+    //    报告里 currentVideoSourceTime 比实际播放位置超前了 14.7 秒。
+    //    音频按它对齐 → 音频也超前 14.7 秒 → 下次检查还是超前 → 再 seek
+    //    → 96 次 seek，每次清空 400ms 缓冲 → 连续断点，25 秒数据被丢弃。
     //
-    //  这样音画偏差永远钳在 100ms 内，5 小时也不会累积。
-    //  按 0.01% 的残余速率误差估算，5 小时大约 seek 18 次，
-    //  总损失 378ms / 18000s = 0.002%，听不出来。
-    {
-        double videoT = [[VCFrameSource shared] currentVideoSourceTime];
-        if (videoT > 0.5) {   // 视频还没真正开始播的时候不做校正
-            double error = videoT - _decodedMaterialSeconds;
-            if (fabs(error) > 0.10) {
-                _seekCount++;
-                if (_seekCount <= 5 || _seekCount % 50 == 0) {
-                    VCLog(@"音频闭环校正 #%d：偏差 %.0fms（视频 %.2fs / 音频 %.2fs）",
-                          _seekCount, error * 1000, videoT, _decodedMaterialSeconds);
-                }
-                [[VCFrameSource shared] seekAudioToVideoTime];
+    //  真正保证音画同步的机制不是这个：
+    //    我们在**采集端**供数据。视频帧和音频块都由系统按实时节奏取走，
+    //    只要两者都不间断地按顺序供给，编码出来的音画天然同步。
+    //    唯一要保证的是「供给不中断」—— 那是环形缓冲水位控制的活。
+    //
+    //  素材循环时的对齐由 VCFrameSource 负责：视频回绕时会一起重置音频 reader。
 
-                // seek 之后必须清空环形缓冲。
-                //
-                //  缓冲里存的是「seek 之前」解码出来的音频，seek 之后解码器
-                //  跳到了别的位置 —— 两者接在一起就是硬切，音画立刻错位。
-                //  清空之后实时线程会走延音分支（用 _lastOut 填补），
-                //  最多 400ms 的延音，听感是「声音略微拖长」，不会断。
-                pthread_mutex_lock(&_lock);
-                _writePos = 0;
-                _readPos  = 0;
-                _count    = 0;
-                // seekAudioToVideoTime 内部往前留了 50ms 余量，
-                // 所以实际读到的位置是 videoT - 0.05
-                _decodedMaterialSeconds = videoT - 0.05;
-                if (_decodedMaterialSeconds < 0) _decodedMaterialSeconds = 0;
-                pthread_mutex_unlock(&_lock);
-            }
-        }
-    }
-
-
-    // 一次最多补 0.5 秒，别长时间占着后台队列
-    size_t want = freeFrames;
-    size_t cap  = (size_t)(dstRate / 2);
-    if (want > cap) want = cap;
-
-    [self produceFrames:want];
+[self produceFrames:want];
 }
 
 - (void)produceFrames:(size_t)wantFrames
@@ -362,9 +330,9 @@ static OSStatus VCPipeInputProc(AudioConverterRef cvt,
 
     size_t avail = srcData.length / sizeof(float);
     if (avail == 0) {
-        static int sMiss = 0;
-        if (++sMiss <= 3 || sMiss % 100 == 0) {
-            VCLog(@"音频管道：本轮拿不到素材数据 (#%d)", sMiss);
+        _starved++;
+        if (_starved <= 3 || _starved % 500 == 0) {
+            VCLog(@"音频管道：本轮拿不到素材数据 (累计 %llu 次)", _starved);
         }
         return;
     }
@@ -531,9 +499,17 @@ static OSStatus VCPipeInputProc(AudioConverterRef cvt,
 
 - (double)currentDrift
 {
-    double videoT = [[VCFrameSource shared] currentVideoSourceTime];
-    if (videoT <= 0) return 0.0;
-    return videoT - _decodedMaterialSeconds;
+    // 现在不做「音频追视频」的时间校正了 —— 那个机制用的时钟是错的
+    // （videoSourceSeconds 是解码进度，天生比播放位置超前十几秒）。
+    //
+    // 这个属性保留名字，但含义改成「当前缓冲里存了多少秒的音频」，
+    // 也就是声音相对画面晚多少。800ms 缓冲下它应该在 0.3~0.8 之间，
+    // 掉到 0.1 以下就说明生产快跟不上了。
+    pthread_mutex_lock(&_lock);
+    size_t c = _count;
+    Float64 r = _dstFormat.mSampleRate;
+    pthread_mutex_unlock(&_lock);
+    return r > 0 ? (double)c / (double)r : 0.0;
 }
 
 - (size_t)bufferedFrames

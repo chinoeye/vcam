@@ -5,6 +5,13 @@
 #import "VCamConfig.h"
 #import "VCLog.h"
 
+#import <sys/socket.h>
+#import <netinet/in.h>
+#import <netdb.h>
+#import <arpa/inet.h>
+#import <unistd.h>
+#import <string.h>
+
 static NSString *const kDomain = @"com.yg.vcam";
 
 // rootless 环境所有 tweak 资源在 /var/jb 下；rootful 直接是根
@@ -53,9 +60,13 @@ static NSString *VCJailbreakRoot(void)
 {
     _sourceKind        = VCSourceKindAsset;
     _audioMode         = VCAudioModeMic;
-    _assetName         = @"";
-    _liveHost          = @"";
-    _livePort          = 8099;
+    // 默认素材名。没有 config.plist 时靠它去电脑拉 test_demo.mp4，
+    // 因为抖音是苹果正版、爱思不给浏览沙盒，没法手动把文件塞进来。
+    _assetName         = @"test_demo";
+    // 默认电脑地址（局域网）。IP 变了要么改这里重编，要么放 config.plist 覆盖。
+    _liveHost          = @"192.168.3.88";
+    _livePort          = 8099;   // 实时帧 TCP（obs_live_push.py）
+    _httpPort          = 8088;   // 素材下载 HTTP（serve_assets.py）
     _injectEnabled     = YES;
     _loopEnabled       = YES;
     _paused            = NO;
@@ -127,6 +138,12 @@ static NSString *VCJailbreakRoot(void)
     if (d[@"assetName"])         _assetName = [d[@"assetName"] description];
     if (d[@"audioMode"])         _audioMode = (VCAudioMode)[d[@"audioMode"] integerValue];
 
+    // 实时源（OBS 推流）：sourceKind=1 时走 VCLiveSource
+    if (d[@"sourceKind"])        _sourceKind = (VCSourceKind)[d[@"sourceKind"] integerValue];
+    if (d[@"liveHost"])          _liveHost = [d[@"liveHost"] description];
+    if (d[@"livePort"])          _livePort = (uint16_t)[d[@"livePort"] integerValue];
+    if (d[@"httpPort"])          _httpPort = (uint16_t)[d[@"httpPort"] integerValue];
+
     VCLog(@"已加载配置文件 %@（inject=%d asset=%@）",
           path, _injectEnabled, _assetName);
 }
@@ -176,8 +193,7 @@ static NSString *VCJailbreakRoot(void)
 }
 
 - (void)persist
-{
-    NSUserDefaults *d = [[NSUserDefaults alloc] initWithSuiteName:kDomain];
+{    NSUserDefaults *d = [[NSUserDefaults alloc] initWithSuiteName:kDomain];
     if (!d) d = [NSUserDefaults standardUserDefaults];
 
     [d setInteger:_sourceKind forKey:@"sourceKind"];
@@ -228,6 +244,113 @@ static NSString *VCJailbreakRoot(void)
         }
     }
     return nil;
+}
+
+// ------------------------------------------------------------------ 素材自动下载
+//
+//  抖音是「苹果正版」，爱思助手不给浏览沙盒，没法手动拖文件进去。
+//  所以改成：本地找不到素材就自己去电脑拉。
+//
+//  为什么用裸 socket 而不是 NSURLSession：
+//    ATS 默认禁止 http 明文，而抖音的 Info.plist 在别人的签名里，我们改不了。
+//    BSD socket 走的是底层，不受 ATS 那套检查约束。
+
+static BOOL VCDownloadHTTP(NSString *host, uint16_t port, NSString *path, NSString *dest)
+{
+    if (host.length == 0 || path.length == 0 || dest.length == 0) return NO;
+
+    struct hostent *he = gethostbyname(host.UTF8String);
+    if (!he || he->h_addrtype != AF_INET || !he->h_addr_list[0]) return NO;
+
+    int fd = socket(AF_INET, SOCK_STREAM, 0);
+    if (fd < 0) return NO;
+
+    struct timeval tv;
+    tv.tv_sec = 15;
+    tv.tv_usec = 0;
+    setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+    setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+
+    struct sockaddr_in addr;
+    memset(&addr, 0, sizeof(addr));
+    addr.sin_family = AF_INET;
+    addr.sin_port   = htons(port);
+    memcpy(&addr.sin_addr.s_addr, he->h_addr_list[0], sizeof(uint32_t));
+
+    if (connect(fd, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
+        close(fd);
+        return NO;
+    }
+
+    char req[512];
+    snprintf(req, sizeof(req),
+             "GET %s HTTP/1.0\r\nHost: %s\r\nUser-Agent: VCam\r\n"
+             "Accept: */*\r\nConnection: close\r\n\r\n",
+             path.UTF8String, host.UTF8String);
+
+    if (send(fd, req, strlen(req), 0) <= 0) {
+        close(fd);
+        return NO;
+    }
+
+    NSMutableData *buf = [NSMutableData dataWithCapacity:4 * 1024 * 1024];
+    char tmp[32768];
+    ssize_t n;
+    while ((n = recv(fd, tmp, sizeof(tmp), 0)) > 0) {
+        [buf appendBytes:tmp length:(NSUInteger)n];
+    }
+    close(fd);
+
+    if (buf.length == 0) return NO;
+
+    NSData *sep = [@"\r\n\r\n" dataUsingEncoding:NSUTF8StringEncoding];
+    NSRange r = [buf rangeOfData:sep options:0
+                           range:NSMakeRange(0, MIN(buf.length, (NSUInteger)8192))];
+    if (r.location == NSNotFound) return NO;
+
+    NSString *head = [[NSString alloc] initWithData:[buf subdataWithRange:NSMakeRange(0, r.location)]
+                                           encoding:NSUTF8StringEncoding];
+    if (![head hasPrefix:@"HTTP/1.0 200"] && ![head hasPrefix:@"HTTP/1.1 200"]) {
+        VCLog(@"下载被拒: %@", [head componentsSeparatedByString:@"\r\n"].firstObject);
+        return NO;
+    }
+
+    NSData *body = [buf subdataWithRange:
+                    NSMakeRange(r.location + r.length,
+                                buf.length - r.location - r.length)];
+    if (body.length < 4096) return NO;   // 太小，肯定不是视频
+
+    return [body writeToFile:dest atomically:YES];
+}
+
+- (BOOL)ensureAssetDownloaded
+{
+    if (_assetName.length == 0) return NO;
+
+    NSString *dir  = [self assetDirectory];
+    NSString *dest = [dir stringByAppendingPathComponent:
+                      [_assetName stringByAppendingPathExtension:@"mp4"]];
+
+    NSFileManager *fm = [NSFileManager defaultManager];
+    if ([fm fileExistsAtPath:dest]) {
+        return YES;   // 已经有了
+    }
+    [fm createDirectoryAtPath:dir withIntermediateDirectories:YES attributes:nil error:NULL];
+
+    if (_liveHost.length == 0) {
+        VCLog(@"素材缺失，且没配 liveHost，无法自动下载");
+        return NO;
+    }
+
+    uint16_t port = _httpPort > 0 ? _httpPort : 8088;
+    NSString *escaped = [_assetName stringByAddingPercentEncodingWithAllowedCharacters:
+                         [NSCharacterSet URLPathAllowedCharacterSet]];
+    NSString *path = [NSString stringWithFormat:@"/%@.mp4", escaped];
+
+    VCLog(@"本地无素材，从 %@:%u 拉 %@", _liveHost, port, path);
+    BOOL ok = VCDownloadHTTP(_liveHost, port, path, dest);
+    VCLog(@"素材下载%@", ok ? @"成功" : @"失败");
+    return ok;
 }
 
 @end

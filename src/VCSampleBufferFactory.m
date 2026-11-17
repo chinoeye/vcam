@@ -11,6 +11,7 @@
 #import <CoreImage/CoreImage.h>
 #import <AudioToolbox/AudioToolbox.h>
 #import <stdlib.h>
+#import <string.h>
 
 @interface VCSampleBufferFactory ()
 {
@@ -308,8 +309,96 @@
     return dst;
 }
 
-// ------------------------------------------------------------------ 快照
+// ------------------------------------------------------------------ 原地改写
+//
+//  为什么需要这条路线：
+//    之前的做法是用 CMSampleBufferCreateReadyWithImageBuffer 伪造一个 buffer
+//    塞给 App。但真实摄像头的 buffer 里还有很多我们造不出来的东西 ——
+//    sample attachments、format description extensions（VerInfo /
+//    CameraIntrinsicMatrix）、data buffer 结构。App 一读就拿到 NULL，
+//    然后对这个 NULL 调 CFRelease，直接 EXC_BREAKPOINT。
+//
+//    崩溃堆栈每次都一模一样：
+//      CFRelease.cold.1 <- CFRelease <- AwemeCore
+//      <- __invoking___ <- VCam.dylib forwardInvocation: <- AVFCapture
+//
+//  现在改成：保留系统给的那个 buffer，只把像素内容换掉。
+//  PTS、attachments、format description 全部原生，App 不会察觉。
+//  代价是每帧多一次 memcpy（同格式）或一次 GPU 缩放（异格式）。
 
+- (BOOL)copyPixelBuffer:(CVPixelBufferRef)src into:(CVPixelBufferRef)dst
+{
+    if (!src || !dst) return NO;
+
+    size_t sw = CVPixelBufferGetWidth(src);
+    size_t sh = CVPixelBufferGetHeight(src);
+    size_t dw = CVPixelBufferGetWidth(dst);
+    size_t dh = CVPixelBufferGetHeight(dst);
+    OSType sf = CVPixelBufferGetPixelFormatType(src);
+    OSType df = CVPixelBufferGetPixelFormatType(dst);
+
+    // ---- 同尺寸同格式：按平面直接 memcpy，最快 ----
+    if (sw == dw && sh == dh && sf == df) {
+        if (CVPixelBufferLockBaseAddress(src, kCVPixelBufferLock_ReadOnly) != kCVReturnSuccess) {
+            return NO;
+        }
+        if (CVPixelBufferLockBaseAddress(dst, 0) != kCVReturnSuccess) {
+            CVPixelBufferUnlockBaseAddress(src, kCVPixelBufferLock_ReadOnly);
+            return NO;
+        }
+
+        BOOL ok = YES;
+        size_t planes = CVPixelBufferGetPlaneCount(src);
+
+        if (planes == 0) {
+            void *sbase = CVPixelBufferGetBaseAddress(src);
+            void *dbase = CVPixelBufferGetBaseAddress(dst);
+            size_t slen  = CVPixelBufferGetDataSize(src);
+            size_t dlen  = CVPixelBufferGetDataSize(dst);
+            if (sbase && dbase && slen <= dlen) {
+                memcpy(dbase, sbase, slen);
+            } else {
+                ok = NO;
+            }
+        } else {
+            for (size_t i = 0; i < planes; i++) {
+                void  *sbase = CVPixelBufferGetBaseAddressOfPlane(src, i);
+                void  *dbase = CVPixelBufferGetBaseAddressOfPlane(dst, i);
+                size_t h     = CVPixelBufferGetHeightOfPlane(src, i);
+                size_t sbpr  = CVPixelBufferGetBytesPerRowOfPlane(src, i);
+                size_t dbpr  = CVPixelBufferGetBytesPerRowOfPlane(dst, i);
+                if (!sbase || !dbase) { ok = NO; break; }
+                size_t rowLen = (sbpr < dbpr) ? sbpr : dbpr;
+                for (size_t y = 0; y < h; y++) {
+                    memcpy((uint8_t *)dbase + y * dbpr,
+                           (uint8_t *)sbase + y * sbpr,
+                           rowLen);
+                }
+            }
+        }
+
+        CVPixelBufferUnlockBaseAddress(dst, 0);
+        CVPixelBufferUnlockBaseAddress(src, kCVPixelBufferLock_ReadOnly);
+        return ok;
+    }
+
+    // ---- 尺寸或格式不同：交给 VTPixelTransferSession 缩放 + 转格式 ----
+    if (!_transfer) {
+        if (VTPixelTransferSessionCreate(kCFAllocatorDefault, &_transfer) != noErr) {
+            return NO;
+        }
+    }
+
+    OSStatus st = VTPixelTransferSessionTransferImage(_transfer, src, dst);
+    if (st != noErr) {
+        VCLog(@"写入系统帧失败 %d (src %zux%zu 0x%x -> dst %zux%zu 0x%x)",
+              (int)st, sw, sh, (unsigned)sf, dw, dh, (unsigned)df);
+        return NO;
+    }
+    return YES;
+}
+
+// ------------------------------------------------------------------ 快照
 /// 采集线程只做一件事：把这一帧 retain 后扔进后台队列，立刻返回。
 ///
 /// 旧实现在采集回调里同步跑 CIContext → CGImage → JPEG，

@@ -307,32 +307,38 @@ static UIWindow *gVCamPanelWindow = nil;
     UIWindow *host = self.view.window;
     if (!host) return;
 
-    _expanded = !_expanded;
     UIScreen *screen = [UIScreen mainScreen];
+    CGFloat sw = screen.bounds.size.width;
+    CGFloat sh = screen.bounds.size.height;
+    CGRect ballFrame = CGRectMake(sw - 64, 120, 44, 44);
+
+    _expanded = !_expanded;
 
     if (_expanded) {
-        // 展开：把宿主 window 临时撑到全屏，44×44 塞不下面板。
-        // 只在用户真的要操作面板时才有这一下，收起后立刻缩回去。
-        host.frame = screen.bounds;
-        self.view.frame = host.bounds;
+        // 展开：window 只撑到**面板大小**，绝不撑到全屏。
+        //
+        // 实测结论：注入开着、不点球，刷视频完全正常；
+        // 一点球就卡死 —— 因为点球那一下把 44×44 的 window 瞬间撑成了整屏，
+        // 全屏透明合成面一出现，正在解码视频的 GPU 立刻被拖死。
+        // 所以这里上限就是面板尺寸，合成面积约等于全屏的三分之一，
+        // 而且面板本身是不透明的，不参与全屏 blend。
+        CGFloat pw = 272;
+        CGFloat ph = MIN(420, sh - 140);
+        CGRect pf = CGRectMake((sw - pw) / 2, 100, pw, ph);
 
-        CGFloat sw = host.bounds.size.width;
-        CGFloat sh = host.bounds.size.height;
-
-        _ball.frame = CGRectMake(sw - 64, 120, 44, 44);
-
-        CGFloat w = 272;
-        CGFloat h = MIN(420, sh - 140);
-        CGFloat y = MAX(60, MIN(100, sh - h - 20));
-        _panel.frame = CGRectMake(12, y, w, h);
+        host.frame = pf;
+        self.view.frame = CGRectMake(0, 0, pw, ph);
+        _panel.frame = self.view.bounds;
         _panel.hidden = NO;
+
+        // 球挪进面板右上角，充当「收起」按钮
+        _ball.frame = CGRectMake(pw - 44 - 8, 8, 44, 44);
         _ball.alpha = 0.9;
+        [self.view bringSubviewToFront:_ball];
     } else {
-        // 收起：window 缩回球那么大，全屏合成开销立刻消失
+        // 收起：window 缩回球那么大
         _panel.hidden = YES;
-        CGFloat sw = screen.bounds.size.width;
-        CGRect bf = CGRectMake(sw - 64, 120, 44, 44);
-        host.frame = bf;
+        host.frame = ballFrame;
         self.view.frame = CGRectMake(0, 0, 44, 44);
         _ball.frame = self.view.bounds;
         _ball.alpha = 0.55;

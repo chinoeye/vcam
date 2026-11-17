@@ -23,6 +23,7 @@
 
 #import <math.h>
 #import <stdlib.h>
+#import <objc/runtime.h>
 
 // ------------------------------------------------------------------ 工具
 
@@ -48,6 +49,11 @@ static BOOL VCIsTargetProcess(void)
     NSString *bid = [NSBundle mainBundle].bundleIdentifier;
     return bid && [VCTargetBundles() containsObject:bid];
 }
+
+// 前向声明：定义在文件末尾（日志上屏那一段），
+// 但 %hook UIWindow 里的摇一摇要先用到它。
+// 忘了这一行就是 "call to undeclared function" 编译错误。
+static void VCDumpLogAlert(void);
 
 static BOOL VCInjectionActive(void)
 {
@@ -614,6 +620,34 @@ didFinishLaunchingWithOptions:(NSDictionary *)launchOptions
 {
     %orig;
     VCBootstrap();
+
+    // 日志手势：双指长按 1.5 秒。
+    //
+    // 为什么不用摇一摇：抖音自己占了 shake —— 一晃就弹「推送视频给朋友」，
+    // 我们的 motionEnded: 拿不到。
+    // 为什么不用单指长按：会跟播放器的长按菜单打架。
+    // 双指长按在抖音里没有绑定功能，是目前最安全的触发方式。
+    static const void *kLogGestureKey = &kLogGestureKey;
+    if (!objc_getAssociatedObject(self, kLogGestureKey)) {
+        UILongPressGestureRecognizer *g =
+            [[UILongPressGestureRecognizer alloc]
+                initWithTarget:self
+                        action:@selector(vc_handleLogGesture:)];
+        g.numberOfTouchesRequired = 2;
+        g.minimumPressDuration = 1.5;
+        g.cancelsTouchesInView = NO;   // 不能吞掉抖音自己的触摸
+        [self addGestureRecognizer:g];
+        objc_setAssociatedObject(self, kLogGestureKey, g,
+                                 OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+        VCLog(@"日志手势已安装：双指长按 1.5 秒");
+    }
+}
+
+- (void)vc_handleLogGesture:(UILongPressGestureRecognizer *)g
+{
+    if (g.state == UIGestureRecognizerStateBegan) {
+        VCDumpLogAlert();
+    }
 }
 
 %end
@@ -682,6 +716,75 @@ static void VCBootstrap(void)
         // dylib 在进程里只剩帧注入这一条链路，屏幕上什么都不多出来。
 
         VCLog(@"VCam 已就绪（后台模式，无 UI。用 vcam://on 开启注入）");
+    });
+}
+
+// ==================================================================
+#pragma mark - 日志上屏
+// ==================================================================
+//
+//  现场调试最大的障碍是「看不见」。iOS 15 上：
+//    syslog_relay      不出数据
+//    os_trace_relay    协议不符
+//    house_arrest      抖音没开 UIFileSharingEnabled
+//    com.apple.afc     被拒
+//
+//  所以直接弹到屏幕上，用户截图即可。
+//  触发方式：摇一摇手机（UIEventSubtypeMotionShake）。
+
+static void VCDumpLogAlert(void)
+{
+    NSString *path = VCLogFilePath();
+    NSString *content = path.length
+        ? [NSString stringWithContentsOfFile:path encoding:NSUTF8StringEncoding error:NULL]
+        : nil;
+
+    if (content.length == 0) {
+        content = [NSString stringWithFormat:@"日志为空\npath=%@", path ?: @"(nil)"];
+    }
+
+    // 只显示最后 24 行，太长塞不下
+    NSMutableArray<NSString *> *lines =
+        [[content componentsSeparatedByString:@"\n"] mutableCopy];
+    if (lines.count > 24) {
+        [lines removeObjectsInRange:NSMakeRange(0, lines.count - 24)];
+    }
+    NSString *text = [lines componentsJoinedByString:@"\n"];
+    if (text.length > 1800) {
+        text = [text substringFromIndex:text.length - 1800];
+    }
+
+    dispatch_async(dispatch_get_main_queue(), ^{
+        UIAlertController *alert =
+            [UIAlertController alertControllerWithTitle:@"VCam 日志（摇一摇）"
+                                               message:text
+                                        preferredStyle:UIAlertControllerStyleAlert];
+
+        [alert addAction:[UIAlertAction actionWithTitle:@"复制"
+                                                  style:UIAlertActionStyleDefault
+                                                handler:^(UIAlertAction *a) {
+            [UIPasteboard generalPasteboard].string = content;
+        }]];
+        [alert addAction:[UIAlertAction actionWithTitle:@"关闭"
+                                                  style:UIAlertActionStyleCancel
+                                                handler:nil]];
+
+        UIWindow *win = nil;
+        for (UIWindow *w in UIApplication.sharedApplication.windows) {
+            if (w.isKeyWindow) { win = w; break; }
+        }
+        if (!win) win = UIApplication.sharedApplication.windows.firstObject;
+
+        UIViewController *vc = win.rootViewController;
+        while (vc.presentedViewController) {
+            vc = vc.presentedViewController;
+        }
+        if (vc) {
+            [vc presentViewController:alert animated:NO completion:nil];
+        } else {
+            // 拿不到 viewController 时退回到剪贴板
+            [UIPasteboard generalPasteboard].string = content;
+        }
     });
 }
 

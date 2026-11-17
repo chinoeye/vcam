@@ -60,7 +60,7 @@ static NSString *VCJailbreakRoot(void)
 - (void)applyDefaults
 {
     _sourceKind        = VCSourceKindAsset;
-    _audioMode         = VCAudioModeMic;
+    _audioMode         = VCAudioModeAsset;   // 用素材自带音轨（0=真麦 1=素材 2=静音）
     // 默认素材名。没有 config.plist 时靠它去电脑拉 test_demo.mp4，
     // 因为抖音是苹果正版、爱思不给浏览沙盒，没法手动把文件塞进来。
     _assetName         = @"test_demo";

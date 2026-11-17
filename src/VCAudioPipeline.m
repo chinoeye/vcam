@@ -285,8 +285,14 @@ static OSStatus VCPipeInputProc(AudioConverterRef cvt,
     // 消费端一不小心就取空 —— 听感是密集的咔哒（打电报）。
     // 只补到 70% 水位就停手：留 30% 的余量给定时器抖动，
     // 比「补到接近满才停」更能应付突发的慢一次。
-    if (count >= kRingFrames * 7 / 10) return;
+    if (count >= kRingFrames * 8 / 10) return;
     size_t freeFrames = kRingFrames - count;
+
+    // 一次最多补 0.5 秒，别长时间占着后台队列。
+    // （800ms 缓冲 + 80% 水位 = 最多需要补 0.4 秒，够一次补满）
+    size_t want = freeFrames;
+    size_t cap  = (size_t)(dstRate / 2);
+    if (want > cap) want = cap;
 
     // ---- 不做「音画时间对齐」----
     //

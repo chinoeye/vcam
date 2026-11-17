@@ -71,6 +71,11 @@ static OSStatus VCPipeInputProc(AudioConverterRef cvt,
     size_t   _bytesPerFrame;
     size_t   _writePos;
     size_t   _readPos;
+    size_t   _count;            // 缓冲里实际有多少帧
+                                // 必须有这个：_writePos == _readPos 既可能是空
+                                // 也可能是满，光看指针差会把「满」误判成「空」，
+                                // 于是继续写、把没读的数据全冲掉
+                                // （实测产出 25M 帧、消费只有 49 万帧，差 52 倍）
 
     AudioStreamBasicDescription _dstFormat;
     AudioStreamBasicDescription _srcFormat;
@@ -149,6 +154,7 @@ static OSStatus VCPipeInputProc(AudioConverterRef cvt,
     _ringBytes = _ring ? need : 0;
     _writePos = 0;
     _readPos = 0;
+    _count = 0;
     _produced = 0;
     _consumed = 0;
     _underrun = 0;
@@ -228,16 +234,16 @@ static OSStatus VCPipeInputProc(AudioConverterRef cvt,
     if (!_running) return;
 
     pthread_mutex_lock(&_lock);
-    size_t used    = (_writePos + _ringBytes - _readPos) % _ringBytes;
-    size_t freeB   = _ringBytes - used;
+    size_t count   = _count;
     size_t bpf     = _bytesPerFrame;
     Float64 dstRate = _dstFormat.mSampleRate;
     pthread_mutex_unlock(&_lock);
 
     if (bpf == 0 || dstRate <= 0) return;
 
-    size_t freeFrames = freeB / bpf;
-    if (freeFrames < 2048) return;          // 还很满，不干活
+    if (count >= kRingFrames) return;        // 满了，等消费端取走
+    size_t freeFrames = kRingFrames - count;
+    if (freeFrames < 2048) return;           // 余量太小不值得干活
 
     // 一次最多补 0.5 秒，别长时间占着后台队列
     size_t want = freeFrames;
@@ -318,7 +324,8 @@ static OSStatus VCPipeInputProc(AudioConverterRef cvt,
 
     // 写环形缓冲
     pthread_mutex_lock(&_lock);
-    size_t space = _ringBytes - ((_writePos + _ringBytes - _readPos) % _ringBytes);
+    size_t freeFramesNow = kRingFrames - _count;
+    size_t space = freeFramesNow * _bytesPerFrame;
     if (produced > space) produced = space - (space % _bytesPerFrame);
     if (produced > 0) {
         size_t tail = _ringBytes - _writePos;
@@ -329,6 +336,7 @@ static OSStatus VCPipeInputProc(AudioConverterRef cvt,
             memcpy(_ring, (const uint8_t *)out.bytes + tail, produced - tail);
         }
         _writePos = (_writePos + produced) % _ringBytes;
+        _count += produced / _bytesPerFrame;
         _produced += produced / _bytesPerFrame;
     }
     pthread_mutex_unlock(&_lock);
@@ -344,7 +352,7 @@ static OSStatus VCPipeInputProc(AudioConverterRef cvt,
 
     pthread_mutex_lock(&_lock);
 
-    size_t avail = (_writePos + _ringBytes - _readPos) % _ringBytes;
+    size_t avail = _count * _bytesPerFrame;
     size_t take  = needBytes < avail ? needBytes : avail;
     take -= take % _bytesPerFrame;
 
@@ -386,7 +394,10 @@ static OSStatus VCPipeInputProc(AudioConverterRef cvt,
 
     if (take > 0) {
         _readPos = (_readPos + take) % _ringBytes;
-        _consumed += take / _bytesPerFrame;
+        size_t takenFrames = take / _bytesPerFrame;
+        if (takenFrames > _count) takenFrames = _count;
+        _count -= takenFrames;
+        _consumed += takenFrames;
     }
 
     pthread_mutex_unlock(&_lock);
@@ -404,8 +415,7 @@ static OSStatus VCPipeInputProc(AudioConverterRef cvt,
 {
     if (!_ring || _bytesPerFrame == 0) return 0;
     pthread_mutex_lock(&_lock);
-    size_t used = (_writePos + _ringBytes - _readPos) % _ringBytes;
-    size_t f = used / _bytesPerFrame;
+    size_t f = _count;
     pthread_mutex_unlock(&_lock);
     return f;
 }

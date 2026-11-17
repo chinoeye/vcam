@@ -323,6 +323,17 @@ typedef OSStatus (*VC_AURender_FN)(AudioUnit, AudioUnitRenderActionFlags *,
 
 static VC_AURender_FN orig_AudioUnitRender = NULL;
 
+// hook 命中统计。诊断报告里直接读这些值，一眼看出 hook 到底装没装上、
+// 有没有被调用、调的时候 bus 是多少。
+static volatile int    g_auHookInstalled = 0;
+static volatile int    g_auRenderHits    = 0;
+static volatile int    g_auBus1Hits      = 0;
+static volatile UInt32 g_auLastBus       = 0xFFFF;
+static volatile UInt32 g_auLastFrames    = 0;
+static volatile UInt32 g_auLastBuffers   = 0;
+static volatile UInt32 g_auLastChannels  = 0;
+static volatile UInt32 g_auLastBytes     = 0;
+
 static void VCRewriteAudioBufferList(AudioBufferList *ioData, UInt32 frames)
 {
     if (!ioData || frames == 0) return;
@@ -388,11 +399,21 @@ static OSStatus hook_AudioUnitRender(AudioUnit unit,
 {
     if (!orig_AudioUnitRender) return -1;
 
+    g_auRenderHits++;
+    g_auLastBus      = bus;
+    g_auLastFrames   = frames;
+    g_auLastBuffers  = ioData ? ioData->mNumberBuffers : 0;
+    g_auLastChannels = (ioData && ioData->mNumberBuffers)
+                       ? ioData->mBuffers[0].mNumberChannels : 0;
+    g_auLastBytes    = (ioData && ioData->mNumberBuffers)
+                       ? (UInt32)ioData->mBuffers[0].mDataByteSize : 0;
+
     OSStatus st = orig_AudioUnitRender(unit, flags, ts, bus, frames, ioData);
     if (st != noErr || !ioData) return st;
 
     // 只碰 input bus（1 = 采集）。碰 bus 0（播放）会把麦克风数据灌进扬声器。
     if (bus != 1) return st;
+    g_auBus1Hits++;
 
     static BOOL sLoggedHit = NO;
     if (!sLoggedHit) {
@@ -962,6 +983,21 @@ static NSString *VCRunAudioDiagnosis(void)
 
     [out appendFormat:@"\n=== 共 %d 个音频相关类 ===\n", classHits];
 
+    // ---- 2.4 AudioUnit hook 运行状态（决定性）----
+    [out appendString:@"\n=== AudioUnitRender hook 状态 ===\n"];
+    [out appendFormat:@"已安装            : %@\n",
+        g_auHookInstalled ? @"是" : @"否（fishhook 没绑上）"];
+    [out appendFormat:@"orig 指针         : %p\n", orig_AudioUnitRender];
+    [out appendFormat:@"被调用次数        : %d\n", g_auRenderHits];
+    [out appendFormat:@"其中 bus==1 次数  : %d\n", g_auBus1Hits];
+    [out appendFormat:@"最近一次 bus      : %u\n", (unsigned)g_auLastBus];
+    [out appendFormat:@"最近一次 frames   : %u\n", (unsigned)g_auLastFrames];
+    [out appendFormat:@"最近一次 buffers  : %u\n", (unsigned)g_auLastBuffers];
+    [out appendFormat:@"最近一次 声道数   : %u\n", (unsigned)g_auLastChannels];
+    [out appendFormat:@"最近一次 字节数   : %u\n", (unsigned)g_auLastBytes];
+    [out appendFormat:@"audioMode         : %ld  (0=真麦 1=素材 2=静音)\n",
+        (long)VCamConfig.shared.audioMode];
+
     // ---- 2.5 byteaudio 导入了哪些音频 API（最关键的证据）----
     [out appendString:@"\n=== byteaudio 导入的音频符号 ===\n"];
     VCDumpImageImports("byteaudio", out);
@@ -1044,6 +1080,7 @@ static void VCDumpAudioReport(void)
             BOOL auHooked = VCHookSymbol("AudioUnitRender",
                                          (void *)hook_AudioUnitRender,
                                          (void **)&orig_AudioUnitRender);
+            g_auHookInstalled = (auHooked && orig_AudioUnitRender) ? 1 : 0;
             VCLog(@"AudioUnitRender hook %@ (orig=%p)",
                   auHooked ? @"已安装" : @"失败", orig_AudioUnitRender);
 

@@ -334,18 +334,42 @@ int g_vcSeekCount = 0;
 - (NSData *)copyNextAudioPCMWithFrameCount:(CMItemCount *)frameCountOut
                                       asbd:(AudioStreamBasicDescription *)asbdOut
 {
-    if (!_ready || !_audioReader || VCamConfig.shared.audioMode != VCAudioModeAsset) {
+    if (VCamConfig.shared.audioMode != VCAudioModeAsset) {
         return nil;
     }
 
     [_lock lock];
     NSData *result = nil;
     @try {
-        if (_audioReader.status != AVAssetReaderStatusReading) {
-            [self restartAudioReaderLocked];
-        }
-        if (!_audioReader || _audioReader.status != AVAssetReaderStatusReading) {
+        // _ready / _audioReader 必须在锁内读 —— reloadWithURL 和 teardown
+        // 都会并发改这两个，锁外读会拿到中间状态。
+        if (!_ready || !_audioReader) {
             return nil;
+        }
+
+        AVAssetReaderStatus st = _audioReader.status;
+
+        if (st == AVAssetReaderStatusFailed || st == AVAssetReaderStatusCancelled) {
+            // reader 坏了才重建
+            [self restartAudioReaderLocked];
+            if (!_audioReader || _audioReader.status != AVAssetReaderStatusReading) {
+                return nil;
+            }
+        } else if (st == AVAssetReaderStatusCompleted) {
+            // 读到素材音频末尾，**不自行重启**。
+            //
+            //  如果这里重启，音频会回到 0 秒，而视频还在 15.98 秒附近，
+            //  音画立刻错开大半个素材长度。素材 16 秒、音频轨通常比视频轨
+            //  短几十毫秒，所以每轮循环都会触发一次 —— 累积起来越来越偏。
+            //
+            //  正确做法：等视频回绕（restartVideoReaderLocked 会一起重置音频），
+            //  这期间返回 nil，管道会延音过渡。
+            return nil;
+        } else if (st != AVAssetReaderStatusReading) {
+            [self restartAudioReaderLocked];
+            if (!_audioReader || _audioReader.status != AVAssetReaderStatusReading) {
+                return nil;
+            }
         }
 
         // 这里**不再**限制音频相对视频的偏移。

@@ -160,6 +160,107 @@ static double VCDrift(double amplitude, double speed)
 %end
 
 // ==================================================================
+#pragma mark - 音频：AVAudioEngine 路径
+// ==================================================================
+//
+//  实测抖音的直播音频不走 AVCaptureAudioDataOutput：
+//  把 audioMode 切成静音，录出来还是真麦克风的声音 —— 说明那条 hook
+//  压根没碰到它的采集链路。它用的是 AVAudioEngine / 底层 AudioUnit。
+//
+//  这里走跟视频同一套「原地改内容」的思路：
+//    tap 回调给的是 AVAudioPCMBuffer（系统原生对象）
+//    我们只改它里面的 floatChannelData，不造任何东西
+//    然后把**同一个 buffer** 交给原始 block
+//
+//  这样格式、所有权、时间戳全是系统的，不存在伪造导致崩溃的风险。
+
+static void VCRewritePCMBuffer(AVAudioPCMBuffer *buf)
+{
+    if (!buf) return;
+
+    VCamConfig *cfg = VCamConfig.shared;
+    if (cfg.audioMode == VCAudioModeMic) return;   // 真麦，不碰
+
+    AVAudioFrameCount frames = buf.frameLength;
+    if (frames == 0) return;
+
+    AVAudioFormat *fmt = buf.format;
+    if (!fmt) return;
+
+    // 静音：整块清零
+    if (cfg.audioMode == VCAudioModeMute) {
+        if (fmt.commonFormat == AVAudioPCMFormatFloat32 && buf.floatChannelData) {
+            UInt32 ch = fmt.channelCount;
+            for (UInt32 c = 0; c < ch; c++) {
+                memset(buf.floatChannelData[c], 0, frames * sizeof(float));
+            }
+        }
+        return;
+    }
+
+    // 素材音轨：只处理 float32
+    if (fmt.commonFormat != AVAudioPCMFormatFloat32 || !buf.floatChannelData) {
+        static BOOL sWarned = NO;
+        if (!sWarned) {
+            sWarned = YES;
+            VCLog(@"AVAudioPCMBuffer 不是 float32（commonFormat=%ld），素材音轨无法灌入",
+                  (long)fmt.commonFormat);
+        }
+        return;
+    }
+
+    CMItemCount srcFrames = 0;
+    AudioStreamBasicDescription asbd = {0};
+    NSData *pcm = [[VCFrameSource shared] copyNextAudioPCMWithFrameCount:&srcFrames asbd:&asbd];
+    if (!pcm || srcFrames == 0) return;
+
+    const float *src = (const float *)pcm.bytes;
+    size_t avail = pcm.length / sizeof(float);
+    if (avail == 0) return;
+
+    size_t n = ((size_t)frames < avail) ? (size_t)frames : avail;
+    UInt32 ch = fmt.channelCount;
+
+    static BOOL sLogged = NO;
+    if (!sLogged) {
+        sLogged = YES;
+        VCLog(@"AVAudioEngine 音频注入接通：系统 %.0fHz x%u，每块 %u 帧，灌入 %zu 帧",
+              fmt.sampleRate, (unsigned)ch, (unsigned)frames, n);
+    }
+
+    for (UInt32 c = 0; c < ch; c++) {
+        float *dst = buf.floatChannelData[c];
+        if (!dst) continue;
+        memcpy(dst, src, n * sizeof(float));
+        if (n < (size_t)frames) {
+            memset(dst + n, 0, ((size_t)frames - n) * sizeof(float));
+        }
+    }
+}
+
+%hook AVAudioEngine
+
+- (void)installTapOnBus:(AVAudioNodeBus)bus
+             bufferSize:(AVAudioFrameCount)bufferSize
+                 format:(AVAudioFormat *)format
+                  block:(AVAudioNodeTapBlock)tapBlock
+{
+    VCLog(@"AVAudioEngine installTapOnBus 命中：bus=%u size=%u fmt=%@",
+          (unsigned)bus, (unsigned)bufferSize, format);
+
+    // 包一层：先改系统给的这个 buffer 的内容，再交给原始 block。
+    // 传下去的还是同一个 buffer 对象，不新建、不折腾所有权。
+    AVAudioNodeTapBlock wrapped = ^(AVAudioPCMBuffer *buffer, AVAudioTime *when) {
+        VCRewritePCMBuffer(buffer);
+        if (tapBlock) tapBlock(buffer, when);
+    };
+
+    %orig(bus, bufferSize, format, wrapped);
+}
+
+%end
+
+// ==================================================================
 #pragma mark - 采集输出：预览通道
 // ==================================================================
 // AVCaptureVideoPreviewLayer 走的是 GPU 直连，不经过 delegate，

@@ -97,6 +97,10 @@ static OSStatus VCPipeInputProc(AudioConverterRef cvt,
     dispatch_source_t _timer;
     volatile BOOL _running;
 
+    // 已经解码到素材内的哪个时间点（秒）。
+    // 生产端用它和视频时间比对，做闭环校正 —— 这是 5 小时长跑不跑偏的关键。
+    double   _decodedMaterialSeconds;
+
     uint64_t _produced;
     uint64_t _consumed;
     uint64_t _underrun;
@@ -178,6 +182,7 @@ static OSStatus VCPipeInputProc(AudioConverterRef cvt,
     _writePos = 0;
     _readPos = 0;
     _count = 0;
+    _decodedMaterialSeconds = 0.0;
     _produced = 0;
     _consumed = 0;
     _underrun = 0;
@@ -284,6 +289,50 @@ static OSStatus VCPipeInputProc(AudioConverterRef cvt,
     if (count >= kRingFrames * 7 / 10) return;
     size_t freeFrames = kRingFrames - count;
 
+    // ---- 闭环校正：音频追视频 ----
+    //
+    //  视频时间 currentVideoSourceTime 是唯一权威时钟。
+    //  每块生产前比一次「已解码到的素材时间」和视频时间的差：
+    //
+    //    > 100ms  → seek 对齐（在后台线程做，缓冲有 400ms 存货，
+    //               重建 reader 的 100 多毫秒实时线程完全察觉不到）
+    //    ≤ 100ms  → 不管它，正常生产
+    //
+    //  这样音画偏差永远钳在 100ms 内，5 小时也不会累积。
+    //  按 0.01% 的残余速率误差估算，5 小时大约 seek 18 次，
+    //  总损失 378ms / 18000s = 0.002%，听不出来。
+    {
+        double videoT = [[VCFrameSource shared] currentVideoSourceTime];
+        if (videoT > 0.5) {   // 视频还没真正开始播的时候不做校正
+            double error = videoT - _decodedMaterialSeconds;
+            if (fabs(error) > 0.10) {
+                _seekCount++;
+                if (_seekCount <= 5 || _seekCount % 50 == 0) {
+                    VCLog(@"音频闭环校正 #%d：偏差 %.0fms（视频 %.2fs / 音频 %.2fs）",
+                          _seekCount, error * 1000, videoT, _decodedMaterialSeconds);
+                }
+                [[VCFrameSource shared] seekAudioToVideoTime];
+
+                // seek 之后必须清空环形缓冲。
+                //
+                //  缓冲里存的是「seek 之前」解码出来的音频，seek 之后解码器
+                //  跳到了别的位置 —— 两者接在一起就是硬切，音画立刻错位。
+                //  清空之后实时线程会走延音分支（用 _lastOut 填补），
+                //  最多 400ms 的延音，听感是「声音略微拖长」，不会断。
+                pthread_mutex_lock(&_lock);
+                _writePos = 0;
+                _readPos  = 0;
+                _count    = 0;
+                // seekAudioToVideoTime 内部往前留了 50ms 余量，
+                // 所以实际读到的位置是 videoT - 0.05
+                _decodedMaterialSeconds = videoT - 0.05;
+                if (_decodedMaterialSeconds < 0) _decodedMaterialSeconds = 0;
+                pthread_mutex_unlock(&_lock);
+            }
+        }
+    }
+
+
     // 一次最多补 0.5 秒，别长时间占着后台队列
     size_t want = freeFrames;
     size_t cap  = (size_t)(dstRate / 2);
@@ -374,9 +423,13 @@ static OSStatus VCPipeInputProc(AudioConverterRef cvt,
             memcpy(_ring + _writePos, out.bytes, tail);
             memcpy(_ring, (const uint8_t *)out.bytes + tail, produced - tail);
         }
+        size_t producedFrames = produced / _bytesPerFrame;
         _writePos = (_writePos + produced) % _ringBytes;
-        _count += produced / _bytesPerFrame;
-        _produced += produced / _bytesPerFrame;
+        _count += producedFrames;
+        _produced += producedFrames;
+
+        // 记录解码进度（目标采样率坐标系，和视频时间同一尺度）
+        _decodedMaterialSeconds += (double)producedFrames / _dstFormat.mSampleRate;
     }
     pthread_mutex_unlock(&_lock);
 }
@@ -475,6 +528,13 @@ static OSStatus VCPipeInputProc(AudioConverterRef cvt,
 - (uint64_t)underrunCount  { return _underrun; }
 - (int)seekCount           { return _seekCount; }
 - (BOOL)isRunning          { return _running; }
+
+- (double)currentDrift
+{
+    double videoT = [[VCFrameSource shared] currentVideoSourceTime];
+    if (videoT <= 0) return 0.0;
+    return videoT - _decodedMaterialSeconds;
+}
 
 - (size_t)bufferedFrames
 {

@@ -119,10 +119,13 @@ static UIWindow *gVCamPanelWindow = nil;
     self.view.hidden = YES;
 }
 
-// 用穿透容器替换默认的 rootView
+// 用穿透容器替换默认的 rootView。
+//
+// 尺寸只给 44×44（= 悬浮球大小），不是全屏 —— 宿主 UIWindow 也这么大。
+// 原因见 +installPanelIfNeeded 里的说明：全屏透明 window 会强制多合成一整屏。
 - (void)loadView
 {
-    self.view = [[VCPassthroughView alloc] initWithFrame:[UIScreen mainScreen].bounds];
+    self.view = [[VCPassthroughView alloc] initWithFrame:CGRectMake(0, 0, 44, 44)];
     self.view.backgroundColor = [UIColor clearColor];
 }
 
@@ -132,8 +135,9 @@ static UIWindow *gVCamPanelWindow = nil;
     self.view.backgroundColor = [UIColor clearColor];
 
     // ---- 悬浮球 ----
+    // 宿主 window 只有 44×44，球直接铺满它，不再需要屏幕坐标计算
     _ball = [UIButton buttonWithType:UIButtonTypeCustom];
-    _ball.frame = CGRectMake(self.view.bounds.size.width - 64, 120, 44, 44);
+    _ball.frame = self.view.bounds;
     _ballHome = _ball.center;
     _ball.backgroundColor = [UIColor colorWithWhite:0 alpha:0.45];
     _ball.layer.cornerRadius = 22;
@@ -145,8 +149,8 @@ static UIWindow *gVCamPanelWindow = nil;
     _ball.titleLabel.font = [UIFont boldSystemFontOfSize:13];
     [_ball addTarget:self action:@selector(togglePanel)
    forControlEvents:UIControlEventTouchUpInside];
-    [_ball addGestureRecognizer:
-        [[UIPanGestureRecognizer alloc] initWithTarget:self action:@selector(dragBall:)]];
+    // 不再挂拖动手势：宿主 window 只有球这么大，拖动等于搬 window，
+    // 每次移动都要重建合成面，得不偿失。先固定右上角，稳定后再考虑加回。
     [self.view addSubview:_ball];
 
     // ---- 面板 ----
@@ -300,19 +304,37 @@ static UIWindow *gVCamPanelWindow = nil;
 
 - (void)togglePanel
 {
+    UIWindow *host = self.view.window;
+    if (!host) return;
+
     _expanded = !_expanded;
-    _panel.hidden = !_expanded;
+    UIScreen *screen = [UIScreen mainScreen];
+
     if (_expanded) {
-        // 面板贴着球出现，别飞出屏幕
-        CGFloat w = _panel.bounds.size.width;
-        CGFloat x = _ball.center.x + w / 2 + 12 > self.view.bounds.size.width
-                    ? self.view.bounds.size.width - w - 12
-                    : _ball.center.x + 30;
-        CGFloat y = MAX(60, MIN(_ball.center.y - 40,
-                                self.view.bounds.size.height - _panel.bounds.size.height - 20));
-        _panel.frame = CGRectMake(x, y, w, _panel.bounds.size.height);
+        // 展开：把宿主 window 临时撑到全屏，44×44 塞不下面板。
+        // 只在用户真的要操作面板时才有这一下，收起后立刻缩回去。
+        host.frame = screen.bounds;
+        self.view.frame = host.bounds;
+
+        CGFloat sw = host.bounds.size.width;
+        CGFloat sh = host.bounds.size.height;
+
+        _ball.frame = CGRectMake(sw - 64, 120, 44, 44);
+
+        CGFloat w = 272;
+        CGFloat h = MIN(420, sh - 140);
+        CGFloat y = MAX(60, MIN(100, sh - h - 20));
+        _panel.frame = CGRectMake(12, y, w, h);
+        _panel.hidden = NO;
         _ball.alpha = 0.9;
     } else {
+        // 收起：window 缩回球那么大，全屏合成开销立刻消失
+        _panel.hidden = YES;
+        CGFloat sw = screen.bounds.size.width;
+        CGRect bf = CGRectMake(sw - 64, 120, 44, 44);
+        host.frame = bf;
+        self.view.frame = CGRectMake(0, 0, 44, 44);
+        _ball.frame = self.view.bounds;
         _ball.alpha = 0.55;
     }
 }
@@ -504,7 +526,19 @@ static UIWindow *gVCamPanelWindow = nil;
     static dispatch_once_t once;
     dispatch_once(&once, ^{
         dispatch_async(dispatch_get_main_queue(), ^{
-            UIWindow *w = [[UIWindow alloc] initWithFrame:[UIScreen mainScreen].bounds];
+            // ---- 宿主 window 只有悬浮球那么大，不是全屏 ----
+            //
+            // 这是本轮定位的结论：全屏透明 UIWindow 在 iPhone 8 上
+            // 会强制多合成一整屏，抖音点开视频正抢 GPU 解码时直接被拖死，
+            // 表现为「画面冻住、HOME 键却有反应」。
+            // 实测：球在就卡，球一消失立刻正常。
+            //
+            // 合成面积从整屏降到 44×44（约千分之一），
+            // 面板展开时再临时撑大，收起立刻缩回。
+            CGFloat sw = [UIScreen mainScreen].bounds.size.width;
+            CGRect ballFrame = CGRectMake(sw - 64, 120, 44, 44);
+
+            UIWindow *w = [[UIWindow alloc] initWithFrame:ballFrame];
             w.windowLevel = UIWindowLevelAlert + 100;
             w.backgroundColor = [UIColor clearColor];
             w.rootViewController = [[VCamPanelController alloc] init];
@@ -519,7 +553,8 @@ static UIWindow *gVCamPanelWindow = nil;
             }
             w.hidden = NO;
             gVCamPanelWindow = w;
-            VCLog(@"控制面板已显示");
+            VCLog(@"悬浮球已挂载 %@（window 仅 %.0fx%.0f）",
+                  NSStringFromCGRect(ballFrame), ballFrame.size.width, ballFrame.size.height);
 
             // ---- 静默模式：面板 5 秒后自毁 ----
             //

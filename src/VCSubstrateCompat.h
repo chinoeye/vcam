@@ -37,7 +37,7 @@ BOOL VCHookSymbol(const char *symbolName, void *newFunc, void **oldFunc);
 
 /// 诊断用：上一次 hook 过程中扫过的 section 列表（"段/节(大小)*" 拼接）。
 /// 带 * 的是被认作符号指针表、真正参与重绑定的。
-extern char g_vcScannedSections[4096];
+extern char g_vcScannedSections[65536];
 
 /// 批量重绑定。数组格式：{ {name, new, &old}, ..., {NULL, NULL, NULL} }
 typedef struct {

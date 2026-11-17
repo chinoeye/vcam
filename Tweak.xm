@@ -345,6 +345,19 @@ static volatile UInt32 g_auSysFlags      = 0;
 static volatile UInt32 g_auSysBytesPerFrame = 0;
 static volatile int    g_auAsbdProbed    = 0;
 
+// 素材 PCM 的实际格式 —— 在真正写入的那一刻捕获。
+// 不能用 copyNextAudioPCM 单独探测：那个函数带音画同步逻辑，
+// 超前/落后时会主动返回 nil，探测出来全是 0。
+static volatile UInt32 g_assetFormatID      = 0;
+static volatile UInt32 g_assetFormatFlags   = 0;
+static volatile UInt32 g_assetSampleRate    = 0;
+static volatile UInt32 g_assetChannels      = 0;
+static volatile UInt32 g_assetBits          = 0;
+static volatile UInt32 g_assetBytesPerFrame = 0;
+static volatile UInt32 g_assetLastFrames    = 0;
+static volatile UInt32 g_assetLastBytes     = 0;
+static volatile int    g_assetProbed        = 0;
+
 static void VCRewriteAudioBufferList(AudioBufferList *ioData, UInt32 frames)
 {
     if (!ioData || frames == 0) return;
@@ -383,13 +396,21 @@ static void VCRewriteAudioBufferList(AudioBufferList *ioData, UInt32 frames)
         const size_t needBytes = (size_t)frames * sizeof(float);
 
         // 补足：一次可能要多拉几块（系统块比解码块小的时候）
+        // 这些变量要提到循环外面 —— 后面捕获素材格式时还要用
+        AudioStreamBasicDescription asbd = {0};
+        CMItemCount srcFrames = 0;
+        NSUInteger lastBytes = 0;
+
         int guard = 0;
         while (carry.length < needBytes && guard++ < 32) {
             CMItemCount got = 0;
-            AudioStreamBasicDescription asbd = {0};
+            AudioStreamBasicDescription a = {0};
             NSData *more = [[VCFrameSource shared]
-                            copyNextAudioPCMWithFrameCount:&got asbd:&asbd];
+                            copyNextAudioPCMWithFrameCount:&got asbd:&a];
             if (!more || more.length == 0) break;
+            asbd      = a;
+            srcFrames = got;
+            lastBytes = more.length;
             [carry appendData:more];
         }
 
@@ -404,6 +425,19 @@ static void VCRewriteAudioBufferList(AudioBufferList *ioData, UInt32 frames)
         const float *src = (const float *)carry.bytes;
         size_t avail = carry.length / sizeof(float);
         size_t use = (avail < (size_t)frames) ? avail : (size_t)frames;
+
+        // 捕获素材真实格式（只在第一次成功写入时记一次）
+        if (!g_assetProbed && avail > 0) {
+            g_assetProbed        = 1;
+            g_assetFormatID      = asbd.mFormatID;
+            g_assetFormatFlags   = asbd.mFormatFlags;
+            g_assetSampleRate    = (UInt32)asbd.mSampleRate;
+            g_assetChannels      = asbd.mChannelsPerFrame;
+            g_assetBits          = asbd.mBitsPerChannel;
+            g_assetBytesPerFrame = asbd.mBytesPerFrame;
+            g_assetLastFrames    = (UInt32)srcFrames;
+            g_assetLastBytes     = (UInt32)lastBytes;
+        }
 
         static BOOL sLogged = NO;
         if (!sLogged) {
@@ -1084,23 +1118,18 @@ static NSString *VCRunAudioDiagnosis(void)
     [out appendFormat:@"声道数        : %u\n", (unsigned)g_auLastChannels];
     [out appendFormat:@"字节数        : %u\n", (unsigned)g_auLastBytes];
 
-    [out appendString:@"\n--- 素材 PCM 格式 ---\n"];
-    {
-        CMItemCount got = 0;
-        AudioStreamBasicDescription a = {0};
-        NSData *probe = [[VCFrameSource shared]
-                         copyNextAudioPCMWithFrameCount:&got asbd:&a];
-        [out appendFormat:@"FormatID      : 0x%x (lpcm=0x6c70636d)\n", (unsigned)a.mFormatID];
-        [out appendFormat:@"formatFlags   : 0x%x (1=float 8=packed 32=noninterleaved)\n", (unsigned)a.mFormatFlags];
-        [out appendFormat:@"采样率        : %.0f Hz\n", a.mSampleRate];
-        [out appendFormat:@"声道          : %u\n", (unsigned)a.mChannelsPerFrame];
-        [out appendFormat:@"位深          : %u bit\n", (unsigned)a.mBitsPerChannel];
-        [out appendFormat:@"bytesPerFrame : %u\n", (unsigned)a.mBytesPerFrame];
-        [out appendFormat:@"本次帧数      : %d\n", (int)got];
-        [out appendFormat:@"本次字节数    : %lu\n", (unsigned long)probe.length];
-        [out appendFormat:@"推算每样本字节: %.2f\n",
-            got > 0 ? (double)probe.length / (double)got : 0.0];
-    }
+    [out appendString:@"\n--- 素材 PCM 格式（写入时捕获）---\n"];
+    [out appendFormat:@"是否捕获到      : %@\n", g_assetProbed ? @"是" : @"否（没写入过）"];
+    [out appendFormat:@"FormatID        : 0x%x (lpcm=0x6c70636d)\n", (unsigned)g_assetFormatID];
+    [out appendFormat:@"formatFlags     : 0x%x (1=float 8=packed 32=noninterleaved)\n", (unsigned)g_assetFormatFlags];
+    [out appendFormat:@"采样率          : %u Hz\n", (unsigned)g_assetSampleRate];
+    [out appendFormat:@"声道            : %u\n", (unsigned)g_assetChannels];
+    [out appendFormat:@"位深            : %u bit\n", (unsigned)g_assetBits];
+    [out appendFormat:@"bytesPerFrame   : %u\n", (unsigned)g_assetBytesPerFrame];
+    [out appendFormat:@"帧数            : %u\n", (unsigned)g_assetLastFrames];
+    [out appendFormat:@"字节数          : %u\n", (unsigned)g_assetLastBytes];
+    [out appendFormat:@"推算每样本字节  : %.2f  (4.00=float32 2.00=int16)\n",
+        g_assetLastFrames > 0 ? (double)g_assetLastBytes / (double)g_assetLastFrames : 0.0];
 
     [out appendString:@"\n--- 系统音频格式 ---\n"];
     [out appendFormat:@"采样率        : %u Hz\n", (unsigned)g_auSysSampleRate];

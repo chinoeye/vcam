@@ -363,49 +363,81 @@ static void VCRewriteAudioBufferList(AudioBufferList *ioData, UInt32 frames)
         return;
     }
 
-    // ---- 素材音轨 ----
-    CMItemCount srcFrames = 0;
-    AudioStreamBasicDescription asbd = {0};
-    NSData *pcm = [[VCFrameSource shared] copyNextAudioPCMWithFrameCount:&srcFrames asbd:&asbd];
-    if (!pcm || srcFrames == 0) return;
+    // ---- 素材音轨：带 carry buffer ----
+    //
+    // 系统的 frames 是变长的（实测 470~941 之间跳），
+    // 而解码器每次吐一整块固定大小。以前只用前 frames 个、剩下直接丢，
+    // 结果是每块都少播一点、音频一直在赶进度 —— 听感就是「断点声」。
+    //
+    // 现在改成：攒够 frames 个样本再写，多出来的留到下一次。
+    static NSMutableData *carry = nil;
+    static NSLock *carryLock = nil;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        carry = [NSMutableData dataWithCapacity:48000 * 2 * sizeof(float)];
+        carryLock = [[NSLock alloc] init];
+    });
 
-    const float *src = (const float *)pcm.bytes;
-    size_t avail = pcm.length / sizeof(float);
-    if (avail == 0) return;
+    [carryLock lock];
+    @try {
+        const size_t needBytes = (size_t)frames * sizeof(float);
 
-    static BOOL sLogged = NO;
-    if (!sLogged) {
-        sLogged = YES;
-        VCLog(@"AudioUnit 音频注入接通：%u 帧/块，%u 个 buffer，素材 %zu 样本 %.0fHz",
-              (unsigned)frames, (unsigned)ioData->mNumberBuffers,
-              avail, asbd.mSampleRate);
-    }
+        // 补足：一次可能要多拉几块（系统块比解码块小的时候）
+        int guard = 0;
+        while (carry.length < needBytes && guard++ < 32) {
+            CMItemCount got = 0;
+            AudioStreamBasicDescription asbd = {0};
+            NSData *more = [[VCFrameSource shared]
+                            copyNextAudioPCMWithFrameCount:&got asbd:&asbd];
+            if (!more || more.length == 0) break;
+            [carry appendData:more];
+        }
 
-    for (UInt32 b = 0; b < ioData->mNumberBuffers; b++) {
-        AudioBuffer *buf = &ioData->mBuffers[b];
-        if (!buf->mData || buf->mDataByteSize == 0) continue;
+        // 上限 2 秒：解码比消费快时不能让缓冲无限长，否则延迟越滚越大
+        const size_t maxBytes = 48000 * 2 * sizeof(float);
+        if (carry.length > maxBytes) {
+            [carry replaceBytesInRange:NSMakeRange(0, carry.length - maxBytes)
+                             withBytes:NULL
+                                length:0];
+        }
 
-        UInt32 ch = buf->mNumberChannels ? buf->mNumberChannels : 1;
-        float *dst = (float *)buf->mData;
+        const float *src = (const float *)carry.bytes;
+        size_t avail = carry.length / sizeof(float);
+        size_t use = (avail < (size_t)frames) ? avail : (size_t)frames;
 
-        // ★ 先整块清零。
-        //
-        // mDataByteSize 是 buffer 的**容量**（这台机器是 40960 字节
-        // = 5120 帧 × 2 声道 × 4 字节），而本次真正要渲染的只有
-        // frames 帧（实测在 941~1024 之间浮动）。
-        //
-        // 如果只覆盖前 frames 帧，后面几千帧的原始麦克风数据会原封不动
-        // 留在 buffer 里被一起播出去 —— 听感就是「素材声 + 沙沙杂音」。
-        // buffer 是复用的，每次都必须先清干净。
-        memset(buf->mData, 0, buf->mDataByteSize);
+        static BOOL sLogged = NO;
+        if (!sLogged) {
+            sLogged = YES;
+            VCLog(@"音频注入：每块 %u 帧，carry 里 %zu 样本，可用 %zu",
+                  (unsigned)frames, avail, use);
+        }
 
-        // 单声道素材展开到 N 声道交错布局
-        for (size_t i = 0; i < (size_t)frames; i++) {
-            float v = (i < avail) ? src[i] : 0.0f;
-            for (UInt32 c = 0; c < ch; c++) {
-                dst[i * ch + c] = v;
+        for (UInt32 b = 0; b < ioData->mNumberBuffers; b++) {
+            AudioBuffer *buf = &ioData->mBuffers[b];
+            if (!buf->mData || buf->mDataByteSize == 0) continue;
+
+            UInt32 ch = buf->mNumberChannels ? buf->mNumberChannels : 1;
+            float *dst = (float *)buf->mData;
+
+            // 先整块清零：mDataByteSize 是容量（40960 字节），
+            // 远大于本次要写的 frames 帧，不清零会把上次的残余一起播出去
+            memset(buf->mData, 0, buf->mDataByteSize);
+
+            for (size_t i = 0; i < (size_t)frames; i++) {
+                float v = (i < use) ? src[i] : 0.0f;
+                for (UInt32 c = 0; c < ch; c++) {
+                    dst[i * ch + c] = v;
+                }
             }
         }
+
+        if (use > 0) {
+            [carry replaceBytesInRange:NSMakeRange(0, use * sizeof(float))
+                             withBytes:NULL
+                                length:0];
+        }
+    } @finally {
+        [carryLock unlock];
     }
 }
 
@@ -714,29 +746,76 @@ didFinishLaunchingWithOptions:(NSDictionary *)launchOptions
     // 我们的 motionEnded: 拿不到。
     // 为什么不用单指长按：会跟播放器的长按菜单打架。
     // 双指长按在抖音里没有绑定功能，是目前最安全的触发方式。
-    static const void *kLogGestureKey = &kLogGestureKey;
-    if (!objc_getAssociatedObject(self, kLogGestureKey)) {
-        UILongPressGestureRecognizer *g =
+    static const void *kGestureKey = &kGestureKey;
+    if (!objc_getAssociatedObject(self, kGestureKey)) {
+        // 双指长按 1.5 秒 → 诊断报告
+        UILongPressGestureRecognizer *g2 =
             [[UILongPressGestureRecognizer alloc]
                 initWithTarget:self
-                        action:@selector(vc_handleLogGesture:)];
-        g.numberOfTouchesRequired = 2;
-        g.minimumPressDuration = 1.5;
-        g.cancelsTouchesInView = NO;   // 不能吞掉抖音自己的触摸
-        [self addGestureRecognizer:g];
-        objc_setAssociatedObject(self, kLogGestureKey, g,
+                        action:@selector(vc_handleTwoFinger:)];
+        g2.numberOfTouchesRequired = 2;
+        g2.minimumPressDuration = 1.5;
+        g2.cancelsTouchesInView = NO;
+        [self addGestureRecognizer:g2];
+
+        // 三指长按 1 秒 → 切音频模式（真麦 / 素材 / 静音）
+        // 有了它，调参不需要重新编译 + 注入，测一次只要几秒
+        UILongPressGestureRecognizer *g3 =
+            [[UILongPressGestureRecognizer alloc]
+                initWithTarget:self
+                        action:@selector(vc_handleThreeFinger:)];
+        g3.numberOfTouchesRequired = 3;
+        g3.minimumPressDuration = 1.0;
+        g3.cancelsTouchesInView = NO;
+        [self addGestureRecognizer:g3];
+
+        objc_setAssociatedObject(self, kGestureKey, g2,
                                  OBJC_ASSOCIATION_RETAIN_NONATOMIC);
-        VCLog(@"日志手势已安装：双指长按 1.5 秒");
+        VCLog(@"手势已安装：双指=报告，三指=切音频模式");
     }
 }
 
-- (void)vc_handleLogGesture:(UILongPressGestureRecognizer *)g
+- (void)vc_handleTwoFinger:(UILongPressGestureRecognizer *)g
 {
     if (g.state == UIGestureRecognizerStateBegan) {
-        // 双指长按跑音频架构诊断（比看日志有用得多），
-        // 结果自动塞进剪贴板。
         VCDumpAudioReport();
     }
+}
+
+// 三指长按：循环切换 audioMode。
+//
+// 存在的意义是省掉「改代码 → 编译 2 分钟 → 注入 → 重开」这个循环。
+// 三种模式互相对照，几秒钟就能判断问题出在采集、写入还是素材本身：
+//   0 真麦   → 应该听到自己的声音（验证链路本身没坏）
+//   1 素材   → 应该听到 test_demo
+//   2 静音   → 应该完全无声（验证清零范围够不够）
+- (void)vc_handleThreeFinger:(UILongPressGestureRecognizer *)g
+{
+    if (g.state != UIGestureRecognizerStateBegan) return;
+
+    VCamConfig *cfg = VCamConfig.shared;
+    NSInteger next = ((NSInteger)cfg.audioMode + 1) % 3;
+    [cfg setAudioMode:(VCAudioMode)next];
+
+    NSString *name = next == 0 ? @"真麦克风" : (next == 1 ? @"素材音轨" : @"静音");
+    VCLog(@"三指切换 audioMode -> %ld (%@)", (long)next, name);
+
+    // 轻震动反馈
+    UIImpactFeedbackGenerator *fb =
+        [[UIImpactFeedbackGenerator alloc] initWithStyle:UIImpactFeedbackStyleMedium];
+    [fb impactOccurred];
+
+    UIAlertController *a =
+        [UIAlertController alertControllerWithTitle:@"音频模式"
+                                           message:[NSString stringWithFormat:
+                        @"已切换到 %@ (%ld)\n\n直接录一段试试，不用重新编译。",
+                        name, (long)next]
+                                    preferredStyle:UIAlertControllerStyleAlert];
+    [a addAction:[UIAlertAction actionWithTitle:@"好"
+                                          style:UIAlertActionStyleCancel
+                                        handler:nil]];
+    UIViewController *vc = VCTopViewController();
+    [vc presentViewController:a animated:NO completion:nil];
 }
 
 %end

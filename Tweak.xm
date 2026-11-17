@@ -468,9 +468,13 @@ static OSStatus hook_AudioUnitRender(AudioUnit unit,
     if (!g_auAsbdProbed) {
         AudioStreamBasicDescription asbd;
         UInt32 sz = sizeof(asbd);
+        // 注意 scope：AudioUnitRender(..., bus=1, ...) 取的是 input element
+        // 的 **output scope**。之前写成 kAudioUnitScope_Input，拿到的是
+        // 麦克风硬件那一侧的格式，跟实际填进 buffer 的不是同一个东西 ——
+        // 所以报告里出现「缓冲区声道=2 / 系统声道=1」这种矛盾。
         OSStatus r = AudioUnitGetProperty(unit,
                                           kAudioUnitProperty_StreamFormat,
-                                          kAudioUnitScope_Input,
+                                          kAudioUnitScope_Output,
                                           bus,
                                           &asbd,
                                           &sz);
@@ -1079,6 +1083,24 @@ static NSString *VCRunAudioDiagnosis(void)
     [out appendFormat:@"buffers       : %u\n", (unsigned)g_auLastBuffers];
     [out appendFormat:@"声道数        : %u\n", (unsigned)g_auLastChannels];
     [out appendFormat:@"字节数        : %u\n", (unsigned)g_auLastBytes];
+
+    [out appendString:@"\n--- 素材 PCM 格式 ---\n"];
+    {
+        CMItemCount got = 0;
+        AudioStreamBasicDescription a = {0};
+        NSData *probe = [[VCFrameSource shared]
+                         copyNextAudioPCMWithFrameCount:&got asbd:&a];
+        [out appendFormat:@"FormatID      : 0x%x (lpcm=0x6c70636d)\n", (unsigned)a.mFormatID];
+        [out appendFormat:@"formatFlags   : 0x%x (1=float 8=packed 32=noninterleaved)\n", (unsigned)a.mFormatFlags];
+        [out appendFormat:@"采样率        : %.0f Hz\n", a.mSampleRate];
+        [out appendFormat:@"声道          : %u\n", (unsigned)a.mChannelsPerFrame];
+        [out appendFormat:@"位深          : %u bit\n", (unsigned)a.mBitsPerChannel];
+        [out appendFormat:@"bytesPerFrame : %u\n", (unsigned)a.mBytesPerFrame];
+        [out appendFormat:@"本次帧数      : %d\n", (int)got];
+        [out appendFormat:@"本次字节数    : %lu\n", (unsigned long)probe.length];
+        [out appendFormat:@"推算每样本字节: %.2f\n",
+            got > 0 ? (double)probe.length / (double)got : 0.0];
+    }
 
     [out appendString:@"\n--- 系统音频格式 ---\n"];
     [out appendFormat:@"采样率        : %u Hz\n", (unsigned)g_auSysSampleRate];

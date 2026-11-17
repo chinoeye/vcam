@@ -298,6 +298,7 @@
     [self restartAudioReaderLocked];
     _audioSamplesRead = 0;
     _audioSamplesOut = 0;
+    _audioConsumedSourceFrames = 0;   // 循环回绕，消费计数一起归零
     _videoSourceSeconds = 0.0;
 
     return YES;
@@ -508,6 +509,14 @@ int g_vcSeekCount = 0;
 
     _audioSamplesRead = (uint64_t)(MAX(0.0, v) * _audioSampleRate);
     _audioSamplesOut = _audioSamplesRead;
+
+    // 同步重置「实际消费位置」。
+    //
+    // 这两个必须一起动：readerT 优先读 _audioConsumedSourceFrames，
+    // 如果 seek 只重置 _audioSamplesRead 而不管它，
+    // readerT 会停在旧的小值上，被判定为「音频严重落后」→ 立刻再 seek
+    // → 永远落后、永远 seek，一个样本都放不出来（实测 254 次调用触发 254 次 seek）。
+    _audioConsumedSourceFrames = _audioSamplesRead;
 }
 
 // ------------------------------------------------------------------ 生命周期

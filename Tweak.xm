@@ -261,6 +261,113 @@ static void VCRewritePCMBuffer(AVAudioPCMBuffer *buf)
 %end
 
 // ==================================================================
+#pragma mark - 音频：AudioUnit (RemoteIO) 路径  ★真正在这条
+// ==================================================================
+//
+//  崩溃日志的镜像列表把答案写得很清楚：
+//    AudioSession.framework        私有音频会话
+//    libEmbeddedSystemAUs.dylib    内嵌系统 AudioUnit
+//
+//  抖音既不走 AVCaptureAudioDataOutput，也不走 AVAudioEngine 的 tap ——
+//  它直接用 AudioUnit（RemoteIO / VoiceProcessingIO）拉麦克风数据。
+//  前两次 hook 完全没反应，就是因为挂错了地方。
+//
+//  AudioUnitRender 是从 input bus 取采集数据的唯一入口。
+//  在它返回之后改写 ioData 里的 PCM，跟视频的原地改写同一套逻辑：
+//    · 不造 buffer，不动所有权
+//    · 只改 mData 里的样本
+//    · 只碰 bus == 1（采集），绝不碰 bus == 0（播放，否则出回声）
+
+typedef OSStatus (*VC_AURender_FN)(AudioUnit, AudioUnitRenderActionFlags *,
+                                   const AudioTimeStamp *, UInt32, UInt32,
+                                   AudioBufferList *);
+
+static VC_AURender_FN orig_AudioUnitRender = NULL;
+
+static void VCRewriteAudioBufferList(AudioBufferList *ioData, UInt32 frames)
+{
+    if (!ioData || frames == 0) return;
+
+    VCamConfig *cfg = VCamConfig.shared;
+    if (cfg.audioMode == VCAudioModeMic) return;
+
+    // ---- 静音：整块清零 ----
+    if (cfg.audioMode == VCAudioModeMute) {
+        for (UInt32 b = 0; b < ioData->mNumberBuffers; b++) {
+            AudioBuffer *buf = &ioData->mBuffers[b];
+            if (buf->mData && buf->mDataByteSize) {
+                memset(buf->mData, 0, buf->mDataByteSize);
+            }
+        }
+        return;
+    }
+
+    // ---- 素材音轨 ----
+    CMItemCount srcFrames = 0;
+    AudioStreamBasicDescription asbd = {0};
+    NSData *pcm = [[VCFrameSource shared] copyNextAudioPCMWithFrameCount:&srcFrames asbd:&asbd];
+    if (!pcm || srcFrames == 0) return;
+
+    const float *src = (const float *)pcm.bytes;
+    size_t avail = pcm.length / sizeof(float);
+    if (avail == 0) return;
+
+    static BOOL sLogged = NO;
+    if (!sLogged) {
+        sLogged = YES;
+        VCLog(@"AudioUnit 音频注入接通：%u 帧/块，%u 个 buffer，素材 %zu 样本 %.0fHz",
+              (unsigned)frames, (unsigned)ioData->mNumberBuffers,
+              avail, asbd.mSampleRate);
+    }
+
+    for (UInt32 b = 0; b < ioData->mNumberBuffers; b++) {
+        AudioBuffer *buf = &ioData->mBuffers[b];
+        if (!buf->mData || buf->mDataByteSize == 0) continue;
+
+        UInt32 ch = buf->mNumberChannels ? buf->mNumberChannels : 1;
+        float *dst = (float *)buf->mData;
+        size_t total = buf->mDataByteSize / sizeof(float);
+        size_t frameCount = total / ch;
+        if (frameCount > frames) frameCount = frames;
+
+        // 单声道素材展开到 N 声道交错布局，尾部补静音
+        for (size_t i = 0; i < frameCount; i++) {
+            float v = (i < avail) ? src[i] : 0.0f;
+            for (UInt32 c = 0; c < ch; c++) {
+                dst[i * ch + c] = v;
+            }
+        }
+    }
+}
+
+static OSStatus hook_AudioUnitRender(AudioUnit unit,
+                                     AudioUnitRenderActionFlags *flags,
+                                     const AudioTimeStamp *ts,
+                                     UInt32 bus,
+                                     UInt32 frames,
+                                     AudioBufferList *ioData)
+{
+    if (!orig_AudioUnitRender) return -1;
+
+    OSStatus st = orig_AudioUnitRender(unit, flags, ts, bus, frames, ioData);
+    if (st != noErr || !ioData) return st;
+
+    // RemoteIO / VoiceProcessingIO：output bus = 0（播放），input bus = 1（采集）
+    if (bus != 1) return st;
+
+    static BOOL sLoggedBus = NO;
+    if (!sLoggedBus) {
+        sLoggedBus = YES;
+        VCLog(@"AudioUnitRender 命中 input bus：frames=%u buffers=%u ch=%u",
+              (unsigned)frames, (unsigned)ioData->mNumberBuffers,
+              ioData->mNumberBuffers ? (unsigned)ioData->mBuffers[0].mNumberChannels : 0);
+    }
+
+    VCRewriteAudioBufferList(ioData, frames);
+    return st;
+}
+
+// ==================================================================
 #pragma mark - 采集输出：预览通道
 // ==================================================================
 // AVCaptureVideoPreviewLayer 走的是 GPU 直连，不经过 delegate，
@@ -572,8 +679,17 @@ static void VCBootstrap(void)
                 [VCHide installHooks];
             }
 
-            // 2. 兜底：即使 didFinishLaunching hook 没命中（SceneDelegate 流程），
-            //    延迟一段时间也把面板和素材拉起来
+            // 2. AudioUnit 采集入口 —— 抖音的音频真正走这条。
+            //    AudioUnitRender 是 C 函数，用 fishhook 按符号名重绑定。
+            //    挂不上也不会崩，只是没效果，这里把结果打出来便于判断。
+            BOOL auHooked = VCHookSymbol("AudioUnitRender",
+                                         (void *)hook_AudioUnitRender,
+                                         (void **)&orig_AudioUnitRender);
+            VCLog(@"AudioUnitRender hook %@ (orig=%p)",
+                  auHooked ? @"已安装" : @"失败", orig_AudioUnitRender);
+
+            // 3. 兜底：即使 didFinishLaunching hook 没命中（SceneDelegate 流程），
+            //    延迟一段时间也把素材拉起来
             dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2.0 * NSEC_PER_SEC)),
                            dispatch_get_main_queue(), ^{
                 VCBootstrap();

@@ -169,7 +169,14 @@ static vc_segment_command *vc_find_segment(const vc_mach_header *mh, const char 
 
 static void vc_rebind_one(vc_entry_t *e, const char *name, void **indirect)
 {
-    if (!indirect) return;
+    if (!indirect || !name) return;
+
+    // Mach-O 里 C 符号名带前导下划线（_AudioUnitRender），
+    // 而注册时写的是 "AudioUnitRender"。这里统一跳过下划线再比 ——
+    // 否则 strcmp 永远不相等，这是 VCHookSymbol 一直绑不上的
+    // 第二个原因（第一个是 section 名认错）。
+    if (*name == '_') name++;
+
     for (size_t i = 0; i < e->nel; i++) {
         if (!e->rb[i].name) continue;
         if (strcmp(name, e->rb[i].name) != 0) continue;

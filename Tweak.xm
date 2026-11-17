@@ -319,10 +319,6 @@ typedef OSStatus (*VC_AURender_FN)(AudioUnit, AudioUnitRenderActionFlags *,
 
 static VC_AURender_FN orig_AudioUnitRender = NULL;
 
-// 诊断期 hook_AudioUnitRender 走的是「无条件清零」，这条带策略的写入
-// 暂时没有调用者。但它是正式版的实现，不能删 —— 加 unused 标记保留，
-// 否则 -Werror 会以 -Wunused-function 判死。
-__attribute__((unused))
 static void VCRewriteAudioBufferList(AudioBufferList *ioData, UInt32 frames)
 {
     if (!ioData || frames == 0) return;
@@ -391,38 +387,19 @@ static OSStatus hook_AudioUnitRender(AudioUnit unit,
     OSStatus st = orig_AudioUnitRender(unit, flags, ts, bus, frames, ioData);
     if (st != noErr || !ioData) return st;
 
-    // ================= 【诊断版】无条件清零 =================
-    //
-    // 目的：一刀切开「hook 没装上」和「装上了但写入逻辑不对」。
-    //   录出来是纯静音  -> hook 生效，问题在 bus 判断或 PCM 格式
-    //   录出来还有声音  -> hook 根本没被调用，抖音不走 AudioUnitRender
-    //
-    // 只碰 input bus（1 = 采集），碰播放 bus 会出回声。
-    if (bus == 1) {
-        static BOOL sLoggedHit = NO;
-        if (!sLoggedHit) {
-            sLoggedHit = YES;
-            VCLog(@"★ AudioUnitRender 命中 input bus：frames=%u buffers=%u ch=%u —— hook 生效",
-                  (unsigned)frames, (unsigned)ioData->mNumberBuffers,
-                  ioData->mNumberBuffers ? (unsigned)ioData->mBuffers[0].mNumberChannels : 0);
-        }
+    // 只碰 input bus（1 = 采集）。碰 bus 0（播放）会把麦克风数据灌进扬声器。
+    if (bus != 1) return st;
 
-        for (UInt32 b = 0; b < ioData->mNumberBuffers; b++) {
-            AudioBuffer *buf = &ioData->mBuffers[b];
-            if (buf->mData && buf->mDataByteSize) {
-                memset(buf->mData, 0, buf->mDataByteSize);
-            }
-        }
-        return st;
+    static BOOL sLoggedHit = NO;
+    if (!sLoggedHit) {
+        sLoggedHit = YES;
+        VCLog(@"★ AudioUnitRender 命中 input bus：frames=%u buffers=%u ch=%u —— hook 生效",
+              (unsigned)frames, (unsigned)ioData->mNumberBuffers,
+              ioData->mNumberBuffers ? (unsigned)ioData->mBuffers[0].mNumberChannels : 0);
     }
 
-    // 其它 bus（播放方向）：只在真注入时做统计日志，绝不改数据
-    static BOOL sLoggedOther = NO;
-    if (!sLoggedOther) {
-        sLoggedOther = YES;
-        VCLog(@"AudioUnitRender 其它 bus=%u frames=%u（播放方向，不动）",
-              (unsigned)bus, (unsigned)frames);
-    }
+    // 按 audioMode 处理：Mic 原样透传 / Mute 清零 / Asset 灌素材
+    VCRewriteAudioBufferList(ioData, frames);
     return st;
 }
 

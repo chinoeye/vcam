@@ -284,10 +284,76 @@ static double VCDrift(double amplitude, double speed)
 %end
 
 // ==================================================================
-#pragma mark - 启动与生命周期
+#pragma mark - 后台控制：URL Scheme
 // ==================================================================
+//
+//  完全去掉了悬浮球和面板 —— 那个全屏 window 是画面卡死的元凶，
+//  而且它挡着抖音界面。改成用 URL Scheme 从外部控制：
+//
+//      vcam://on              开启注入
+//      vcam://off             关闭注入
+//      vcam://pause           暂停/继续
+//      vcam://asset/demo1     切换素材（demo1 = 素材文件名，不带扩展）
+//      vcam://audio/0|1|2     音频：0=真麦 1=素材 2=静音
+//      vcam://status          仅拉起 App，不改配置
+//
+//  用法：Safari 地址栏敲一行，系统会问「是否在抖音中打开」，确认即可。
+//  或者做成快捷指令放到桌面，点一下就切。
 
 static void VCBootstrap(void);
+
+static void VCApplyURL(NSURL *url)
+{
+    if (!url) return;
+
+    NSString *host = url.host.lowercaseString;
+    NSString *path = url.path;
+    VCamConfig *cfg = VCamConfig.shared;
+
+    if ([host isEqualToString:@"on"]) {
+        cfg.injectEnabled = YES;
+        [cfg persist];
+        VCLog(@"URL 控制: 注入已开启");
+    } else if ([host isEqualToString:@"off"]) {
+        cfg.injectEnabled = NO;
+        [cfg persist];
+        VCLog(@"URL 控制: 注入已关闭");
+    } else if ([host isEqualToString:@"pause"]) {
+        cfg.paused = !cfg.paused;
+        [cfg persist];
+        VCLog(@"URL 控制: %@", cfg.paused ? @"已暂停" : @"已继续");
+    } else if ([host isEqualToString:@"asset"]) {
+        if (path.length > 1) {
+            NSString *name = [path substringFromIndex:1];
+            cfg.assetName = name;
+            cfg.sourceKind = VCSourceKindAsset;
+            [cfg persist];
+            NSURL *u = [cfg assetURL];
+            NSError *err = nil;
+            if (u && [[VCFrameSource shared] reloadWithURL:u error:&err]) {
+                VCLog(@"URL 控制: 素材切到 %@", name);
+            } else {
+                VCLog(@"URL 控制: 素材切换失败 %@", err);
+            }
+        }
+    } else if ([host isEqualToString:@"audio"]) {
+        NSInteger mode = path.length > 1 ? [[path substringFromIndex:1] integerValue] : -1;
+        if (mode >= 0 && mode <= 2) {
+            cfg.audioMode = (VCAudioMode)mode;
+            [cfg persist];
+            VCLog(@"URL 控制: 音频模式 %ld", (long)mode);
+        }
+    } else if ([host isEqualToString:@"status"]) {
+        VCLog(@"URL 控制: 状态查询 inject=%d asset=%@",
+              cfg.injectEnabled, cfg.assetName);
+    } else {
+        VCLog(@"URL 控制: 未知命令 %@", host);
+    }
+}
+
+// ==================================================================
+#pragma mark - 启动与生命周期
+// ==================================================================
 
 %hook UIApplication
 
@@ -297,6 +363,19 @@ didFinishLaunchingWithOptions:(NSDictionary *)launchOptions
     BOOL ret = %orig;
     VCBootstrap();
     return ret;
+}
+
+// 后台控制入口：vcam://on / off / pause / asset/xxx / audio/0|1|2
+- (BOOL)application:(UIApplication *)app
+            openURL:(NSURL *)url
+            options:(NSDictionary<UIApplicationOpenURLOptionsKey, id> *)options
+{
+    if ([url.scheme.lowercaseString isEqualToString:@"vcam"]) {
+        VCApplyURL(url);
+        VCBootstrap();   // 冷启动时 didFinishLaunching 可能还没走到
+        return YES;
+    }
+    return %orig;
 }
 
 %end
@@ -341,13 +420,11 @@ static void VCBootstrap(void)
             VCLog(@"注入未启用 → 静默模式：不加载素材、不连实时源");
         }
 
-        // 面板稍后再挂，等 App 自己的 UI 起来，避免抢 window
-        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.5 * NSEC_PER_SEC)),
-                       dispatch_get_main_queue(), ^{
-            [VCOverlay installPanelIfNeeded];
-        });
+        // 面板不再挂载 —— 改成后台程序，用 URL Scheme 控制（见 VCApplyURL）。
+        // 那个全屏 UIWindow 是「点一下画面就冻住」的元凶，去掉之后
+        // dylib 在进程里只剩帧注入这一条链路，屏幕上什么都不多出来。
 
-        VCLog(@"VCam 已就绪");
+        VCLog(@"VCam 已就绪（后台模式，无 UI。用 vcam://on 开启注入）");
     });
 }
 

@@ -21,6 +21,7 @@
 
 #import "VCAudioPipeline.h"
 #import "VCFrameSource.h"
+#import "VCAudioSource.h"
 #import "VCLog.h"
 
 #import <pthread.h>
@@ -184,7 +185,9 @@ static OSStatus VCPipeInputProc(AudioConverterRef cvt,
     _seekCount = 0;
 
     AudioStreamBasicDescription src = {0};
-    src.mSampleRate       = 48000;
+    // 素材实际采样率：优先用 VCAudioSource 探到的，拿不到才退回 48000
+    double srcRate = [VCAudioSource shared].sampleRate;
+    src.mSampleRate       = srcRate > 0 ? srcRate : 48000;
     src.mFormatID         = kAudioFormatLinearPCM;
     src.mFormatFlags      = kAudioFormatFlagIsFloat | kAudioFormatFlagIsPacked;
     src.mBytesPerPacket   = 4;
@@ -324,8 +327,8 @@ static OSStatus VCPipeInputProc(AudioConverterRef cvt,
     while ((srcData.length / sizeof(float)) < needSrc && guard++ < 32) {
         CMItemCount got = 0;
         AudioStreamBasicDescription a = {0};
-        NSData *more = [[VCFrameSource shared]
-                        copyNextAudioPCMWithFrameCount:&got asbd:&a];
+        NSData *more = [[VCAudioSource shared]
+                        nextPCMWithFrames:&got asbd:&a];
         if (!more || more.length == 0) break;
         [srcData appendData:more];
     }

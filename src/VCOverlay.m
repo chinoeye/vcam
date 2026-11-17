@@ -106,6 +106,17 @@ static UIWindow *gVCamPanelWindow = nil;
     UIStackView *_assetStack;
     BOOL _expanded;
     CGPoint _ballHome;
+    NSTimer *_timer;
+}
+
+/// 彻底停掉面板：定时器 invalidate + 视图隐藏。
+/// 静默模式下这东西必须在几秒后消失，否则定时器会一直 retain 住 controller，
+/// 全屏透明视图也一直参与合成。
+- (void)shutdown
+{
+    [_timer invalidate];
+    _timer = nil;
+    self.view.hidden = YES;
 }
 
 // 用穿透容器替换默认的 rootView
@@ -202,9 +213,9 @@ static UIWindow *gVCamPanelWindow = nil;
     [stack addArrangedSubview:_pauseButton];
 
     [self refreshStatus];
-    [NSTimer scheduledTimerWithTimeInterval:1.5 target:self
-                                   selector:@selector(refreshStatus)
-                                   userInfo:nil repeats:YES];
+    _timer = [NSTimer scheduledTimerWithTimeInterval:1.5 target:self
+                                            selector:@selector(refreshStatus)
+                                            userInfo:nil repeats:YES];
 }
 
 - (UIView *)separator
@@ -509,6 +520,27 @@ static UIWindow *gVCamPanelWindow = nil;
             w.hidden = NO;
             gVCamPanelWindow = w;
             VCLog(@"控制面板已显示");
+
+            // ---- 静默模式：面板 5 秒后自毁 ----
+            //
+            // 目的不是省资源，是**做对照实验**：
+            // 这个全屏透明 window 挂在 UIWindowLevelAlert + 100 上，
+            // 只要它还在，就永远说不清卡顿到底是它还是别的。
+            // 留 5 秒是让用户有机会把「注入」重新打开，
+            // 之后就彻底销毁 —— window、controller、定时器一起没。
+            VCamConfig *cfg = VCamConfig.shared;
+            BOOL active = (cfg.injectEnabled && cfg.sourceKind != VCSourceKindNone);
+            if (!active) {
+                VCamPanelController *vc = (VCamPanelController *)w.rootViewController;
+                dispatch_after(dispatch_time(DISPATCH_TIME_NOW,
+                                             (int64_t)(5.0 * NSEC_PER_SEC)),
+                               dispatch_get_main_queue(), ^{
+                    [vc shutdown];
+                    w.hidden = YES;
+                    if (gVCamPanelWindow == w) gVCamPanelWindow = nil;
+                    VCLog(@"静默模式：控制面板已自动销毁（window + 定时器）");
+                });
+            }
         });
     });
 }

@@ -79,12 +79,20 @@ static NSString *VCJailbreakRoot(void)
 - (NSString *)resolveAssetDirectory
 {
     // 优先 /Library/Application Support（App 进程可读，不受沙盒限制）
-    NSArray *candidates = @[
-        [VCJailbreakRoot() stringByAppendingPathComponent:
-            @"Library/Application Support/VCam/assets"],
-        @"/var/mobile/Library/Application Support/VCam/assets",
-        [NSTemporaryDirectory() stringByAppendingPathComponent:@"VCam/assets"],
-    ];
+    // TrollStore 注入的 dylib 跑在 App 自己的沙盒里，只能碰得到本容器的目录。
+    // 老版本那几条 /var/jb、/var/mobile/Library 的路径在无越狱环境下全部无效。
+    //
+    // 现在统一用 App 自己的 Documents ——
+    // 爱思助手 → 文件管理 → 应用 → 抖音 → Documents，可以直接往里拖素材。
+    // 或者把素材下载到「文件」App 再用爱思搬进来。
+    NSString *docs = NSSearchPathForDirectoriesInDomains(NSDocumentDirectory,
+                                                         NSUserDomainMask, YES).firstObject;
+    NSMutableArray *candidates = [NSMutableArray array];
+    if (docs.length > 0) {
+        [candidates addObject:[docs stringByAppendingPathComponent:@"VCam/assets"]];
+    }
+    [candidates addObject:[NSTemporaryDirectory() stringByAppendingPathComponent:@"VCam/assets"]];
+
     NSFileManager *fm = [NSFileManager defaultManager];
     for (NSString *p in candidates) {
         BOOL isDir = NO;
@@ -97,6 +105,30 @@ static NSString *VCJailbreakRoot(void)
     [fm createDirectoryAtPath:first withIntermediateDirectories:YES
                    attributes:nil error:NULL];
     return first;
+}
+
+/// Documents/VCam/config.plist 里的键优先于 UserDefaults。
+/// 用爱思助手改这个文件，重启抖音就生效 —— 这是后台模式唯一的控制入口。
+- (void)applyConfigFile
+{
+    NSString *docs = NSSearchPathForDirectoriesInDomains(NSDocumentDirectory,
+                                                         NSUserDomainMask, YES).firstObject;
+    if (docs.length == 0) return;
+
+    NSString *path = [docs stringByAppendingPathComponent:@"VCam/config.plist"];
+    NSDictionary *d = [NSDictionary dictionaryWithContentsOfFile:path];
+    if (![d isKindOfClass:[NSDictionary class]]) return;
+
+    if (d[@"injectEnabled"])     _injectEnabled = [d[@"injectEnabled"] boolValue];
+    if (d[@"paused"])            _paused = [d[@"paused"] boolValue];
+    if (d[@"loopEnabled"])       _loopEnabled = [d[@"loopEnabled"] boolValue];
+    if (d[@"jitterTimestamps"])  _jitterTimestamps = [d[@"jitterTimestamps"] boolValue];
+    if (d[@"hideJailbreakV2"])   _hideJailbreak = [d[@"hideJailbreakV2"] boolValue];
+    if (d[@"assetName"])         _assetName = [d[@"assetName"] description];
+    if (d[@"audioMode"])         _audioMode = (VCAudioMode)[d[@"audioMode"] integerValue];
+
+    VCLog(@"已加载配置文件 %@（inject=%d asset=%@）",
+          path, _injectEnabled, _assetName);
 }
 
 - (NSString *)assetDirectory
@@ -129,6 +161,11 @@ static NSString *VCJailbreakRoot(void)
     if ([d objectForKey:@"hideOverlayQuickly"]) _hideOverlayQuickly = [d boolForKey:@"hideOverlayQuickly"];
 
     if (_livePort == 0) _livePort = 8099;
+
+    // 再让 Documents/VCam/config.plist 覆盖一遍（存在才覆盖）。
+    // 后台模式下没有 UI，这个文件就是唯一的控制入口。
+    [self applyConfigFile];
+
     if (_assetName.length == 0) {
         NSArray *all = [self availableAssets];
         _assetName = all.firstObject ?: @"";

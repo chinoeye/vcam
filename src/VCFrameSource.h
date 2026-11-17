@@ -73,6 +73,17 @@ NS_ASSUME_NONNULL_BEGIN
 /// 用真实的输出帧数换算时间，才能和系统播放进度严格一致。
 @property (nonatomic, assign) double audioPlaybackSeconds;
 
+/// 已经真正播出去的源帧数（48000Hz 坐标系），由 Tweak 层在每次成功写入后累加。
+///
+/// 和 _audioSamplesRead 的区别：
+///   _audioSamplesRead      解码到哪了（含还攒在 carry 里没用的）
+///   audioConsumedSourceFrames  真正播放到哪了
+///
+/// 判断音画同步必须用后者。用解码进度会让 carry 越攒越多、
+/// 判定「音频严重超前」，于是不停 seek —— 每次 seek 重建 reader
+/// 阻塞 140ms，就是波形里那个大断点。
+@property (nonatomic, assign) uint64_t audioConsumedSourceFrames;
+
 /// 音频 seek 校正的累计次数（诊断用，定义在 .m 里）。
 extern int g_vcSeekCount;
 

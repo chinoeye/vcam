@@ -277,6 +277,48 @@ static void VCRewritePCMBuffer(AVAudioPCMBuffer *buf)
     }
 }
 
+// ==================================================================
+#pragma mark - 音频会话：强制 48000Hz
+// ==================================================================
+//
+//  实测这台机器上系统侧是 44100Hz，而素材和解码器都是 48000Hz。
+//  两边不一致会带来两个麻烦：
+//    1) 每块都要重采样，48k -> 44.1k，多一次运算
+//    2) 按源样本数推算的时间比实际播放快 8.8%，几秒就撞同步阈值导致断音
+//
+//  与其在转换链路上打补丁，不如把音频会话直接设成 48000 ——
+//  两边对齐之后 ratio = 1.0，既没有重采样开销，也没有速率差。
+//
+//  注意：这里只是「偏好设置」，系统可能拒绝。拒绝也不会崩，退回重采样即可。
+
+%hook AVAudioSession
+
+- (BOOL)setSampleRate:(double)sampleRate error:(NSError **)outError
+{
+    double target = 48000.0;
+    BOOL ok = %orig(target, outError);
+    if (ok) {
+        if (fabs(sampleRate - target) > 1.0) {
+            VCLog(@"音频会话采样率已改写: %.0f -> %.0f", sampleRate, target);
+        }
+    } else {
+        VCLog(@"音频会话采样率改写失败（原 %.0f），继续走重采样", sampleRate);
+    }
+    return ok;
+}
+
+- (BOOL)setPreferredSampleRate:(double)sampleRate error:(NSError **)outError
+{
+    double target = 48000.0;
+    BOOL ok = %orig(target, outError);
+    if (ok) {
+        VCLog(@"音频会话首选采样率已设为 %.0f", target);
+    }
+    return ok;
+}
+
+%end
+
 %hook AVAudioEngine
 
 - (void)installTapOnBus:(AVAudioNodeBus)bus
@@ -658,14 +700,10 @@ static void VCRewriteAudioBufferList(AudioBufferList *ioData, UInt32 frames)
                                 length:0];
         }
 
-        // ---- 回报真实播放进度 ----
-        // 用实际输出的帧数换算，而不是源样本数 —— 这是消除周期性断音的关键。
-        // 源 48k、目标 44.1k，用源算会差 8.8%，几秒就撞阈值。
+        // 统计实际输出帧数（诊断用）。
+        // 注意：不要拿它去驱动 VCFrameSource 的同步判断 —— 那会形成
+        // 「不转换就不更新、不更新就不转换」的死锁。
         g_audioOutFrames += outPackets;
-        VCamConfig *cfgRef = VCamConfig.shared;
-        (void)cfgRef;
-        [VCFrameSource shared].audioPlaybackSeconds =
-            (double)g_audioOutFrames / dst.mSampleRate;
     } @finally {
         [carryLock unlock];
     }

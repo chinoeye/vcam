@@ -285,6 +285,85 @@ typedef OSStatus (*VC_AUSetProp_FN)(AudioUnit, AudioUnitPropertyID, AudioUnitSco
                                     AudioUnitElement, const void *, UInt32);
 static VC_AUSetProp_FN orig_AudioUnitSetProperty = NULL;
 
+// ==================================================================
+#pragma mark - AudioUnitAddRenderNotify 诊断
+// ==================================================================
+//
+//  为什么加这个：
+//    hook AudioUnitRender 拿到的 ioData->mBuffers[0].mDataByteSize 是 40960，
+//    而 frames=1024、bytesPerFrame=4 按契约只应该是 4096 —— 差 10 倍。
+//    分不清是抖音配置特殊，还是我读的时机不对（读到的是缓冲区容量
+//    而不是本次要填的长度）。
+//
+//    AudioUnitAddRenderNotify 是系统标准 API：每次渲染**前**(PreRender)
+//    和**后**(PostRender)各回调一次，frames 和 ioData 都由系统直接给出，
+//    时机明确，可以对照出真实值。
+//
+//  这里只记录，绝不修改 ioData —— 不影响现有音频输出。
+
+typedef OSStatus (*VC_AddRenderNotify_FN)(AudioUnit, AURenderCallback, void *);
+static VC_AddRenderNotify_FN orig_AddRenderNotify = NULL;
+
+static volatile int    g_rnInstalled  = 0;
+static volatile int    g_rnRegResult  = -999;
+static volatile UInt32 g_rnCalls      = 0;
+static volatile UInt32 g_rnPreCalls   = 0;
+static volatile UInt32 g_rnPostCalls  = 0;
+static volatile UInt32 g_rnPreFrames  = 0;
+static volatile UInt32 g_rnPreBytes   = 0;
+static volatile UInt32 g_rnPostBytes  = 0;
+static volatile UInt32 g_rnBus        = 0xFFFF;
+static volatile UInt32 g_rnBufs       = 0;
+static volatile UInt32 g_rnBpf        = 0;
+
+static OSStatus VCRenderNotify(void *refCon,
+                               AudioUnitRenderActionFlags *flags,
+                               const AudioTimeStamp *ts,
+                               UInt32 bus,
+                               UInt32 frames,
+                               AudioBufferList *ioData)
+{
+    g_rnCalls++;
+    g_rnBus  = bus;
+    g_rnBufs = ioData ? ioData->mNumberBuffers : 0;
+
+    if (flags && (*flags & kAudioUnitRenderAction_PreRender)) {
+        g_rnPreCalls++;
+        g_rnPreFrames = frames;
+        if (ioData && ioData->mNumberBuffers > 0) {
+            g_rnPreBytes = (UInt32)ioData->mBuffers[0].mDataByteSize;
+            if (frames > 0) {
+                g_rnBpf = (UInt32)(ioData->mBuffers[0].mDataByteSize / frames);
+            }
+        }
+    } else if (flags && (*flags & kAudioUnitRenderAction_PostRender)) {
+        g_rnPostCalls++;
+        if (ioData && ioData->mNumberBuffers > 0) {
+            g_rnPostBytes = (UInt32)ioData->mBuffers[0].mDataByteSize;
+        }
+    }
+    return noErr;
+}
+
+/// 给某个 unit 挂 RenderNotify。重复调用无副作用。
+static void VCInstallRenderNotify(AudioUnit unit)
+{
+    if (!unit) return;
+    if (!orig_AddRenderNotify) {
+        orig_AddRenderNotify = (VC_AddRenderNotify_FN)
+            dlsym(RTLD_NEXT, "AudioUnitAddRenderNotify");
+        if (!orig_AddRenderNotify) {
+            VCLog(@"RenderNotify: dlsym 拿不到符号");
+            return;
+        }
+    }
+    OSStatus r = orig_AddRenderNotify(unit, VCRenderNotify, NULL);
+    g_rnRegResult = (int)r;
+    g_rnInstalled = (r == noErr) ? 1 : 0;
+    VCLog(@"RenderNotify 注册 %@ (ret=%d, unit=%p)",
+          r == noErr ? @"成功" : @"失败", (int)r, unit);
+}
+
 static OSStatus hook_AudioUnitSetProperty(AudioUnit unit,
                                           AudioUnitPropertyID prop,
                                           AudioUnitScope scope,
@@ -307,6 +386,14 @@ static OSStatus hook_AudioUnitSetProperty(AudioUnit unit,
             return orig_AudioUnitSetProperty(unit, prop, scope, elem, &asbd, size);
         }
     }
+    // 遇到「输入回调」或「格式设置」时挂 RenderNotify。
+    // 2005 = kAudioOutputUnitProperty_SetInputCallback
+    if (prop == kAudioUnitProperty_StreamFormat || prop == 2005) {
+        if (!g_rnInstalled && g_rnRegResult != 0) {
+            VCInstallRenderNotify(unit);
+        }
+    }
+
     return orig_AudioUnitSetProperty(unit, prop, scope, elem, data, size);
 }
 
@@ -1113,6 +1200,19 @@ static NSString *VCRunAudioDiagnosis(void)
     }
     [out appendFormat:@"hook 填充次数 : %d\n", g_audioWriteOK];
     [out appendFormat:@"最近返回原因  : %d  (0=正常 1=Mic 2=Mute)\n", g_audioBail];
+
+    [out appendString:@"\n--- RenderNotify 诊断（系统标准 API）---\n"];
+    [out appendFormat:@"注册状态      : %@  (ret=%d)\n",
+        g_rnInstalled ? @"已注册" : @"未注册", g_rnRegResult];
+    [out appendFormat:@"回调次数      : %u  (Pre %u / Post %u)\n",
+        (unsigned)g_rnCalls, (unsigned)g_rnPreCalls, (unsigned)g_rnPostCalls];
+    [out appendFormat:@"PreRender 帧数: %u\n", (unsigned)g_rnPreFrames];
+    [out appendFormat:@"PreRender 字节: %u\n", (unsigned)g_rnPreBytes];
+    [out appendFormat:@"PostRender 字节: %u\n", (unsigned)g_rnPostBytes];
+    [out appendFormat:@"反推每帧字节  : %u   (格式报告是 %u)\n",
+        (unsigned)g_rnBpf, (unsigned)g_auSysBytesPerFrame];
+    [out appendFormat:@"最近 bus/bufs : %u / %u\n",
+        (unsigned)g_rnBus, (unsigned)g_rnBufs];
 
     [out appendString:@"\n--- 系统音频格式 ---\n"];
     [out appendFormat:@"采样率        : %u Hz\n", (unsigned)g_auSysSampleRate];

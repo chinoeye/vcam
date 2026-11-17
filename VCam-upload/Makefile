@@ -24,7 +24,12 @@ VCam_FRAMEWORKS = UIKit Foundation AVFoundation CoreMedia CoreVideo \
                   CoreImage ImageIO QuartzCore CoreGraphics \
                   VideoToolbox AudioToolbox
 
-VCam_LIBRARIES = substrate
+# 不再链接 libsubstrate —— TrollStore 环境没有它。
+# hook 能力由 src/VCSubstrateCompat.m 内建：
+#   MSHookMessageEx → method_setImplementation（objc runtime 原生）
+#   MSHookFunction  → fishhook 按符号名重绑定
+# 产出的 dylib 自包含，越狱和 TrollStore 两边都能用。
+# VCam_LIBRARIES = substrate
 
 include $(THEOS_MAKE_PATH)/tweak.mk
 

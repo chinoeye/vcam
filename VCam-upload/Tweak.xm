@@ -19,6 +19,7 @@
 #import "VCHide.h"
 #import "VCSampleBufferFactory.h"
 #import "VCLog.h"
+#import "VCSubstrateCompat.h"
 
 #import <math.h>
 #import <stdlib.h>

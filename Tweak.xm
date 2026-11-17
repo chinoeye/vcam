@@ -392,6 +392,26 @@ didFinishLaunchingWithOptions:(NSDictionary *)launchOptions
 
 // ------------------------------------------------------------------
 
+/// 真正去加载素材。下载线程回调到主线程后调用。
+static void VCLoadAssetNow(void)
+{
+    VCamConfig *c = VCamConfig.shared;
+    if ([VCFrameSource shared].isReady) return;
+
+    NSURL *url = [c assetURL];
+    if (!url) {
+        VCLog(@"素材不可用：沙盒里没有 %@.mp4，自动下载也没成功", c.assetName);
+        return;
+    }
+
+    NSError *err = nil;
+    if (![[VCFrameSource shared] reloadWithURL:url error:&err]) {
+        VCLog(@"素材装载失败: %@", err);
+    } else {
+        VCLog(@"素材已装载: %@", url.lastPathComponent);
+    }
+}
+
 static void VCBootstrap(void)
 {
     static dispatch_once_t once;
@@ -399,23 +419,24 @@ static void VCBootstrap(void)
         VCamConfig *cfg = VCamConfig.shared;
 
         // 静默模式：注入没开就完全不碰素材、不连实时源、不解码。
-        // 面板照常挂 —— 否则关了注入就再也打不开了。
         if (VCInjectionActive()) {
-            if (![VCFrameSource shared].isReady) {
-                NSURL *url = [cfg assetURL];
-                if (url) {
-                    NSError *err = nil;
-                    if (![[VCFrameSource shared] reloadWithURL:url error:&err]) {
-                        VCLog(@"素材装载失败: %@", err);
-                    }
-                } else {
-                    VCLog(@"没有可用素材，等面板里选");
-                }
-            }
-
+            // 实时源先连上，跟素材下载互不干扰
             if (cfg.sourceKind == VCSourceKindLive && cfg.liveHost.length > 0) {
                 [[VCLiveSource shared] connectToHost:cfg.liveHost port:cfg.livePort];
             }
+
+            // 素材可能还在电脑上 —— 抖音是「苹果正版」，爱思助手不给浏览
+            // 沙盒，没法手动拖文件进去。所以这里后台拉一次再加载。
+            // 用 UTILITY 优先级，别跟 App 自己的启动抢 CPU。
+            dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
+                VCamConfig *c = VCamConfig.shared;
+                if (c.sourceKind == VCSourceKindAsset) {
+                    [c ensureAssetDownloaded];
+                }
+                dispatch_async(dispatch_get_main_queue(), ^{
+                    VCLoadAssetNow();
+                });
+            });
         } else {
             VCLog(@"注入未启用 → 静默模式：不加载素材、不连实时源");
         }

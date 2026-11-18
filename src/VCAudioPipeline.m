@@ -346,53 +346,55 @@ static OSStatus VCPipeInputProc(AudioConverterRef cvt,
     size_t cap  = (size_t)(dstRate / 2);
     if (want > cap) want = cap;
 
-    // ---- 音画对齐 ----
+    // ---- 音画对齐：只在启动时做一次 ----
     //
-    //  视频侧时钟：VCFrameSource.currentVideoSourceTime = 最近解码那一帧的 PTS。
-    //  这个值约等于「播放位置 + 1 帧」，是可信的。
+    //  为什么不需要持续校正：
     //
-    //  音频侧：因为预生产，解码位置 = 播放位置 + 缓冲深度（最多 2 秒）。
-    //  如果不做补偿，音频会比视频超前整整一个缓冲深度 —— 实测就是「音画对不上」。
+    //      播放位置 = _decodedMaterialSeconds − buffered
     //
-    //  所以音频解码目标 = 视频解码位置 − 缓冲深度。
-    //  偏差超过 300ms 才 seek（避免频繁重建 reader 造成断音）。
+    //  水位控制在填缓冲时，_decodedMaterialSeconds 和 buffered 同步增长，
+    //  播放位置保持不变。所以只要「启动时」让音频从视频当前位置开始，
+    //  之后两边就自然同步 —— 不需要反复 seek。
+    //
+    //  以前每轮都比对一次再 seek，每次 seek 都清空缓冲：
+    //    ① 缓冲清空 → buffered 变 0 → target 跳变 → 立刻又要 seek
+    //    ② 异步 seek 还没生效 → 读到的是旧位置 → 位置对不上 → 再 seek
+    //    两次叠加就是死循环，实测 634 次欠载 / 13.5 秒静音。
+    //
+    //  现在：只对齐一次；偏差超过 5 秒（文件级异常）才重新对齐。
     {
+        static double sAlignedAtVideoT = -1.0;
+        static double sLastRealign = 0.0;
+
         double videoT = [[VCFrameSource shared] currentVideoSourceTime];
         if (videoT > 0.5) {
-            pthread_mutex_lock(&_lock);
-            double buffered = (_dstFormat.mSampleRate > 0)
-                            ? (double)_count / _dstFormat.mSampleRate : 0.0;
-            pthread_mutex_unlock(&_lock);
-
-            // 符号千万别搞反 —— 上一版写成 videoT - buffered，方向反了：
-            //
-            //   _decodedMaterialSeconds 是「已解码到素材的哪个时间」，
-            //   而缓冲里那 buffered 秒还没播出去，
-            //   所以音频的**播放**位置 = _decodedMaterialSeconds - buffered。
-            //
-            //   要和视频播放位置（≈ videoT）对齐，就必须：
-            //       _decodedMaterialSeconds - buffered ≈ videoT
-            //   →   _decodedMaterialSeconds ≈ videoT + buffered
-            //
-            //   写成减法时 error 恒为 -2×buffered（约 -4 秒），永远超阈值，
-            //   于是每次生产都 seek、每次 seek 都清空缓冲 ——
-            //   实测 634 次欠载、13.5 秒静音。
-            double target = videoT + buffered;
-            double error = target - _decodedMaterialSeconds;
-
-            // 阈值放宽到 0.8 秒：seek 会清空缓冲，代价很大，
-            // 只在大幅偏离时才做，小幅偏差让缓冲自己吸收。
-            static double sLastSeekAt = 0;
             double now = CFAbsoluteTimeGetCurrent();
-            if (fabs(error) > 0.80 && (now - sLastSeekAt) > 3.0) {
-                sLastSeekAt = now;
-                _seekCount++;
-                if (_seekCount <= 5 || _seekCount % 30 == 0) {
-                    VCLog(@"音频对齐 #%d：偏差 %.0fms（视频 %.2fs − 缓冲 %.2fs = 目标 %.2fs / 音频 %.2fs）",
-                          _seekCount, error * 1000, videoT, buffered,
-                          target, _decodedMaterialSeconds);
+            BOOL needAlign = NO;
+            double alignTo = videoT;
+
+            if (sAlignedAtVideoT < 0) {
+                needAlign = YES;          // 第一次：启动对齐
+            } else {
+                // 估算当前播放位置
+                pthread_mutex_lock(&_lock);
+                double buffered = (_dstFormat.mSampleRate > 0)
+                                ? (double)_count / _dstFormat.mSampleRate : 0.0;
+                pthread_mutex_unlock(&_lock);
+                double playPos = _decodedMaterialSeconds - buffered;
+                double drift = playPos - videoT;
+                if (fabs(drift) > 5.0 && (now - sLastRealign) > 30.0) {
+                    needAlign = YES;      // 只有极端偏差才重新对齐
+                    sLastRealign = now;
+                    alignTo = videoT;
                 }
-                [self seekAudioToTime:target];
+            }
+
+            if (needAlign) {
+                sAlignedAtVideoT = alignTo;
+                _seekCount++;
+                VCLog(@"音频对齐 #%d：启动对齐到 %.2fs（视频当前 %.2fs）",
+                      _seekCount, alignTo, videoT);
+                [self seekAudioToTime:alignTo];
             }
         }
     }

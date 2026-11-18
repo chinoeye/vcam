@@ -60,6 +60,10 @@ NS_ASSUME_NONNULL_BEGIN
 
 /// 上次欠载发生在管道启动后第几秒（用于定位断点位置）
 @property (nonatomic, readonly) double   lastUnderrunAt;
+/// 音频已解码到素材的哪个时间（秒）
+@property (nonatomic, readonly) double   decodedMaterialSeconds;
+/// 视频当前解码到素材的哪个时间（秒）—— 对齐基准
+@property (nonatomic, readonly) double   videoSourceSeconds;
 /// 单次生产最长耗时（毫秒）
 @property (nonatomic, readonly) double   maxProduceMs;
 

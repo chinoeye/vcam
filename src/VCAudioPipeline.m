@@ -481,7 +481,8 @@ static OSStatus VCPipeInputProc(AudioConverterRef cvt,
     //    ② 必须在**一次调用内**丢完。跨调用丢的话，每次 return 都让
     //       实时线程拿不到数据 → 缓冲空 → 闹钟一样的静音，累计好几秒。
     if (_skipUntilSeconds > 0 && _decodedMaterialSeconds < _skipUntilSeconds) {
-        double consumed = (double)availFrames / _srcFormat.mSampleRate;
+        size_t haveNow = srcData.length / srcBpf;
+        double consumed = (double)haveNow / _srcFormat.mSampleRate;
         _decodedMaterialSeconds += consumed;
         int guard = 0;
         while (_decodedMaterialSeconds < _skipUntilSeconds - 0.001 && guard++ < 400) {

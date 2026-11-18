@@ -117,8 +117,18 @@ NSString *const VCAudioSourceShouldResetNotification =
         }
 
         // 输出保持素材原始格式，转换交给管道那层
+        // 必须显式指定声道数为 1。
+        //
+        //  素材是 stereo（实测 test_demo.mp4 = 48000Hz / 2ch）。
+        //  不指定的话 AVAssetReader 会原样输出交错 stereo 数据，
+        //  而管道那边的源格式是按 mono（4 字节/帧）声明的 ——
+        //  交错数据 L0 R0 L1 R1 ... 被当成连续单声道样本解释，
+        //  左右声道交替播放，频率翻倍，听感就是「哒哒哒」的鼓点。
+        //
+        //  这里统一降到 mono，管道也用 mono 声明，两边严格对齐。
         NSDictionary *settings = @{
             AVFormatIDKey:               @(kAudioFormatLinearPCM),
+            AVNumberOfChannelsKey:       @1,
             AVLinearPCMBitDepthKey:      @32,
             AVLinearPCMIsFloatKey:       @YES,
             AVLinearPCMIsBigEndianKey:   @NO,
@@ -197,8 +207,11 @@ NSString *const VCAudioSourceShouldResetNotification =
         return;
     }
 
+    // 与 loadURL 里保持完全一致：强制单声道。
+    // 两处不同步会让「重置后」的声音变成哒哒哒，而首次加载正常 —— 极难排查。
     NSDictionary *settings = @{
         AVFormatIDKey:               @(kAudioFormatLinearPCM),
+        AVNumberOfChannelsKey:       @1,
         AVLinearPCMBitDepthKey:      @32,
         AVLinearPCMIsFloatKey:       @YES,
         AVLinearPCMIsBigEndianKey:   @NO,

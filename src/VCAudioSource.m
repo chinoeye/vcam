@@ -324,14 +324,18 @@ NSString *const VCAudioSourceShouldResetNotification =
             self->_underrun++;
             self->_consecutiveNil++;
 
-            // 兜底：连续拿不到数据，且 reader 已经读完，就自己回到开头。
-            // 正常情况下视频回绕会通过通知先一步重置，走不到这里；
-            // 这里是为了防止通知丢失导致永久静音。
-            if (self->_consecutiveNil >= 3 &&
-                self->_reader.status == AVAssetReaderStatusCompleted) {
-                VCLog(@"音频源：读到末尾且无通知，自行回到素材开头");
-                [self restartLocked];
-                self->_consecutiveNil = 0;
+            // 读到素材末尾：**绝不能自己重启**。
+            //
+            //  以前这里有「连续 3 次拿不到数据就自行回到开头」的兜底，
+            //  结果是素材（30 秒）一读完音频就绕回去，而视频还在 8 秒 ——
+            //  听感就是「音频在短循环」，音画差出 27 秒。
+            //
+            //  正确做法：等 VCFrameSource 视频回绕时通过通知统一重置。
+            //  这期间返回 nil，管道用缓冲里的存货顶着（2 秒足够）。
+            static BOOL sLoggedEOF = NO;
+            if (!sLoggedEOF) {
+                sLoggedEOF = YES;
+                VCLog(@"音频源：读到素材末尾，等待视频回绕通知（不自行重启）");
             }
             return;
         }

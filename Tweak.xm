@@ -1174,9 +1174,10 @@ static NSString *VCRunAudioDiagnosis(void)
         [out appendFormat:@"缓冲延迟      : %.0f ms\n", pipe.currentDrift * 1000.0];
         [out appendFormat:@"视频位置      : %.2f s\n", pipe.videoSourceSeconds];
         [out appendFormat:@"音频位置      : %.2f s\n", pipe.decodedMaterialSeconds];
-        [out appendFormat:@"位置差        : %+.2f s  (音频−视频，含%+.0fms缓冲)\n",
-            pipe.decodedMaterialSeconds - pipe.videoSourceSeconds,
-            pipe.currentDrift * 1000.0];
+        [out appendFormat:@"音频播放位置  : %.2f s  (音频位置−缓冲)\n",
+            pipe.decodedMaterialSeconds - pipe.currentDrift];
+        [out appendFormat:@">>> 音画偏差    : %+.2f s  (负=音频落后)\n",
+            pipe.decodedMaterialSeconds - pipe.currentDrift - pipe.videoSourceSeconds];
         [out appendFormat:@"上次欠载时刻  : %.2f s（录音开始后）\n", pipe.lastUnderrunAt];
         [out appendFormat:@"单次生产最长  : %.0f ms\n", pipe.maxProduceMs];
         [out appendString:@"\n--- 静音来源细分 ---\n"];

@@ -29,6 +29,9 @@
     // 一旦任何一边丢一次回调，两条轨道的源位置就错开，而且误差只累加不纠正。
     // 这组变量用来把音频强行钉在视频的时间轴上。
     double _videoSourceSeconds;      // 当前视频帧在源文件中的位置
+    CVPixelBufferRef _lastPB;        // 上一帧，用于按帧率节流时复用
+    double _lastPBTime;              // 上次返回帧的时刻（CACurrentMediaTime）
+    double _sourceFPS;               // 素材帧率
     uint64_t _audioSamplesOut;       // 已输出给 App 的音频样本总数
     uint64_t _audioSamplesRead;      // 已从 reader 读出的样本总数（含被丢弃的）
     double _audioSampleRate;
@@ -72,6 +75,8 @@
         _aspect = 1080.0 / 1920.0;
         _audioSampleRate = 48000.0;
         _videoSourceSeconds = 0.0;
+    _lastPBTime = 0.0;
+    _sourceFPS = 30.0;
         _audioSamplesOut = 0;
         _audioSamplesRead = 0;
     }
@@ -124,6 +129,11 @@
             return NO;
         }
 
+        // 记录素材帧率，供 copyNextPixelBuffer 节流用
+        float fps = vtrack.nominalFrameRate;
+        if (fps > 1.0f) _sourceFPS = (double)fps;
+        VCLog(@"素材帧率 %.2f fps（用于视频出帧节流）", _sourceFPS);
+
         CGSize size = vtrack.naturalSize;
         if (size.width > 0 && size.height > 0) {
             _aspect = size.width / size.height;
@@ -175,6 +185,8 @@
         _ready = YES;
         _frameCount = 0;
         _videoSourceSeconds = 0.0;
+    _lastPBTime = 0.0;
+    _sourceFPS = 30.0;
         _audioSamplesRead = 0;
         _audioSamplesOut = 0;
         [[VCSampleBufferFactory shared] resetTimeline];
@@ -243,6 +255,26 @@
 {
     if (!_ready || VCamConfig.shared.paused) return NULL;
 
+    // ---- 按素材帧率节流 ----
+    //
+    //  抖音的 AVCaptureVideoDataOutput 按 60fps 回调（实测），
+    //  而我们素材是 30fps。以前每次回调都推进一帧素材，
+    //  结果 15 秒录制消耗了 30 秒素材（视频位置 29.93s vs 音频 17.00s），
+    //  音画差出整整一个录制时长。
+    //
+    //  正确做法：只有距上次出帧超过 1/素材帧率 才推进，否则重复上一帧。
+    //  这样视频消耗速度和音频一样，都是实时的 1:1。
+    double now = CACurrentMediaTime();
+    double minInterval = (_sourceFPS > 1.0) ? (1.0 / _sourceFPS) : (1.0 / 30.0);
+
+    [_lock lock];
+    if (_lastPB && (now - _lastPBTime) < minInterval * 0.85) {
+        CVPixelBufferRef dup = CVPixelBufferRetain(_lastPB);
+        [_lock unlock];
+        return dup;
+    }
+    [_lock unlock];
+
     CVPixelBufferRef result = NULL;
     [_lock lock];
     @try {
@@ -271,6 +303,12 @@
                     break;
                 }
             }
+        }
+
+        if (result) {
+        
+            _lastPB = CVPixelBufferRetain(result);
+            _lastPBTime = CACurrentMediaTime();
         }
     } @finally {
         [_lock unlock];
@@ -562,6 +600,8 @@ int g_vcSeekCount = 0;
 
 - (void)teardownLocked
 {
+    if (_lastPB) { CVPixelBufferRelease(_lastPB); _lastPB = NULL; }
+    _lastPBTime = 0.0;
     @try { [_videoReader cancelReading]; } @catch (NSException *e) {}
     @try { [_audioReader cancelReading]; } @catch (NSException *e) {}
     _videoReader = nil;

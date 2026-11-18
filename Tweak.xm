@@ -725,6 +725,44 @@ static OSStatus hook_AudioUnitRender(AudioUnit unit,
 //  用法：Safari 地址栏敲一行，系统会问「是否在抖音中打开」，确认即可。
 //  或者做成快捷指令放到桌面，点一下就切。
 
+/// 预热音频管道：在 App 启动时就建好环形缓冲并填满数据。
+///
+/// 为什么必须预热：
+///   管道若等到第一次 AudioUnitRender 才启动，环形缓冲是空的，
+///   填满 2 秒期间实时线程只能输出静音；而抖音的音频时间照走，
+///   于是音频内容永远比视频晚一个「填缓冲耗时」—— 实测 -2.38 秒。
+///
+///   在这里提前跑，等用户真去点录制时缓冲已经满了，
+///   AudioUnitRender 第一次调用就能拿到真实数据，没有静音段。
+///
+/// 格式用 48000/2ch/16bit 预设：这是实测抖音的系统格式。
+/// 万一不同，首次 AudioUnitRender 会调用 setTargetFormat 重建一次 ——
+/// 那时候缓冲会重新填，但只发生一次，不影响正常录制。
+static void VCPrewarmAudioPipeline(void)
+{
+    VCamConfig *cfg = VCamConfig.shared;
+    if (cfg.audioMode != VCAudioModeAsset) return;
+    if (![VCAudioSource shared].ready) {
+        VCLog(@"预热跳过：音频源还没就绪");
+        return;
+    }
+
+    AudioStreamBasicDescription def = {0};
+    def.mSampleRate       = 48000;
+    def.mFormatID         = kAudioFormatLinearPCM;
+    def.mFormatFlags      = kAudioFormatFlagIsSignedInteger |
+                            kAudioFormatFlagsNativeEndian |
+                            kAudioFormatFlagIsPacked;
+    def.mChannelsPerFrame = 2;
+    def.mBitsPerChannel   = 16;
+    def.mBytesPerFrame    = 4;
+    def.mBytesPerPacket   = 4;
+    def.mFramesPerPacket  = 1;
+
+    [[VCAudioPipeline shared] setTargetFormat:def];
+    VCLog(@"音频管道预热已触发（缓冲将在约 2 秒内填满）");
+}
+
 static void VCBootstrap(void);
 
 static void VCApplyURL(NSURL *url)
@@ -953,6 +991,7 @@ static void VCBootstrap(void)
                 }
                 dispatch_async(dispatch_get_main_queue(), ^{
                     VCLoadAssetNow();
+                    VCPrewarmAudioPipeline();
                 });
             });
         } else {

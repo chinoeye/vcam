@@ -472,22 +472,28 @@ static OSStatus VCPipeInputProc(AudioConverterRef cvt,
         }
     }
 
-    // 启动对齐：把目标位置之前的数据读出来丢掉，不写进缓冲
+    // 启动对齐：把目标位置之前的数据读出来丢掉。
+    //
+    //  两个关键点，上一版都写错了：
+    //    ① 记账必须用「实际消费的帧数」（availNow），不是「想丢的帧数」。
+    //       写 dropFrames 会让 _decodedMaterialSeconds 少算，
+    //       位置永远追不上目标，于是持续丢弃、持续静音。
+    //    ② 必须在**一次调用内**丢完。跨调用丢的话，每次 return 都让
+    //       实时线程拿不到数据 → 缓冲空 → 闹钟一样的静音，累计好几秒。
     if (_skipUntilSeconds > 0 && _decodedMaterialSeconds < _skipUntilSeconds) {
-        size_t availNow = srcData.length / srcBpf;
-        double remainSec = _skipUntilSeconds - _decodedMaterialSeconds;
-        size_t dropFrames = (size_t)(remainSec * _srcFormat.mSampleRate);
-        if (dropFrames > availNow) dropFrames = availNow;
-        if (dropFrames > 0) {
-            _decodedMaterialSeconds += (double)dropFrames / _srcFormat.mSampleRate;
-            VCLog(@"音频对齐：丢弃 %.3fs（位置 %.2fs → 目标 %.2fs）",
-                  (double)dropFrames / _srcFormat.mSampleRate,
-                  _decodedMaterialSeconds, _skipUntilSeconds);
+        double consumed = (double)availFrames / _srcFormat.mSampleRate;
+        _decodedMaterialSeconds += consumed;
+        int guard = 0;
+        while (_decodedMaterialSeconds < _skipUntilSeconds - 0.001 && guard++ < 400) {
+            CMItemCount got2 = 0;
+            AudioStreamBasicDescription a2 = {0};
+            NSData *more2 = [[VCAudioSource shared] nextPCMWithFrames:&got2 asbd:&a2];
+            if (!more2 || more2.length == 0) break;
+            _decodedMaterialSeconds += (double)got2 / _srcFormat.mSampleRate;
         }
-        if (_decodedMaterialSeconds >= _skipUntilSeconds - 0.001) {
-            _skipUntilSeconds = 0;
-            VCLog(@"音频对齐完成，之后正常生产");
-        }
+        VCLog(@"音频对齐：丢弃完毕，位置 %.2fs（目标 %.2fs，%d 次取块）",
+              _decodedMaterialSeconds, _skipUntilSeconds, guard);
+        _skipUntilSeconds = 0;
         return;
     }
 
@@ -855,6 +861,8 @@ static OSStatus VCPipeInputProc(AudioConverterRef cvt,
 - (BOOL)isRunning          { return _running; }
 
 - (double)lastUnderrunAt { return _lastUnderrunAt; }
+- (double)decodedMaterialSeconds { return _decodedMaterialSeconds; }
+- (double)videoSourceSeconds { return [[VCFrameSource shared] currentVideoSourceTime]; }
 - (uint64_t)silentNoRing { return _silentNoRing; }
 - (uint64_t)silentShort  { return _silentShort; }
 - (uint64_t)zeroBytes    { return _zeroBytes; }

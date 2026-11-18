@@ -346,7 +346,41 @@ static OSStatus VCPipeInputProc(AudioConverterRef cvt,
     size_t cap  = (size_t)(dstRate / 2);
     if (want > cap) want = cap;
 
-    // ---- 不做「音画时间对齐」----
+    // ---- 音画对齐 ----
+    //
+    //  视频侧时钟：VCFrameSource.currentVideoSourceTime = 最近解码那一帧的 PTS。
+    //  这个值约等于「播放位置 + 1 帧」，是可信的。
+    //
+    //  音频侧：因为预生产，解码位置 = 播放位置 + 缓冲深度（最多 2 秒）。
+    //  如果不做补偿，音频会比视频超前整整一个缓冲深度 —— 实测就是「音画对不上」。
+    //
+    //  所以音频解码目标 = 视频解码位置 − 缓冲深度。
+    //  偏差超过 300ms 才 seek（避免频繁重建 reader 造成断音）。
+    {
+        double videoT = [[VCFrameSource shared] currentVideoSourceTime];
+        if (videoT > 0.5) {
+            pthread_mutex_lock(&_lock);
+            double buffered = (_dstFormat.mSampleRate > 0)
+                            ? (double)_count / _dstFormat.mSampleRate : 0.0;
+            pthread_mutex_unlock(&_lock);
+
+            double target = videoT - buffered;
+            if (target < 0) target = 0;
+            double error = target - _decodedMaterialSeconds;
+
+            if (fabs(error) > 0.30) {
+                _seekCount++;
+                if (_seekCount <= 5 || _seekCount % 30 == 0) {
+                    VCLog(@"音频对齐 #%d：偏差 %.0fms（视频 %.2fs − 缓冲 %.2fs = 目标 %.2fs / 音频 %.2fs）",
+                          _seekCount, error * 1000, videoT, buffered,
+                          target, _decodedMaterialSeconds);
+                }
+                [self seekAudioToTime:target];
+            }
+        }
+    }
+
+    // ---- 不做「音画时间比对」用于别的目的 ----
     //
     //  这里曾经有一段闭环校正：拿 currentVideoSourceTime（视频**解码**进度）
     //  和音频已解码位置比对，偏差超 100ms 就 seek。
@@ -365,6 +399,23 @@ static OSStatus VCPipeInputProc(AudioConverterRef cvt,
     //  素材循环时的对齐由 VCFrameSource 负责：视频回绕时会一起重置音频 reader。
 
 [self produceFrames:want];
+}
+
+/// 把音频源 seek 到素材内的指定位置，并清空环形缓冲。
+- (void)seekAudioToTime:(double)targetSeconds
+{
+    [[VCAudioSource shared] seekToTime:targetSeconds];
+
+    pthread_mutex_lock(&_lock);
+    _writePos = 0;
+    _readPos  = 0;
+    _count    = 0;
+    _srcCarry = nil;
+    _srcCarryFrames = 0;
+    _probeData = nil;
+    _probeFrames = 0;
+    _decodedMaterialSeconds = targetSeconds;
+    pthread_mutex_unlock(&_lock);
 }
 
 - (void)produceFrames:(size_t)wantFrames

@@ -119,6 +119,10 @@ static OSStatus VCPipeInputProc(AudioConverterRef cvt,
     size_t   _takeThisCall;     // 本次调用从环形缓冲取走的字节数
     uint64_t _starved;          // 拿不到数据的次数
     double   _lastUnderrunAt;   // 上次欠载发生在录音开始后第几秒
+    uint64_t _silentNoRing;     // 因 _ring 为空而输出静音的帧数
+    uint64_t _silentShort;      // 因缓冲不足而输出静音的帧数
+    uint64_t _zeroBytes;        // writable 为 0 的调用次数
+    uint64_t _totalFilledFrames;// 累计填充的帧数（诊断）
     double   _maxProduceMs;     // 单次生产最长耗时
     double   _startedAt;        // 管道启动时刻（CFAbsoluteTime）
     NSData  *_probeData;        // 探测源格式时取走的那一块，必须留着复用
@@ -210,6 +214,10 @@ static OSStatus VCPipeInputProc(AudioConverterRef cvt,
     _probeFrames = 0;
     _srcCarry = nil;
     _srcCarryFrames = 0;
+    _silentNoRing = 0;
+    _silentShort = 0;
+    _zeroBytes = 0;
+    _totalFilledFrames = 0;
     _produced = 0;
     _consumed = 0;
     _underrun = 0;
@@ -610,6 +618,13 @@ static OSStatus VCPipeInputProc(AudioConverterRef cvt,
     pthread_mutex_lock(&_lock);
 
     if (!_ring || _bytesPerFrame == 0) {
+        // 这条分支以前完全不计数，导致「有静音但报告里欠载次数不涨」。
+        _silentNoRing += frames;
+        static int sNoRingLog = 0;
+        if (++sNoRingLog <= 10) {
+            VCLog(@"音频管道：环形缓冲未就绪，输出静音 (#%d, frames=%u, ring=%p, bpf=%zu)",
+                  sNoRingLog, (unsigned)frames, _ring, _bytesPerFrame);
+        }
         for (UInt32 b = 0; b < ioData->mNumberBuffers; b++) {
             AudioBuffer *buf = &ioData->mBuffers[b];
             if (buf->mData && buf->mDataByteSize) {
@@ -640,7 +655,7 @@ static OSStatus VCPipeInputProc(AudioConverterRef cvt,
         size_t writable = buf->mDataByteSize < contractBytes
                         ? buf->mDataByteSize : contractBytes;
         writable -= writable % _bytesPerFrame;
-        if (writable == 0) continue;
+        if (writable == 0) { _zeroBytes++; continue; }
 
         if (b == 0) {
             size_t avail0 = _count * _bytesPerFrame;
@@ -650,6 +665,7 @@ static OSStatus VCPipeInputProc(AudioConverterRef cvt,
         size_t take = _takeThisCall;
 
         if (take >= writable) {
+            _totalFilledFrames += writable / _bytesPerFrame;
             // 缓冲够：整块拷贝（实时线程唯一的工作）
             size_t tail = _ringBytes - _readPos;
             if (take <= tail) {
@@ -666,6 +682,7 @@ static OSStatus VCPipeInputProc(AudioConverterRef cvt,
             //  静音至少听感是「短暂空白」，不会制造假的节奏感。
             memset(buf->mData, 0, writable);
             _underrun++;
+            _silentShort += writable / _bytesPerFrame;
         }
 
         // 契约外的那部分（mDataByteSize 比 needBytes 大的时候）清掉，
@@ -696,6 +713,10 @@ static OSStatus VCPipeInputProc(AudioConverterRef cvt,
 - (BOOL)isRunning          { return _running; }
 
 - (double)lastUnderrunAt { return _lastUnderrunAt; }
+- (uint64_t)silentNoRing { return _silentNoRing; }
+- (uint64_t)silentShort  { return _silentShort; }
+- (uint64_t)zeroBytes    { return _zeroBytes; }
+- (uint64_t)totalFilled  { return _totalFilledFrames; }
 - (double)maxProduceMs   { return _maxProduceMs; }
 
 - (double)currentDrift

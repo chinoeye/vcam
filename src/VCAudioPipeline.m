@@ -214,18 +214,32 @@ static OSStatus VCPipeInputProc(AudioConverterRef cvt,
           (unsigned)format.mBitsPerChannel,
           kRingFrames);
 
-    // 格式就绪就直接开跑。
-    // 不依赖外部先 start() 再 setTargetFormat —— 那个顺序很容易搞错，
-    // 一旦漏了就是「有 hook 但没产出」，症状跟完全没注入一样。
+    // 格式就绪就开跑。转换器会在定时器第一次拿到数据时按实测格式创建。
     (void)wasRunning;
     [self start];
+
+    VCLog(@"音频管道启动结果：%@（定时器 %@）",
+          _running ? @"运行中" : @"未运行",
+          _timer ? @"已创建" : @"未创建");
 }
 
 // ------------------------------------------------------------------ 启停
 
 - (void)start
 {
-    if (_running || !_conv || !_ring) return;
+    if (_running) return;
+
+    // 只要求环形缓冲存在，**不要求转换器**。
+    //
+    //  转换器现在是延迟创建的：要等第一块真实数据才能反推源格式
+    //  （素材是 stereo，写死 mono 会让左右声道交替播放 = 哒哒哒）。
+    //  而那块数据要靠这里的定时器去取 —— 如果这里也等 _conv，
+    //  就成了「等 A 才能做 B，B 又需要 A 先做」的死锁，
+    //  症状是「运行中：否 / 产出 0 / 欠载 711 次 / 完全没声音」。
+    if (!_ring) {
+        VCLog(@"音频管道：start 跳过 —— 环形缓冲还没分配");
+        return;
+    }
     _running = YES;
 
     _timer = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0, _queue);

@@ -119,6 +119,8 @@ static OSStatus VCPipeInputProc(AudioConverterRef cvt,
     size_t   _takeThisCall;     // 本次调用从环形缓冲取走的字节数
     uint64_t _starved;          // 拿不到数据的次数
     NSData  *_probeData;        // 探测源格式时取走的那一块，必须留着复用
+    NSMutableData *_srcCarry;   // 上一轮没被转换器吃掉的源数据（字节）
+    size_t   _srcCarryFrames;   // 上面那份缓存里的帧数
     CMItemCount _probeFrames;
     int      _seekCount;
 
@@ -203,6 +205,8 @@ static OSStatus VCPipeInputProc(AudioConverterRef cvt,
     _decodedMaterialSeconds = 0.0;
     _probeData = nil;
     _probeFrames = 0;
+    _srcCarry = nil;
+    _srcCarryFrames = 0;
     _produced = 0;
     _consumed = 0;
     _underrun = 0;
@@ -374,14 +378,27 @@ static OSStatus VCPipeInputProc(AudioConverterRef cvt,
 
     NSMutableData *srcData = [NSMutableData dataWithCapacity:needSrcFrames * srcBpf];
 
-    // 攒够 needSrcFrames 个**真帧**。先放探测时取走的那一块。
+    // 攒够 needSrcFrames 个**真帧**。
+    //
+    //  必须先把上一轮没吃掉的 carry 接上。
+    //  否则在循环里多拿的那几块会被丢弃，下一轮从新位置开始，
+    //  两轮的数据之间就断了一截 —— 波形断裂，听感是一声「啪」。
+    //  实测 15 秒里 18 处，间隔 0.1857s（正好一轮生产的时间）。
     size_t haveFrames = 0;
+    size_t srcBpfHere = srcBpf;
+    if (_srcCarry.length > 0) {
+        [srcData appendData:_srcCarry];
+        haveFrames += _srcCarryFrames;
+        _srcCarry = nil;
+        _srcCarryFrames = 0;
+    }
     if (_probeData.length > 0) {
         [srcData appendData:_probeData];
         haveFrames += (size_t)_probeFrames;
         _probeData = nil;
         _probeFrames = 0;
     }
+    (void)srcBpfHere;
     int guard = 0;
     while (haveFrames < needSrcFrames && guard++ < 64) {
         CMItemCount got = 0;
@@ -444,6 +461,25 @@ static OSStatus VCPipeInputProc(AudioConverterRef cvt,
         static BOOL sErr = NO;
         if (!sErr) { sErr = YES; VCLog(@"音频管道：转换失败 %d", (int)st); }
         return;
+    }
+
+    // 把转换器没吃掉的源数据留到下一轮，绝不丢弃。
+    //
+    //  inner loop 每次拿一整块（1024 帧），needSrc 往往不是整块，
+    //  多出来的部分以前直接扔了 —— 那就是每一轮生产边界处那声「啪」。
+    {
+        size_t leftover = (availFrames > ctx.consumed)
+                        ? (availFrames - ctx.consumed) : 0;
+        if (leftover > 0) {
+            const uint8_t *base = (const uint8_t *)srcData.bytes
+                                + ctx.consumed * srcBpf;
+            _srcCarry = [NSMutableData dataWithBytes:base
+                                              length:leftover * srcBpf];
+            _srcCarryFrames = leftover;
+        } else {
+            _srcCarry = nil;
+            _srcCarryFrames = 0;
+        }
     }
 
     size_t produced = abl.mBuffers[0].mDataByteSize;

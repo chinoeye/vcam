@@ -126,6 +126,7 @@ static OSStatus VCPipeInputProc(AudioConverterRef cvt,
     uint64_t _dcSegments;       // 产出的数据里出现「整段恒定值」的次数
     double   _maxProduceMs;     // 单次生产最长耗时
     double   _startedAt;        // 管道启动时刻（CFAbsoluteTime）
+    double   _skipUntilSeconds; // 启动对齐：丢弃该位置之前的解码数据（不 seek）
     NSData  *_probeData;        // 探测源格式时取走的那一块，必须留着复用
     NSMutableData *_srcCarry;   // 上一轮没被转换器吃掉的源数据（字节）
     size_t   _srcCarryFrames;   // 上面那份缓存里的帧数

@@ -235,6 +235,62 @@ NSString *const VCAudioSourceShouldResetNotification =
     _consecutiveNil = 0;
 }
 
+/// 跳到素材内的指定秒。
+///
+///  重建 reader 并把 timeRange 起点设到目标位置。
+///  往前不留余量 —— 音频对齐是「精确追上视频当前位置」，
+///  留余量会让音频永远落后一个固定的偏移。
+- (void)seekToTime:(double)seconds
+{
+    dispatch_async(_queue, ^{
+        if (!self->_asset || !self->_track) return;
+
+        if (self->_output) [self->_reader cancelReading];
+        self->_output = nil;
+        self->_reader = nil;
+
+        NSError *err = nil;
+        self->_reader = [[AVAssetReader alloc] initWithAsset:self->_asset error:&err];
+        if (!self->_reader) {
+            VCLog(@"音频源：seek 时 reader 创建失败 %@", err.localizedDescription);
+            self->_ready = NO;
+            return;
+        }
+
+        NSDictionary *settings = @{
+            AVFormatIDKey:               @(kAudioFormatLinearPCM),
+            AVNumberOfChannelsKey:       @1,
+            AVLinearPCMBitDepthKey:      @32,
+            AVLinearPCMIsFloatKey:       @YES,
+            AVLinearPCMIsBigEndianKey:   @NO,
+            AVLinearPCMIsNonInterleavedKey: @NO,
+        };
+        self->_output = [[AVAssetReaderTrackOutput alloc] initWithTrack:self->_track
+                                                     outputSettings:settings];
+        self->_output.alwaysCopiesSampleData = YES;
+
+        if (![self->_reader canAddOutput:self->_output]) {
+            self->_ready = NO;
+            return;
+        }
+        [self->_reader addOutput:self->_output];
+
+        double t = seconds > 0 ? seconds : 0;
+        self->_reader.timeRange = CMTimeRangeMake(CMTimeMakeWithSeconds(t, 1000),
+                                                  kCMTimePositiveInfinity);
+
+        if (![self->_reader startReading]) {
+            VCLog(@"音频源：seek 后 startReading 失败 %@",
+                  self->_reader.error.localizedDescription);
+            self->_ready = NO;
+            return;
+        }
+
+        self->_ready = YES;
+        self->_consecutiveNil = 0;
+    });
+}
+
 - (void)teardownLocked
 {
     if (_output) [_reader cancelReading];

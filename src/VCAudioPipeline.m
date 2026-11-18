@@ -165,13 +165,20 @@ static OSStatus VCPipeInputProc(AudioConverterRef cvt,
     // 停后台 → free 环形缓冲 → 重建转换器 → 重启。
     // 每秒 47 次重建 = 缓冲永远是空的 = 打电报。
     pthread_mutex_lock(&_lock);
+    // 只比较格式本身和环形缓冲是否就绪，**不要看 _conv**。
+    //
+    //  _conv 是延迟创建的（要等第一块真实数据才能反推源格式）。
+    //  如果这里要求 _conv 非空，那么在它建好之前每次回调都会判定
+    //  「格式变了」→ 走下面整套重建：stop()(dispatch_sync 等后台跑完)
+    //  + free 环形缓冲 + calloc + start() 重建定时器。
+    //  每秒 47 次重建，音频线程被反复阻塞 —— 抖音直接卡死。
     BOOL same = _hasFormat &&
                 _dstFormat.mSampleRate       == format.mSampleRate &&
                 _dstFormat.mChannelsPerFrame == format.mChannelsPerFrame &&
                 _dstFormat.mBitsPerChannel   == format.mBitsPerChannel &&
                 _dstFormat.mFormatFlags      == format.mFormatFlags &&
                 _dstFormat.mBytesPerFrame    == format.mBytesPerFrame &&
-                _conv != NULL && _ring != NULL;
+                _ring != NULL;
     pthread_mutex_unlock(&_lock);
     if (same) return;
 

@@ -448,7 +448,22 @@ static OSStatus VCPipeInputProc(AudioConverterRef cvt,
     //  那样补的是输出侧的尾部，波形是连续延伸的，不会断裂。
 
 
-    size_t outBytes = wantFrames * _bytesPerFrame;
+    // 请求的帧数不能超过「现有数据能转换出来的量」。
+    //
+    //  以前固定请求 wantFrames，数据不够时转换器只吐一部分，
+    //  然后我又用「末样本重复」把剩余填满 —— 那会生成一段恒定直流值
+    //  （实测 2.04~2.28s 有 240ms 全是同一个值，RMS==峰值==0.00367），
+    //  接上真实音频就是一次断裂，听感是「断了一下」。
+    //
+    //  现在：能转多少就请求多少，转换器必然吐满，不需要任何补齐。
+    size_t outFrames = wantFrames;
+    if (ratio > 0) {
+        size_t capBySrc = (size_t)((double)availFrames / ratio);
+        if (capBySrc < outFrames) outFrames = capBySrc;
+    }
+    if (outFrames == 0) return;
+
+    size_t outBytes = outFrames * _bytesPerFrame;
     NSMutableData *out = [NSMutableData dataWithLength:outBytes];
 
     VCConvCtx ctx;
@@ -464,7 +479,7 @@ static OSStatus VCPipeInputProc(AudioConverterRef cvt,
     abl.mBuffers[0].mData = out.mutableBytes;
     abl.mBuffers[0].mDataByteSize = (UInt32)outBytes;
 
-    UInt32 outPackets = (UInt32)wantFrames;
+    UInt32 outPackets = (UInt32)outFrames;
     OSStatus st = AudioConverterFillComplexBuffer(_conv,
                                                   VCPipeInputProc,
                                                   &ctx,
@@ -503,32 +518,11 @@ static OSStatus VCPipeInputProc(AudioConverterRef cvt,
         return;
     }
 
-    // 吐不满就补：用最后一个样本重复填满剩余部分。
-    //
-    //  out 是 dataWithLength（全零），转换器没写的部分是 0。
-    //  如果就这么写进环形缓冲，下一块数据会紧接在 0 后面 ——
-    //  波形从 0 猛地跳到下一个值，就是「啪」一声。
-    //  用最后样本补满，波形保持连续，听不出来。
-    if (produced < outBytes) {
-        size_t sampleSize = (_bytesPerFrame / _dstFormat.mChannelsPerFrame);
-        const uint8_t *lastFrame = (const uint8_t *)out.bytes + produced - _bytesPerFrame;
-        uint8_t *padDst = (uint8_t *)out.mutableBytes + produced;
-        size_t padLen = outBytes - produced;
-        for (size_t off = 0; off + _bytesPerFrame <= padLen; off += _bytesPerFrame) {
-            memcpy(padDst + off, lastFrame, _bytesPerFrame);
-        }
-        size_t rem = padLen % _bytesPerFrame;
-        if (rem) {
-            memcpy(padDst + padLen - rem, lastFrame, rem);
-        }
-        produced = outBytes;
+    // 不做任何补齐 —— 请求量已经按可用数据算过，转换器必然吐满。
+    // 任何形式的「重复末样本补满」都会生成恒定直流段，听感就是断点。
+    if (produced < outBytes) produced -= produced % _bytesPerFrame;
 
-        static int sShortCount = 0;
-        if (++sShortCount <= 5 || sShortCount % 200 == 0) {
-            VCLog(@"音频管道：转换器吐不满（累计 %d 次），已用末样本补齐", sShortCount);
-        }
-        (void)sampleSize;
-    }
+
 
     pthread_mutex_lock(&_lock);
     size_t freeFramesNow = kRingFrames - _count;

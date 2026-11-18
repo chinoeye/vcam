@@ -201,17 +201,6 @@ static OSStatus VCPipeInputProc(AudioConverterRef cvt,
           _dstFormat.mSampleRate, (unsigned)_dstFormat.mChannelsPerFrame,
           (unsigned)_dstFormat.mBitsPerChannel, (unsigned)_dstFormat.mBytesPerFrame);
 
-    // 源格式固定 mono / float32 / 4 字节每帧。
-    // VCAudioSource 那边已经用 AVNumberOfChannelsKey=1 强制下混成单声道，
-    // 两边必须严格一致 —— 声道数对不上会让交错数据被按连续样本解释，
-    // 听感是频率翻倍的「哒哒哒」。
-    VCLog(@"音频管道源格式：%.0fHz / %u ch / %u bit / %u B每帧",
-          src.mSampleRate, (unsigned)src.mChannelsPerFrame,
-          (unsigned)src.mBitsPerChannel, (unsigned)src.mBytesPerFrame);
-    VCLog(@"音频管道目标格式：%.0fHz / %u ch / %u bit / %u B每帧",
-          _dstFormat.mSampleRate, (unsigned)_dstFormat.mChannelsPerFrame,
-          (unsigned)_dstFormat.mBitsPerChannel, (unsigned)_dstFormat.mBytesPerFrame);
-
     pthread_mutex_unlock(&_lock);
 
     if (!_ring) {
@@ -219,7 +208,7 @@ static OSStatus VCPipeInputProc(AudioConverterRef cvt,
         return;
     }
 
-    VCLog(@"音频管道就绪：48000/mono/f32 -> %.0fHz/x%u/%u bit，缓冲 %zu 帧",
+    VCLog(@"音频管道就绪：目标 %.0fHz/x%u/%u bit，缓冲 %zu 帧（源格式等首块数据实测）",
           format.mSampleRate,
           (unsigned)format.mChannelsPerFrame,
           (unsigned)format.mBitsPerChannel,

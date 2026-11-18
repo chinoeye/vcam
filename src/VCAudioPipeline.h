@@ -69,6 +69,8 @@ NS_ASSUME_NONNULL_BEGIN
 @property (nonatomic, readonly) uint64_t silentShort;   // 缓冲不足的帧数
 @property (nonatomic, readonly) uint64_t zeroBytes;     // writable=0 的次数
 @property (nonatomic, readonly) uint64_t totalFilled;   // 实际填充的帧数
+/// 产出的数据里出现「整段恒定值」的次数。>0 说明上游还有补齐残留。
+@property (nonatomic, readonly) uint64_t dcSegments;
 
 @end
 

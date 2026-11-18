@@ -58,6 +58,11 @@ NS_ASSUME_NONNULL_BEGIN
 /// 5 小时长跑时随时读它，判断闭环校正有没有把偏差钳住。
 @property (nonatomic, readonly) double   currentDrift;
 
+/// 上次欠载发生在管道启动后第几秒（用于定位断点位置）
+@property (nonatomic, readonly) double   lastUnderrunAt;
+/// 单次生产最长耗时（毫秒）
+@property (nonatomic, readonly) double   maxProduceMs;
+
 @end
 
 NS_ASSUME_NONNULL_END

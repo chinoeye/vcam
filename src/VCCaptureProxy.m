@@ -2,6 +2,7 @@
 //  VCCaptureProxy.m
 //
 
+#import <QuartzCore/QuartzCore.h>
 #import "VCCaptureProxy.h"
 #import "VCFrameSource.h"
 #import "VCLiveSource.h"
@@ -55,6 +56,8 @@ static NSLock *VCProxyLock(void)
     VCProxyKind _kind;
     __weak id _output;
     BOOL _loggedFirstReplacement;
+    CVPixelBufferRef _lastSrcPB;   // 上一帧源数据，用于按素材帧率节流
+    double _lastSrcTime;
 }
 
 + (instancetype)proxyForTarget:(id)target kind:(VCProxyKind)kind output:(id)output
@@ -281,7 +284,26 @@ static NSLock *VCProxyLock(void)
             CFRelease(sb);
         }
     } else {
-        src = [[VCFrameSource shared] copyNextPixelBuffer];
+        // 按素材帧率节流。
+        //
+        //  抖音的 AVCaptureVideoDataOutput 按 60fps 回调，而素材是 30fps。
+        //  以前每次回调都推进一帧素材 → 15 秒录制消耗 30 秒素材
+        //  （实测视频位置 29.93s vs 音频 17.00s，差一整个录制时长）。
+        //  这里缓存上一帧，没到间隔就复用，让视频消耗速度和音频一致。
+        double now = CACurrentMediaTime();
+        CGFloat fps = [VCFrameSource shared].sourceFrameRate;
+        double minInterval = (fps > 1.0) ? (1.0 / fps) : (1.0 / 30.0);
+
+        if (_lastSrcPB && (now - _lastSrcTime) < minInterval * 0.85) {
+            src = CVPixelBufferRetain(_lastSrcPB);
+        } else {
+            src = [[VCFrameSource shared] copyNextPixelBuffer];
+            if (src) {
+                if (_lastSrcPB) CVPixelBufferRelease(_lastSrcPB);
+                _lastSrcPB = CVPixelBufferRetain(src);
+                _lastSrcTime = now;
+            }
+        }
     }
 
     if (!src) {

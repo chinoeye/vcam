@@ -364,11 +364,28 @@ static OSStatus VCPipeInputProc(AudioConverterRef cvt,
                             ? (double)_count / _dstFormat.mSampleRate : 0.0;
             pthread_mutex_unlock(&_lock);
 
-            double target = videoT - buffered;
-            if (target < 0) target = 0;
+            // 符号千万别搞反 —— 上一版写成 videoT - buffered，方向反了：
+            //
+            //   _decodedMaterialSeconds 是「已解码到素材的哪个时间」，
+            //   而缓冲里那 buffered 秒还没播出去，
+            //   所以音频的**播放**位置 = _decodedMaterialSeconds - buffered。
+            //
+            //   要和视频播放位置（≈ videoT）对齐，就必须：
+            //       _decodedMaterialSeconds - buffered ≈ videoT
+            //   →   _decodedMaterialSeconds ≈ videoT + buffered
+            //
+            //   写成减法时 error 恒为 -2×buffered（约 -4 秒），永远超阈值，
+            //   于是每次生产都 seek、每次 seek 都清空缓冲 ——
+            //   实测 634 次欠载、13.5 秒静音。
+            double target = videoT + buffered;
             double error = target - _decodedMaterialSeconds;
 
-            if (fabs(error) > 0.30) {
+            // 阈值放宽到 0.8 秒：seek 会清空缓冲，代价很大，
+            // 只在大幅偏离时才做，小幅偏差让缓冲自己吸收。
+            static double sLastSeekAt = 0;
+            double now = CFAbsoluteTimeGetCurrent();
+            if (fabs(error) > 0.80 && (now - sLastSeekAt) > 3.0) {
+                sLastSeekAt = now;
                 _seekCount++;
                 if (_seekCount <= 5 || _seekCount % 30 == 0) {
                     VCLog(@"音频对齐 #%d：偏差 %.0fms（视频 %.2fs − 缓冲 %.2fs = 目标 %.2fs / 音频 %.2fs）",

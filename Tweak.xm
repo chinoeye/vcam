@@ -450,6 +450,12 @@ static volatile int g_audioWriteOK = 0;
 // hook 内部必须先调它、再处理数据 —— 少这一行整个 hook 逻辑就崩了。
 static VC_AURender_FN orig_AudioUnitRender = NULL;
 
+
+// ---- 手机端指标上报用的全局计数器 ----
+//  必须在 hook 之前声明：hook_AudioUnitRender 在文件中部，会用到这些。
+volatile int    g_statVideoDelegates = 0;
+volatile int    g_statAudioCalls     = 0;
+
 static OSStatus hook_AudioUnitRender(AudioUnit unit,
                                      AudioUnitRenderActionFlags *flags,
                                      const AudioTimeStamp *ts,
@@ -739,11 +745,6 @@ static OSStatus hook_AudioUnitRender(AudioUnit unit,
 //
 //  每秒一行，只报变化量，避免刷屏。
 
-static volatile int    g_statVideoDelegates = 0;   // 视频 delegate 调用次数
-static volatile double g_statVideoPTS       = 0;   // 视频最近 PTS
-static volatile int    g_statAudioCalls     = 0;   // AudioUnitRender 调用次数
-static volatile double g_statAudioPos       = 0;   // 音频已解码位置
-static volatile double g_statVideoPosSrc    = 0;   // 视频源位置
 
 static void VCStartStatReporter(void)
 {

@@ -1277,6 +1277,7 @@ static void VCDumpAudioReport(void)
     dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
         @autoreleasepool {
             NSString *report = VCRunAudioDiagnosis();
+        [out appendFormat:@"微调次数      : %llu  (稳定后应停止增长)\n", pipe.tuneBlocks];
 
             // 写文件（方便以后用别的办法取）
             NSString *logPath = VCLogFilePath();

@@ -1181,6 +1181,8 @@ static NSString *VCRunAudioDiagnosis(void)
             pipe.silentShort, pipe.silentShort / 48.0];
         [out appendFormat:@"writable=0    : %llu 次\n", pipe.zeroBytes];
         [out appendFormat:@"实际填充帧数  : %llu\n", pipe.totalFilled];
+        [out appendFormat:@"恒定值段      : %llu 次  (必须为 0，否则上游有补齐残留)\n",
+            pipe.dcSegments];
     }
     [out appendFormat:@"hook 填充次数 : %d\n", g_audioWriteOK];
     {

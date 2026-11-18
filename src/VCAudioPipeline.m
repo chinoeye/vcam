@@ -104,7 +104,9 @@ static OSStatus VCPipeInputProc(AudioConverterRef cvt,
     uint64_t _consumed;
     uint64_t _underrun;
     size_t   _takeThisCall;     // 本次调用从环形缓冲取走的字节数
-    uint64_t _starved;          // copyNextAudioPCM 拿不到数据的次数
+    uint64_t _starved;          // 拿不到数据的次数
+    NSData  *_probeData;        // 探测源格式时取走的那一块，必须留着复用
+    CMItemCount _probeFrames;
     int      _seekCount;
 
     pthread_mutex_t _lock;
@@ -179,23 +181,25 @@ static OSStatus VCPipeInputProc(AudioConverterRef cvt,
     _readPos = 0;
     _count = 0;
     _decodedMaterialSeconds = 0.0;
+    _probeData = nil;
+    _probeFrames = 0;
     _produced = 0;
     _consumed = 0;
     _underrun = 0;
     _seekCount = 0;
 
-    AudioStreamBasicDescription src = {0};
-    // 素材实际采样率：优先用 VCAudioSource 探到的，拿不到才退回 48000
-    double srcRate = [VCAudioSource shared].sampleRate;
-    src.mSampleRate       = srcRate > 0 ? srcRate : 48000;
-    src.mFormatID         = kAudioFormatLinearPCM;
-    src.mFormatFlags      = kAudioFormatFlagIsFloat | kAudioFormatFlagIsPacked;
-    src.mBytesPerPacket   = 4;
-    src.mFramesPerPacket  = 1;
-    src.mBytesPerFrame    = 4;
-    src.mChannelsPerFrame = 1;
-    src.mBitsPerChannel   = 32;
-    _srcFormat = src;
+    // 源格式先不写死：等第一次真正拿到数据，用 length/frames 反推。
+    //
+    //  之前写死 mono（4 字节/帧），但素材是 stereo（8 字节/帧）——
+    //  交错数据被当成连续单声道样本解释，左右声道交替播放，
+    //  听感就是频率翻倍的「哒哒哒」。
+    //  想靠 AVAssetReaderTrackOutput 的 AVNumberOfChannelsKey 强制下混，
+    //  实测不一定生效（那套 settings 对音频支持有限）。
+    //  所以改成实测：谁也别猜，用数据本身说话。
+    _srcFormat = (AudioStreamBasicDescription){0};
+    VCLog(@"音频管道目标格式：%.0fHz / %u ch / %u bit / %u B每帧",
+          _dstFormat.mSampleRate, (unsigned)_dstFormat.mChannelsPerFrame,
+          (unsigned)_dstFormat.mBitsPerChannel, (unsigned)_dstFormat.mBytesPerFrame);
 
     // 源格式固定 mono / float32 / 4 字节每帧。
     // VCAudioSource 那边已经用 AVNumberOfChannelsKey=1 强制下混成单声道，
@@ -208,13 +212,10 @@ static OSStatus VCPipeInputProc(AudioConverterRef cvt,
           _dstFormat.mSampleRate, (unsigned)_dstFormat.mChannelsPerFrame,
           (unsigned)_dstFormat.mBitsPerChannel, (unsigned)_dstFormat.mBytesPerFrame);
 
-    AudioConverterRef conv = NULL;
-    OSStatus st = AudioConverterNew(&src, &_dstFormat, &conv);
-    if (st == noErr) _conv = conv;
     pthread_mutex_unlock(&_lock);
 
-    if (st != noErr || !_conv || !_ring) {
-        VCLog(@"音频管道：初始化失败 (conv=%d, ring=%p)", (int)st, _ring);
+    if (!_ring) {
+        VCLog(@"音频管道：环形缓冲分配失败");
         return;
     }
 
@@ -327,25 +328,46 @@ static OSStatus VCPipeInputProc(AudioConverterRef cvt,
 
 - (void)produceFrames:(size_t)wantFrames
 {
-    if (!_conv || wantFrames == 0) return;
+    if (wantFrames == 0) return;
 
-    // 需要多少源帧（48000 坐标系）
-    double ratio = _srcFormat.mSampleRate / _dstFormat.mSampleRate;
-    size_t needSrc = (size_t)((double)wantFrames * ratio) + 2;
-
-    NSMutableData *srcData = [NSMutableData dataWithCapacity:needSrc * sizeof(float)];
-    int guard = 0;
-    while ((srcData.length / sizeof(float)) < needSrc && guard++ < 32) {
-        CMItemCount got = 0;
-        AudioStreamBasicDescription a = {0};
-        NSData *more = [[VCAudioSource shared]
-                        nextPCMWithFrames:&got asbd:&a];
-        if (!more || more.length == 0) break;
-        [srcData appendData:more];
+    // ---- 第一次拿到数据时，用实测格式建转换器 ----
+    if (!_conv) {
+        [self probeSourceFormatLocked];
+        if (!_conv) return;
     }
 
-    size_t avail = srcData.length / sizeof(float);
-    if (avail == 0) {
+    // 需要多少源帧。倍率按源/目标采样率算；声道数不影响帧数，只影响字节。
+    double ratio = (_srcFormat.mSampleRate > 0 && _dstFormat.mSampleRate > 0)
+                 ? (_srcFormat.mSampleRate / _dstFormat.mSampleRate)
+                 : 1.0;
+    size_t needSrcFrames = (size_t)((double)wantFrames * ratio) + 2;
+    size_t srcBpf = _srcFormat.mBytesPerFrame;      // 4=mono, 8=stereo（float32）
+
+    NSMutableData *srcData = [NSMutableData dataWithCapacity:needSrcFrames * srcBpf];
+
+    // 攒够 needSrcFrames 个**真帧**。先放探测时取走的那一块。
+    size_t haveFrames = 0;
+    if (_probeData.length > 0) {
+        [srcData appendData:_probeData];
+        haveFrames += (size_t)_probeFrames;
+        _probeData = nil;
+        _probeFrames = 0;
+    }
+    int guard = 0;
+    while (haveFrames < needSrcFrames && guard++ < 64) {
+        CMItemCount got = 0;
+        AudioStreamBasicDescription a = {0};
+        NSData *more = [[VCAudioSource shared] nextPCMWithFrames:&got asbd:&a];
+        if (!more || more.length == 0) break;
+        [srcData appendData:more];
+
+        // 用「返回的字节数 ÷ 帧数」反推每帧字节，比任何声明都可靠
+        if (got > 0 && more.length > 0) {
+            haveFrames += (size_t)got;
+        }
+    }
+
+    if (haveFrames == 0) {
         _starved++;
         if (_starved <= 3 || _starved % 500 == 0) {
             VCLog(@"音频管道：本轮拿不到素材数据 (累计 %llu 次)", _starved);
@@ -353,15 +375,20 @@ static OSStatus VCPipeInputProc(AudioConverterRef cvt,
         return;
     }
 
-    if (avail < needSrc) {
-        // 不够就用最后一个样本延音补齐，保持幅度连续
-        size_t pad = needSrc - avail;
-        float last = ((const float *)srcData.bytes)[avail - 1];
-        NSMutableData *p = [NSMutableData dataWithLength:pad * sizeof(float)];
-        float *pp = (float *)p.mutableBytes;
-        for (size_t i = 0; i < pad; i++) pp[i] = last;
-        [srcData appendData:p];
-        avail = needSrc;
+    // 不够就延音补齐（帧数维度，不是样本维度）
+    size_t availFrames = srcData.length / srcBpf;
+    if (availFrames < needSrcFrames) {
+        size_t padFrames = needSrcFrames - availFrames;
+        NSMutableData *p2 = [NSMutableData dataWithLength:padFrames * srcBpf];
+        // 用最后一帧的内容重复填充，保持幅度连续
+        const uint8_t *last = (const uint8_t *)srcData.bytes
+                            + (availFrames - 1) * srcBpf;
+        uint8_t *dst = (uint8_t *)p2.mutableBytes;
+        for (size_t k = 0; k < padFrames; k++) {
+            memcpy(dst + k * srcBpf, last, srcBpf);
+        }
+        [srcData appendData:p2];
+        availFrames = needSrcFrames;
     }
 
     size_t outBytes = wantFrames * _bytesPerFrame;
@@ -369,7 +396,7 @@ static OSStatus VCPipeInputProc(AudioConverterRef cvt,
 
     VCConvCtx ctx;
     ctx.data     = (const float *)srcData.bytes;
-    ctx.total    = avail;
+    ctx.total    = availFrames;
     ctx.consumed = 0;
 
     AudioBufferList abl;
@@ -394,7 +421,6 @@ static OSStatus VCPipeInputProc(AudioConverterRef cvt,
     size_t produced = abl.mBuffers[0].mDataByteSize;
     if (produced == 0) return;
 
-    // 写环形缓冲
     pthread_mutex_lock(&_lock);
     size_t freeFramesNow = kRingFrames - _count;
     size_t space = freeFramesNow * _bytesPerFrame;
@@ -411,11 +437,61 @@ static OSStatus VCPipeInputProc(AudioConverterRef cvt,
         _writePos = (_writePos + produced) % _ringBytes;
         _count += producedFrames;
         _produced += producedFrames;
-
-        // 记录解码进度（目标采样率坐标系，和视频时间同一尺度）
         _decodedMaterialSeconds += (double)producedFrames / _dstFormat.mSampleRate;
     }
     pthread_mutex_unlock(&_lock);
+}
+
+/// 用第一块真实数据反推源格式，然后建转换器。
+///
+///  为什么要反推：素材是 stereo（8 字节/帧），但 AVAssetReaderTrackOutput
+///  的 AVNumberOfChannelsKey 不一定生效。声明错了，交错数据就会被当成
+///  连续单声道样本播，听感是频率翻倍的「哒哒哒」。与其猜，不如量。
+- (void)probeSourceFormatLocked
+{
+    CMItemCount got = 0;
+    AudioStreamBasicDescription a = {0};
+    NSData *probe = [[VCAudioSource shared] nextPCMWithFrames:&got asbd:&a];
+    if (!probe || probe.length == 0 || got == 0) return;
+
+    // 这块数据已经被 reader 消费掉了，必须留着重用 ——
+    // 丢掉它会凭空少一块音频，正好造成一个咔哒。
+    _probeData   = probe;
+    _probeFrames = got;
+
+    size_t bpf = probe.length / (size_t)got;      // 实测每帧字节
+    UInt32 ch = 1;
+    if (bpf >= 8)      ch = 2;
+    else if (bpf >= 4) ch = 1;
+
+    AudioStreamBasicDescription src = {0};
+    src.mSampleRate       = a.mSampleRate > 0 ? a.mSampleRate
+                            : ([VCAudioSource shared].sampleRate > 0
+                               ? [VCAudioSource shared].sampleRate : 48000);
+    src.mFormatID         = kAudioFormatLinearPCM;
+    src.mFormatFlags      = kAudioFormatFlagIsFloat | kAudioFormatFlagIsPacked;
+    src.mBytesPerFrame    = (UInt32)bpf;
+    src.mBytesPerPacket   = (UInt32)bpf;
+    src.mFramesPerPacket  = 1;
+    src.mChannelsPerFrame = ch;
+    src.mBitsPerChannel   = 32;
+
+    AudioConverterRef conv = NULL;
+    OSStatus st = AudioConverterNew(&src, &_dstFormat, &conv);
+
+    VCLog(@"音频管道源格式(实测)：%.0fHz / %u ch / %u bit / %zu B每帧  -> 转换器 %@(%d)",
+          src.mSampleRate, (unsigned)src.mChannelsPerFrame,
+          (unsigned)src.mBitsPerChannel, bpf,
+          st == noErr ? @"创建成功" : @"创建失败", (int)st);
+
+    if (st == noErr) {
+        _conv = conv;
+        _srcFormat = src;
+    } else {
+        if (bpf >= 8) {
+            VCLog(@"音频管道：stereo 转换器创建失败，试 mono 兜底");
+        }
+    }
 }
 
 // ------------------------------------------------------------------ 消费

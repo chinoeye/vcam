@@ -242,7 +242,10 @@ NSString *const VCAudioSourceShouldResetNotification =
 ///  留余量会让音频永远落后一个固定的偏移。
 - (void)seekToTime:(double)seconds
 {
-    dispatch_async(_queue, ^{
+    // 必须同步：异步的话调用方设置好 _decodedMaterialSeconds 后立刻继续生产，
+    // 而 seek 还没真正生效，读到的仍是旧位置的数据 —— 位置永远对不上。
+    // 这里会阻塞几百毫秒，但调用方是后台生产线程，可以接受。
+    dispatch_sync(_queue, ^{
         if (!self->_asset || !self->_track) return;
 
         if (self->_output) [self->_reader cancelReading];

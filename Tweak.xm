@@ -460,6 +460,7 @@ static OSStatus hook_AudioUnitRender(AudioUnit unit,
     if (!orig_AudioUnitRender) return -1;
 
     g_auRenderHits++;
+    g_statAudioCalls++;
 
     // 记录 AudioUnit 实例：如果换过实例，说明抖音开了多条音频通路
     if (g_auFirstUnit == 0) {
@@ -724,6 +725,61 @@ static OSStatus hook_AudioUnitRender(AudioUnit unit,
 //
 //  用法：Safari 地址栏敲一行，系统会问「是否在抖音中打开」，确认即可。
 //  或者做成快捷指令放到桌面，点一下就切。
+
+// ==================================================================
+#pragma mark - 手机端指标上报
+// ==================================================================
+//
+//  电脑上看不到手机发生了什么：iOS 15 上 syslog_relay 废弃、
+//  os_trace_relay 拿不到 NSLog、house_arrest 要求 App 开 UIFileSharingEnabled、
+//  com.apple.afc 被拒。四条路全断。
+//
+//  所以 dylib 主动把关键指标 GET 回电脑（VCRemoteLog → /vcam-log），
+//  电脑端 rangeserver 落到 logs/phone-YYYYMMDD.log，可以实时 tail 看。
+//
+//  每秒一行，只报变化量，避免刷屏。
+
+static volatile int    g_statVideoDelegates = 0;   // 视频 delegate 调用次数
+static volatile double g_statVideoPTS       = 0;   // 视频最近 PTS
+static volatile int    g_statAudioCalls     = 0;   // AudioUnitRender 调用次数
+static volatile double g_statAudioPos       = 0;   // 音频已解码位置
+static volatile double g_statVideoPosSrc    = 0;   // 视频源位置
+
+static void VCStartStatReporter(void)
+{
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        dispatch_source_t t = dispatch_source_create(
+            DISPATCH_SOURCE_TYPE_TIMER, 0, 0,
+            dispatch_get_global_queue(QOS_CLASS_UTILITY, 0));
+        dispatch_source_set_timer(t,
+            dispatch_time(DISPATCH_TIME_NOW, 2 * NSEC_PER_SEC),
+            1 * NSEC_PER_SEC, 100 * NSEC_PER_MSEC);
+        dispatch_source_set_event_handler(t, ^{
+            static int sPrevV = 0, sPrevA = 0;
+            int v = g_statVideoDelegates;
+            int a = g_statAudioCalls;
+            int dv = v - sPrevV;
+            int da = a - sPrevA;
+            sPrevV = v; sPrevA = a;
+
+            VCAudioPipeline *pipe = [VCAudioPipeline shared];
+            VCRemoteLog(@"STAT vDeleg=%d/s(%d) aCalls=%d/s(%d) "
+                        @"vSrc=%.2f aDec=%.2f buf=%.0fms err=%+.0fms "
+                        @"produced=%llu consumed=%llu under=%llu",
+                        dv, v, da, a,
+                        [VCFrameSource shared].currentVideoSourceTime,
+                        pipe.decodedMaterialSeconds,
+                        pipe.currentDrift * 1000.0,
+                        (pipe.decodedMaterialSeconds - pipe.currentDrift
+                         - [VCFrameSource shared].currentVideoSourceTime) * 1000.0,
+                        pipe.producedFrames, pipe.consumedFrames,
+                        pipe.underrunCount);
+        });
+        dispatch_resume(t);
+        VCLog(@"指标上报已启动（每秒一次 → /vcam-log）");
+    });
+}
 
 /// 预热音频管道：在 App 启动时就建好环形缓冲并填满数据。
 ///
@@ -992,6 +1048,7 @@ static void VCBootstrap(void)
                 dispatch_async(dispatch_get_main_queue(), ^{
                     VCLoadAssetNow();
                     VCPrewarmAudioPipeline();
+                    VCStartStatReporter();
                 });
             });
         } else {

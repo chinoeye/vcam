@@ -132,6 +132,7 @@ static OSStatus VCPipeInputProc(AudioConverterRef cvt,
                                 //   抖音不会因为收到静音就停下，每 21ms 照样取 1024 帧
     double   _startPlaySeconds; // 启动那一刻视频所在的素材位置
     double   _playError;        // 当前音画偏差（正=音频数据不够，负=数据太多）
+    uint64_t _tuneBlocks;       // 累计微调次数（诊断：稳定后应停止增长）
     NSData  *_probeData;        // 探测源格式时取走的那一块，必须留着复用
     NSMutableData *_srcCarry;   // 上一轮没被转换器吃掉的源数据（字节）
     size_t   _srcCarryFrames;   // 上面那份缓存里的帧数
@@ -221,6 +222,7 @@ static OSStatus VCPipeInputProc(AudioConverterRef cvt,
     _requestedFrames = 0;
     _startPlaySeconds = -1.0;
     _playError = 0.0;
+    _tuneBlocks = 0;
     _probeData = nil;
     _probeFrames = 0;
     _srcCarry = nil;
@@ -629,14 +631,24 @@ static OSStatus VCPipeInputProc(AudioConverterRef cvt,
     //
     //  2% 的速率变化约等于 0.34 个半音，听不出来；
     //  但每 21ms 就能修正 0.4ms，2 秒的偏差几十秒内收敛完。
-    if (fabs(_playError) > 0.05) {
+    // 死区 100ms：小于这个量不折腾，否则会一直小幅抖动（听感上是轻微颤音）。
+    // 用户要求是「长期不漂移」，100ms 以内的残差肉眼/耳朵都察觉不到。
+    if (fabs(_playError) > 0.10) {
         size_t perFrame = _bytesPerFrame;
         size_t totalFrames = produced / perFrame;
 
-        // 每块最多调整 2%
+        // 每块最多调整 2%（约 0.34 个半音，听不出来）
         size_t maxAdj = totalFrames / 50;
         size_t adj = (size_t)(fabs(_playError) * _dstFormat.mSampleRate * 0.02);
         if (adj > maxAdj) adj = maxAdj;
+        if (adj == 0) adj = 1;
+
+        _tuneBlocks++;
+        if (_tuneBlocks <= 5 || _tuneBlocks % 500 == 0) {
+            VCLog(@"音频微调 #%llu：偏差 %+.0fms，本块调 %zu 帧（%.2f%%）",
+                  _tuneBlocks, _playError * 1000, adj,
+                  100.0 * (double)adj / (double)totalFrames);
+        }
         if (adj > 0) {
             if (_playError > 0) {
                 // 落后：末尾重复 adj 帧（复制最后一段）
@@ -933,6 +945,7 @@ static OSStatus VCPipeInputProc(AudioConverterRef cvt,
 - (double)lastUnderrunAt { return _lastUnderrunAt; }
 - (double)decodedMaterialSeconds { return _decodedMaterialSeconds; }
 - (double)videoSourceSeconds { return [[VCFrameSource shared] currentVideoSourceTime]; }
+- (uint64_t)tuneBlocks { return _tuneBlocks; }
 - (uint64_t)silentNoRing { return _silentNoRing; }
 - (uint64_t)silentShort  { return _silentShort; }
 - (uint64_t)zeroBytes    { return _zeroBytes; }

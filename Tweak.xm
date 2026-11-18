@@ -1217,6 +1217,7 @@ static NSString *VCRunAudioDiagnosis(void)
             pipe.decodedMaterialSeconds - pipe.currentDrift];
         [out appendFormat:@">>> 音画偏差    : %+.2f s  (负=音频落后)\n",
             pipe.decodedMaterialSeconds - pipe.currentDrift - pipe.videoSourceSeconds];
+        [out appendFormat:@"微调次数      : %llu  (稳定后应停止增长)\n", pipe.tuneBlocks];
         [out appendFormat:@"上次欠载时刻  : %.2f s（录音开始后）\n", pipe.lastUnderrunAt];
         [out appendFormat:@"单次生产最长  : %.0f ms\n", pipe.maxProduceMs];
         [out appendString:@"\n--- 静音来源细分 ---\n"];

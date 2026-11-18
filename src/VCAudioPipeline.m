@@ -363,7 +363,14 @@ static OSStatus VCPipeInputProc(AudioConverterRef cvt,
     double ratio = (_srcFormat.mSampleRate > 0 && _dstFormat.mSampleRate > 0)
                  ? (_srcFormat.mSampleRate / _dstFormat.mSampleRate)
                  : 1.0;
-    size_t needSrcFrames = (size_t)((double)wantFrames * ratio) + 2;
+    // 多给 5% + 32 帧余量。
+    //
+    //  只给 wantFrames+2 时，转换器内部缓冲不足会吐不满 ——
+    //  abl.mBuffers[0].mDataByteSize 小于请求值，环形缓冲里就出现
+    //  「半块」，下一块数据紧接着接上，波形断裂 = 一声「啪」。
+    //  实测 15 秒里出现 15 次，间隔 0.185s / 0.371s 交替，
+    //  听感就是电报声。
+    size_t needSrcFrames = (size_t)((double)wantFrames * ratio * 1.05) + 32;
     size_t srcBpf = _srcFormat.mBytesPerFrame;      // 4=mono, 8=stereo（float32）
 
     NSMutableData *srcData = [NSMutableData dataWithCapacity:needSrcFrames * srcBpf];
@@ -444,7 +451,38 @@ static OSStatus VCPipeInputProc(AudioConverterRef cvt,
     }
 
     size_t produced = abl.mBuffers[0].mDataByteSize;
-    if (produced == 0) return;
+    if (produced == 0) {
+        static BOOL sLog = NO;
+        if (!sLog) { sLog = YES; VCLog(@"音频管道：转换器零输出"); }
+        return;
+    }
+
+    // 吐不满就补：用最后一个样本重复填满剩余部分。
+    //
+    //  out 是 dataWithLength（全零），转换器没写的部分是 0。
+    //  如果就这么写进环形缓冲，下一块数据会紧接在 0 后面 ——
+    //  波形从 0 猛地跳到下一个值，就是「啪」一声。
+    //  用最后样本补满，波形保持连续，听不出来。
+    if (produced < outBytes) {
+        size_t sampleSize = (_bytesPerFrame / _dstFormat.mChannelsPerFrame);
+        const uint8_t *lastFrame = (const uint8_t *)out.bytes + produced - _bytesPerFrame;
+        uint8_t *padDst = (uint8_t *)out.mutableBytes + produced;
+        size_t padLen = outBytes - produced;
+        for (size_t off = 0; off + _bytesPerFrame <= padLen; off += _bytesPerFrame) {
+            memcpy(padDst + off, lastFrame, _bytesPerFrame);
+        }
+        size_t rem = padLen % _bytesPerFrame;
+        if (rem) {
+            memcpy(padDst + padLen - rem, lastFrame, rem);
+        }
+        produced = outBytes;
+
+        static int sShortCount = 0;
+        if (++sShortCount <= 5 || sShortCount % 200 == 0) {
+            VCLog(@"音频管道：转换器吐不满（累计 %d 次），已用末样本补齐", sShortCount);
+        }
+        (void)sampleSize;
+    }
 
     pthread_mutex_lock(&_lock);
     size_t freeFramesNow = kRingFrames - _count;

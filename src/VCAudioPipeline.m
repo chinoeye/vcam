@@ -32,13 +32,13 @@
 //
 //  这个值**直接等于音频延迟**：缓冲里存多少，声音就比画面晚多少。
 //
-//  取 800ms（38400 帧）的依据：
+//  取 2 秒（96000 帧）的依据：
 //    · 实测欠载 103 次 / 713 次调用 = 14.5%，每次欠载会让实时线程
 //      重复上一块 21ms，听感是「哒哒哒」——就是用户说的打电报
 //    · 生产端单次耗时被视频解码拖到 20~50ms，定时器 5ms 一次会堆积
 //    · 800ms 有 16 倍余量，即使连续卡几次也不会取空
 //    · 录播场景 800ms 延迟完全可接受（不是实时互动）
-static const size_t kRingFrames = 38400;
+static const size_t kRingFrames = 96000;
 
 // ------------------------------------------------------------------ 转换输入回调
 
@@ -118,6 +118,9 @@ static OSStatus VCPipeInputProc(AudioConverterRef cvt,
     uint64_t _underrun;
     size_t   _takeThisCall;     // 本次调用从环形缓冲取走的字节数
     uint64_t _starved;          // 拿不到数据的次数
+    double   _lastUnderrunAt;   // 上次欠载发生在录音开始后第几秒
+    double   _maxProduceMs;     // 单次生产最长耗时
+    double   _startedAt;        // 管道启动时刻（CFAbsoluteTime）
     NSData  *_probeData;        // 探测源格式时取走的那一块，必须留着复用
     NSMutableData *_srcCarry;   // 上一轮没被转换器吃掉的源数据（字节）
     size_t   _srcCarryFrames;   // 上面那份缓存里的帧数
@@ -265,6 +268,7 @@ static OSStatus VCPipeInputProc(AudioConverterRef cvt,
         return;
     }
     _running = YES;
+    _startedAt = CFAbsoluteTimeGetCurrent();
 
     _timer = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0, _queue);
     // 5ms 一次而不是 10ms：单次生产被视频解码挡住时，
@@ -356,6 +360,8 @@ static OSStatus VCPipeInputProc(AudioConverterRef cvt,
 - (void)produceFrames:(size_t)wantFrames
 {
     if (wantFrames == 0) return;
+
+    double t0 = CFAbsoluteTimeGetCurrent();
 
     // ---- 第一次拿到数据时，用实测格式建转换器 ----
     if (!_conv) {
@@ -535,6 +541,12 @@ static OSStatus VCPipeInputProc(AudioConverterRef cvt,
         _decodedMaterialSeconds += (double)producedFrames / _dstFormat.mSampleRate;
     }
     pthread_mutex_unlock(&_lock);
+
+    double spent = (CFAbsoluteTimeGetCurrent() - t0) * 1000.0;
+    if (spent > _maxProduceMs) _maxProduceMs = spent;
+    if (spent > 200) {
+        VCLog(@"音频管道：单次生产耗时 %.0fms（want=%zu 帧）", spent, wantFrames);
+    }
 }
 
 /// 用第一块真实数据反推源格式，然后建转换器。
@@ -682,6 +694,9 @@ static OSStatus VCPipeInputProc(AudioConverterRef cvt,
 - (uint64_t)underrunCount  { return _underrun; }
 - (int)seekCount           { return _seekCount; }
 - (BOOL)isRunning          { return _running; }
+
+- (double)lastUnderrunAt { return _lastUnderrunAt; }
+- (double)maxProduceMs   { return _maxProduceMs; }
 
 - (double)currentDrift
 {

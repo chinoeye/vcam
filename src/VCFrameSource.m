@@ -97,10 +97,22 @@
     @try {
         [self teardownLocked];
 
-        NSDictionary *opts = @{
-            AVURLAssetPreferPreciseDurationAndTimingKey: @YES,
-            AVURLAssetAllowsCellularAccessKey: @YES,
-        };
+        // HTTP 源不要开 PreferPreciseDurationAndTiming。
+        //
+        //  那个选项要求「精确时长和时间戳」，AVFoundation 会去加载完整索引
+        //  （6.5 GB 素材的 moov 有 13 MB，加上逐轨解析），在 WiFi 上很容易
+        //  卡十几秒 —— 足以让系统 watchdog 把抖音判为无响应并杀掉。
+        //  症状就是：进录制页黑屏 → 闪退。
+        //
+        //  本地文件保留精确模式（本来就在本地，解析很快）。
+        BOOL isRemote = (url.scheme.length > 0 &&
+                         ![url.scheme isEqualToString:@"file"]);
+        NSDictionary *opts = isRemote
+            ? @{ AVURLAssetAllowsCellularAccessKey: @YES }
+            : @{ AVURLAssetPreferPreciseDurationAndTimingKey: @YES,
+                 AVURLAssetAllowsCellularAccessKey: @YES };
+        VCLog(@"装载素材：%@（%@）", url.absoluteString,
+              isRemote ? @"远程，非精确模式" : @"本地，精确模式");
         _asset = [AVURLAsset URLAssetWithURL:url options:opts];
         _currentURL = url;
 

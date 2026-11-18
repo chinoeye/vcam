@@ -43,6 +43,9 @@ extern NSString *const VCAudioSourceShouldResetNotification;
 /// 回到素材开头（视频回绕时调用）
 - (void)reset;
 
+/// 跳到素材内的指定秒（用于音画对齐校正）
+- (void)seekToTime:(double)seconds;
+
 /// 取下一块 PCM（float32 / 素材原始声道 / 素材原始采样率）。
 /// 没有数据时返回 nil。内部串行，可多线程调用。
 - (nullable NSData *)nextPCMWithFrames:(CMItemCount *)frames

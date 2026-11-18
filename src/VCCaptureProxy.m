@@ -260,6 +260,9 @@ static NSLock *VCProxyLock(void)
 //  App 完全感知不到差异。代价是每帧一次 memcpy 或一次 GPU 缩放。
 - (void)rewriteVideoBufferInPlace:(CMSampleBufferRef)buffer drop:(BOOL *)dropOut
 {
+    extern volatile int g_statVideoDelegates;
+    g_statVideoDelegates++;
+
     if (dropOut) *dropOut = NO;
     if (!buffer) return;
 

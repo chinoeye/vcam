@@ -377,7 +377,6 @@ static OSStatus VCPipeInputProc(AudioConverterRef cvt,
             // 播放位置 = 起点 + 已请求的帧数（含静音段）
             double playPos = _startPlaySeconds
                            + (double)_requestedFrames / _dstFormat.mSampleRate;
-            double drift = playPos - videoT;
 
             pthread_mutex_lock(&_lock);
             double buffered = (_dstFormat.mSampleRate > 0)

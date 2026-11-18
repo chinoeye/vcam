@@ -1174,6 +1174,13 @@ static NSString *VCRunAudioDiagnosis(void)
         [out appendFormat:@"缓冲延迟      : %.0f ms\n", pipe.currentDrift * 1000.0];
         [out appendFormat:@"上次欠载时刻  : %.2f s（录音开始后）\n", pipe.lastUnderrunAt];
         [out appendFormat:@"单次生产最长  : %.0f ms\n", pipe.maxProduceMs];
+        [out appendString:@"\n--- 静音来源细分 ---\n"];
+        [out appendFormat:@"缓冲未就绪静音: %llu 帧 (%.0f ms)\n",
+            pipe.silentNoRing, pipe.silentNoRing / 48.0];
+        [out appendFormat:@"缓冲不足静音  : %llu 帧 (%.0f ms)\n",
+            pipe.silentShort, pipe.silentShort / 48.0];
+        [out appendFormat:@"writable=0    : %llu 次\n", pipe.zeroBytes];
+        [out appendFormat:@"实际填充帧数  : %llu\n", pipe.totalFilled];
     }
     [out appendFormat:@"hook 填充次数 : %d\n", g_audioWriteOK];
     {

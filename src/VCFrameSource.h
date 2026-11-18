@@ -60,6 +60,8 @@ NS_ASSUME_NONNULL_BEGIN
 @property (nonatomic, readonly) BOOL isReady;
 @property (nonatomic, readonly) NSUInteger frameCount;
 @property (nonatomic, readonly) CGFloat sourceAspectRatio;
+/// 素材帧率（用于视频出帧节流）
+@property (nonatomic, readonly) CGFloat sourceFrameRate;
 
 /// 当前视频帧在源文件里的时间位置（秒）。
 /// 音频侧靠它对表，保证音画不会各跑各的。

@@ -62,10 +62,21 @@ static OSStatus VCPipeInputProc(AudioConverterRef cvt,
     if (want > (UInt32)remain) want = (UInt32)remain;
     if (want == 0) return 1;      // 喂完了，告诉转换器没数据
 
+    // 指针按**字节**偏移，不能按 float 偏移。
+    //
+    //  源是 stereo（8 字节/帧）时，consumed 帧 = consumed*2 个 float。
+    //  写成 (c->data + c->consumed) 时偏移只有正确值的一半，
+    //  转换器读到错位的半帧数据 —— 表现为素材声里夹周期性电报声。
+    //
+    //  mDataByteSize 同理必须是 want * bytesPerFrame；
+    //  固定 sizeof(float)=4 在 stereo 下只喂了一半数据。
+    const uint8_t *base = (const uint8_t *)c->data
+                        + c->consumed * c->bytesPerFrame;
+
     ioData->mNumberBuffers = 1;
-    ioData->mBuffers[0].mNumberChannels = 1;
-    ioData->mBuffers[0].mData = (void *)(c->data + c->consumed);
-    ioData->mBuffers[0].mDataByteSize = want * sizeof(float);
+    ioData->mBuffers[0].mNumberChannels = c->channels;
+    ioData->mBuffers[0].mData = (void *)base;
+    ioData->mBuffers[0].mDataByteSize = (UInt32)(want * c->bytesPerFrame);
 
     *ioNumPackets = want;
     c->consumed += want;
@@ -398,9 +409,11 @@ static OSStatus VCPipeInputProc(AudioConverterRef cvt,
     NSMutableData *out = [NSMutableData dataWithLength:outBytes];
 
     VCConvCtx ctx;
-    ctx.data     = (const float *)srcData.bytes;
-    ctx.total    = availFrames;
-    ctx.consumed = 0;
+    ctx.data          = (const float *)srcData.bytes;
+    ctx.total         = availFrames;
+    ctx.consumed      = 0;
+    ctx.bytesPerFrame = srcBpf;
+    ctx.channels      = _srcFormat.mChannelsPerFrame;
 
     AudioBufferList abl;
     abl.mNumberBuffers = 1;

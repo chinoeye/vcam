@@ -123,6 +123,7 @@ static OSStatus VCPipeInputProc(AudioConverterRef cvt,
     uint64_t _silentShort;      // 因缓冲不足而输出静音的帧数
     uint64_t _zeroBytes;        // writable 为 0 的调用次数
     uint64_t _totalFilledFrames;// 累计填充的帧数（诊断）
+    uint64_t _dcSegments;       // 产出的数据里出现「整段恒定值」的次数
     double   _maxProduceMs;     // 单次生产最长耗时
     double   _startedAt;        // 管道启动时刻（CFAbsoluteTime）
     NSData  *_probeData;        // 探测源格式时取走的那一块，必须留着复用
@@ -218,6 +219,7 @@ static OSStatus VCPipeInputProc(AudioConverterRef cvt,
     _silentShort = 0;
     _zeroBytes = 0;
     _totalFilledFrames = 0;
+    _dcSegments = 0;
     _produced = 0;
     _consumed = 0;
     _underrun = 0;
@@ -522,6 +524,30 @@ static OSStatus VCPipeInputProc(AudioConverterRef cvt,
     // 任何形式的「重复末样本补满」都会生成恒定直流段，听感就是断点。
     if (produced < outBytes) produced -= produced % _bytesPerFrame;
 
+    // 自检：这段产出是不是「整段恒定值」。
+    //
+    //  正常音频在几十毫秒内一定会变化；如果整块每个样本都相同，
+    //  说明上游又混进了补齐/重复逻辑 —— 那就是断点的来源。
+    //  有了这个计数，以后不用靠波形反推就能发现。
+    if (produced >= _bytesPerFrame * 64) {
+        const uint8_t *base = (const uint8_t *)out.bytes;
+        BOOL allSame = YES;
+        for (size_t off = _bytesPerFrame; off + _bytesPerFrame <= produced;
+             off += _bytesPerFrame) {
+            if (memcmp(base + off, base, _bytesPerFrame) != 0) {
+                allSame = NO;
+                break;
+            }
+        }
+        if (allSame) {
+            _dcSegments++;
+            if (_dcSegments <= 5) {
+                VCLog(@"音频管道：检测到恒定值段（%zu 帧），上游可能有补齐残留",
+                      produced / _bytesPerFrame);
+            }
+        }
+    }
+
 
 
     pthread_mutex_lock(&_lock);
@@ -669,14 +695,74 @@ static OSStatus VCPipeInputProc(AudioConverterRef cvt,
                 memcpy((uint8_t *)buf->mData + tail, _ring, take - tail);
             }
         } else {
-            // 缓冲不够：这一块直接输出静音，并计数。
+            // 真欠载（理论上只剩启动那一瞬间）。
             //
-            //  不重复上一块 —— 重复整块 1024 帧（21ms）会让声音变成
-            //  机械的「哒哒哒」，就是用户说的打电报。
-            //  静音至少听感是「短暂空白」，不会制造假的节奏感。
-            memset(buf->mData, 0, writable);
+            //  部分有数据时：先拷进去，剩余部分从最后一个样本**线性淡出到 0**。
+            //  直接 memset 会让波形从当前幅度瞬间跌到 0 —— 那一声「啪」
+            //  是突变造成的，不是静音本身造成的。淡出就没有突变。
+            //
+            //  仍然不重复整块：重复 1024 帧会变成机械的「哒哒哒」。
             _underrun++;
             _silentShort += writable / _bytesPerFrame;
+
+            size_t have = 0;
+            if (take > 0) {
+                size_t tail = _ringBytes - _readPos;
+                if (take <= tail) {
+                    memcpy(buf->mData, _ring + _readPos, take);
+                } else {
+                    memcpy(buf->mData, _ring + _readPos, tail);
+                    memcpy((uint8_t *)buf->mData + tail, _ring, take - tail);
+                }
+                have = take;
+            }
+
+            size_t padBytes = writable - have;
+            size_t ch = _dstFormat.mChannelsPerFrame ? _dstFormat.mChannelsPerFrame : 1;
+            size_t sampleBytes = ch * (_dstFormat.mBitsPerChannel / 8);
+            if (sampleBytes == 0) sampleBytes = 2;
+
+            // 取最后一个有效样本（没有就用 0）
+            int32_t lastVal = 0;
+            if (have >= sampleBytes) {
+                const uint8_t *lb = (const uint8_t *)buf->mData + have - sampleBytes;
+                if (sampleBytes == 2) {
+                    int16_t v; memcpy(&v, lb, 2); lastVal = v;
+                } else if (sampleBytes == 4) {
+                    if (_dstFormat.mFormatFlags & kAudioFormatFlagIsFloat) {
+                        float v; memcpy(&v, lb, 4);
+                        v *= 32768.0f;
+                        lastVal = (int32_t)v;
+                    } else {
+                        int32_t v; memcpy(&v, lb, 4); lastVal = v;
+                    }
+                }
+            }
+
+            size_t padFrames = padBytes / sampleBytes;
+            uint8_t *pd = (uint8_t *)buf->mData + have;
+            for (size_t k = 0; k < padFrames; k++) {
+                int32_t v = 0;
+                if (padFrames > 0) {
+                    v = (int32_t)((double)lastVal *
+                                  (1.0 - (double)(k + 1) / (double)padFrames));
+                }
+                if (sampleBytes == 2) {
+                    int16_t sv = (int16_t)v;
+                    for (size_t c = 0; c < ch; c++) {
+                        memcpy(pd + k * sampleBytes + c * 2, &sv, 2);
+                    }
+                } else {
+                    int32_t sv = v;
+                    for (size_t c = 0; c < ch; c++) {
+                        memcpy(pd + k * sampleBytes + c * 4, &sv, 4);
+                    }
+                }
+            }
+            size_t done = padFrames * sampleBytes;
+            if (done < padBytes) {
+                memset(pd + done, 0, padBytes - done);
+            }
         }
 
         // 契约外的那部分（mDataByteSize 比 needBytes 大的时候）清掉，
@@ -711,6 +797,7 @@ static OSStatus VCPipeInputProc(AudioConverterRef cvt,
 - (uint64_t)silentShort  { return _silentShort; }
 - (uint64_t)zeroBytes    { return _zeroBytes; }
 - (uint64_t)totalFilled  { return _totalFilledFrames; }
+- (uint64_t)dcSegments   { return _dcSegments; }
 - (double)maxProduceMs   { return _maxProduceMs; }
 
 - (double)currentDrift

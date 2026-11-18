@@ -423,16 +423,6 @@ static volatile int    g_auAsbdProbed    = 0;
 // 素材 PCM 的实际格式 —— 在真正写入的那一刻捕获。
 // 不能用 copyNextAudioPCM 单独探测：那个函数带音画同步逻辑，
 // 超前/落后时会主动返回 nil，探测出来全是 0。
-static volatile UInt32 g_assetFormatID      = 0;
-static volatile UInt32 g_assetFormatFlags   = 0;
-static volatile UInt32 g_assetSampleRate    = 0;
-static volatile UInt32 g_assetChannels      = 0;
-static volatile UInt32 g_assetBits          = 0;
-static volatile UInt32 g_assetBytesPerFrame = 0;
-static volatile UInt32 g_assetLastFrames    = 0;
-static volatile UInt32 g_assetLastBytes     = 0;
-static volatile int    g_assetProbed        = 0;
-
 
 // 音频写入每次提前返回的原因。
 // 报告里直接读，一眼看出卡在哪一步 —— 比猜省事。
@@ -1170,23 +1160,8 @@ static NSString *VCRunAudioDiagnosis(void)
     [out appendFormat:@"声道数        : %u\n", (unsigned)g_auLastChannels];
     [out appendFormat:@"字节数        : %u\n", (unsigned)g_auLastBytes];
 
-    [out appendString:@"\n--- 素材 PCM 格式（写入时捕获）---\n"];
-    [out appendFormat:@"是否捕获到      : %@\n", g_assetProbed ? @"是" : @"否（没写入过）"];
-    [out appendFormat:@"FormatID        : 0x%x (lpcm=0x6c70636d)\n", (unsigned)g_assetFormatID];
-    [out appendFormat:@"formatFlags     : 0x%x (1=float 8=packed 32=noninterleaved)\n", (unsigned)g_assetFormatFlags];
-    [out appendFormat:@"采样率          : %u Hz\n", (unsigned)g_assetSampleRate];
-    [out appendFormat:@"声道            : %u\n", (unsigned)g_assetChannels];
-    [out appendFormat:@"位深            : %u bit\n", (unsigned)g_assetBits];
-    [out appendFormat:@"bytesPerFrame   : %u\n", (unsigned)g_assetBytesPerFrame];
-    [out appendFormat:@"帧数            : %u\n", (unsigned)g_assetLastFrames];
-    [out appendFormat:@"字节数          : %u\n", (unsigned)g_assetLastBytes];
-    [out appendFormat:@"推算每样本字节  : %.2f  (4.00=float32 2.00=int16)\n",
-        g_assetLastFrames > 0 ? (double)g_assetLastBytes / (double)g_assetLastFrames : 0.0];
-
     [out appendFormat:@"SetProperty hook: %@ (orig=%p)\n",
         orig_AudioUnitSetProperty ? @"已装" : @"未装", orig_AudioUnitSetProperty];
-
-    [out appendFormat:@"seek 校正次数   : %d\n", g_vcSeekCount];
 
     [out appendString:@"\n--- 音频管道 ---\n"];
     {
@@ -1200,6 +1175,13 @@ static NSString *VCRunAudioDiagnosis(void)
             pipe.currentDrift * 1000.0];
     }
     [out appendFormat:@"hook 填充次数 : %d\n", g_audioWriteOK];
+    {
+        VCAudioSource *asrc = [VCAudioSource shared];
+        [out appendFormat:@"素材音频源    : %@  %.0fHz / %u ch\n",
+            asrc.ready ? @"已加载" : @"未加载",
+            asrc.sampleRate, (unsigned)asrc.channels];
+        [out appendFormat:@"源累计交付帧  : %llu\n", asrc.framesDelivered];
+    }
     [out appendFormat:@"最近返回原因  : %d  (0=正常 1=Mic 2=Mute)\n", g_audioBail];
 
     [out appendString:@"\n--- RenderNotify 诊断（系统标准 API）---\n"];

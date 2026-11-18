@@ -131,6 +131,7 @@ static OSStatus VCPipeInputProc(AudioConverterRef cvt,
                                 //   必须用它算播放位置，不能用 _consumed ——
                                 //   抖音不会因为收到静音就停下，每 21ms 照样取 1024 帧
     double   _startPlaySeconds; // 启动那一刻视频所在的素材位置
+    double   _playError;        // 当前音画偏差（正=音频数据不够，负=数据太多）
     NSData  *_probeData;        // 探测源格式时取走的那一块，必须留着复用
     NSMutableData *_srcCarry;   // 上一轮没被转换器吃掉的源数据（字节）
     size_t   _srcCarryFrames;   // 上面那份缓存里的帧数
@@ -219,6 +220,7 @@ static OSStatus VCPipeInputProc(AudioConverterRef cvt,
     _skipUntilSeconds = 0.0;
     _requestedFrames = 0;
     _startPlaySeconds = -1.0;
+    _playError = 0.0;
     _probeData = nil;
     _probeFrames = 0;
     _srcCarry = nil;
@@ -387,14 +389,18 @@ static OSStatus VCPipeInputProc(AudioConverterRef cvt,
             double expected = playPos + buffered;
             double err = expected - _decodedMaterialSeconds;
 
-            static double sLastFix = 0;
+            // 只记录偏差，交给 produceFrames 用「微调速率」慢慢收敛。
+            //
+            //  以前这里直接 _skipUntilSeconds = expected 丢弃整段，
+            //  丢弃期间没有数据产出 → 缓冲空 → 静音 1941ms → 更落后，
+            //  形成「越修越差」的循环。
+            _playError = err;
+            static double sLastLog = 0;
             double now = CFAbsoluteTimeGetCurrent();
-            if (fabs(err) > 0.4 && (now - sLastFix) > 2.0) {
-                sLastFix = now;
-                _skipUntilSeconds = expected;
-                VCLog(@"音频对齐修正：播放位置 %.2fs（视频 %.2fs），"
-                      @"应解码到 %.2fs，实际 %.2fs，偏差 %+.0fms",
-                      playPos, videoT, expected, _decodedMaterialSeconds, err * 1000);
+            if (fabs(err) > 0.3 && (now - sLastLog) > 3.0) {
+                sLastLog = now;
+                VCLog(@"音频偏差监测：%+.0fms（播放 %.2fs / 视频 %.2fs / 应解码 %.2fs / 实际 %.2fs）",
+                      err * 1000, playPos, videoT, expected, _decodedMaterialSeconds);
             }
         }
     }
@@ -614,6 +620,38 @@ static OSStatus VCPipeInputProc(AudioConverterRef cvt,
         static BOOL sLog = NO;
         if (!sLog) { sLog = YES; VCLog(@"音频管道：转换器零输出"); }
         return;
+    }
+
+    // ---- 音画微调：只动 ≤2% 的数据，绝不丢整块 ----
+    //
+    //  偏差为正（音频数据不够 / 落后）→ 这块多给一点：重复末尾少量帧
+    //  偏差为负（数据太多 / 超前）    → 这块少给一点：丢掉末尾少量帧
+    //
+    //  2% 的速率变化约等于 0.34 个半音，听不出来；
+    //  但每 21ms 就能修正 0.4ms，2 秒的偏差几十秒内收敛完。
+    if (fabs(_playError) > 0.05) {
+        size_t perFrame = _bytesPerFrame;
+        size_t totalFrames = produced / perFrame;
+
+        // 每块最多调整 2%
+        size_t maxAdj = totalFrames / 50;
+        size_t adj = (size_t)(fabs(_playError) * _dstFormat.mSampleRate * 0.02);
+        if (adj > maxAdj) adj = maxAdj;
+        if (adj > 0) {
+            if (_playError > 0) {
+                // 落后：末尾重复 adj 帧（复制最后一段）
+                size_t addBytes = adj * perFrame;
+                NSMutableData *grown = [NSMutableData dataWithLength:produced + addBytes];
+                memcpy(grown.mutableBytes, out.bytes, produced);
+                const uint8_t *tailSrc = (const uint8_t *)out.bytes + produced - adj * perFrame;
+                memcpy((uint8_t *)grown.mutableBytes + produced, tailSrc, addBytes);
+                out = grown;
+                produced += addBytes;
+            } else {
+                // 超前：丢掉末尾 adj 帧
+                produced -= adj * perFrame;
+            }
+        }
     }
 
     // 不做任何补齐 —— 请求量已经按可用数据算过，转换器必然吐满。

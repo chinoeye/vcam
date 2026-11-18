@@ -64,6 +64,8 @@ NS_ASSUME_NONNULL_BEGIN
 @property (nonatomic, readonly) double   decodedMaterialSeconds;
 /// 视频当前解码到素材的哪个时间（秒）—— 对齐基准
 @property (nonatomic, readonly) double   videoSourceSeconds;
+/// 累计微调次数。稳定后应停止增长。
+@property (nonatomic, readonly) uint64_t tuneBlocks;
 /// 单次生产最长耗时（毫秒）
 @property (nonatomic, readonly) double   maxProduceMs;
 

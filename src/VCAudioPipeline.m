@@ -624,47 +624,18 @@ static OSStatus VCPipeInputProc(AudioConverterRef cvt,
         return;
     }
 
-    // ---- 音画微调：只动 ≤2% 的数据，绝不丢整块 ----
+    // 不做速率微调。
     //
-    //  偏差为正（音频数据不够 / 落后）→ 这块多给一点：重复末尾少量帧
-    //  偏差为负（数据太多 / 超前）    → 这块少给一点：丢掉末尾少量帧
+    //  试过「每块重复/丢弃 ≤2% 的帧」来慢慢收敛偏差，结果音色变了 ——
+    //  重复或丢弃样本会直接改变波形周期，等于变调，
+    //  每 21ms 做一次就是持续的音调偏移，还带周期性咔哒。
+    //  AudioConverter 不支持动态改重采样比例，所以平滑微调在这条链路上做不出来。
     //
-    //  2% 的速率变化约等于 0.34 个半音，听不出来；
-    //  但每 21ms 就能修正 0.4ms，2 秒的偏差几十秒内收敛完。
-    // 死区 100ms：小于这个量不折腾，否则会一直小幅抖动（听感上是轻微颤音）。
-    // 用户要求是「长期不漂移」，100ms 以内的残差肉眼/耳朵都察觉不到。
-    if (fabs(_playError) > 0.10) {
-        size_t perFrame = _bytesPerFrame;
-        size_t totalFrames = produced / perFrame;
+    //  正确做法是让偏差压根不产生：靠 VCPrewarmAudioPipeline 预热，
+    //  在 App 启动时就把缓冲填满，录制第一帧就有真实数据。
+    //  这里只记录偏差供诊断，不参与任何数据处理。
 
-        // 每块最多调整 2%（约 0.34 个半音，听不出来）
-        size_t maxAdj = totalFrames / 50;
-        size_t adj = (size_t)(fabs(_playError) * _dstFormat.mSampleRate * 0.02);
-        if (adj > maxAdj) adj = maxAdj;
-        if (adj == 0) adj = 1;
 
-        _tuneBlocks++;
-        if (_tuneBlocks <= 5 || _tuneBlocks % 500 == 0) {
-            VCLog(@"音频微调 #%llu：偏差 %+.0fms，本块调 %zu 帧（%.2f%%）",
-                  _tuneBlocks, _playError * 1000, adj,
-                  100.0 * (double)adj / (double)totalFrames);
-        }
-        if (adj > 0) {
-            if (_playError > 0) {
-                // 落后：末尾重复 adj 帧（复制最后一段）
-                size_t addBytes = adj * perFrame;
-                NSMutableData *grown = [NSMutableData dataWithLength:produced + addBytes];
-                memcpy(grown.mutableBytes, out.bytes, produced);
-                const uint8_t *tailSrc = (const uint8_t *)out.bytes + produced - adj * perFrame;
-                memcpy((uint8_t *)grown.mutableBytes + produced, tailSrc, addBytes);
-                out = grown;
-                produced += addBytes;
-            } else {
-                // 超前：丢掉末尾 adj 帧
-                produced -= adj * perFrame;
-            }
-        }
-    }
 
     // 不做任何补齐 —— 请求量已经按可用数据算过，转换器必然吐满。
     // 任何形式的「重复末样本补满」都会生成恒定直流段，听感就是断点。

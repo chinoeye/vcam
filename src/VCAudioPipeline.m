@@ -43,9 +43,11 @@ static const size_t kRingFrames = 38400;
 // ------------------------------------------------------------------ 转换输入回调
 
 typedef struct {
-    const float *data;
-    size_t       total;
-    size_t       consumed;
+    const float *data;          // 源数据起点（float32，可能是交错多声道）
+    size_t       total;         // 总帧数（不是 float 个数）
+    size_t       consumed;      // 已喂掉的帧数
+    size_t       bytesPerFrame; // 每帧字节：4=mono, 8=stereo（float32）
+    uint32_t     channels;      // 源声道数
 } VCConvCtx;
 
 static OSStatus VCPipeInputProc(AudioConverterRef cvt,

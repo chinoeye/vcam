@@ -63,7 +63,7 @@ static NSString *VCJailbreakRoot(void)
     _audioMode         = VCAudioModeAsset;   // 素材音轨（0=真麦 1=素材 2=静音）
     // 默认素材名。没有 config.plist 时靠它去电脑拉 test_demo.mp4，
     // 因为抖音是苹果正版、爱思不给浏览沙盒，没法手动把文件塞进来。
-    _assetName         = @"test_demo";
+    _assetName         = @"current";   // 指向 6.5GB 成品，避免用到手机沙盒里的旧 test_demo 缓存
     // 默认电脑地址（局域网）。IP 变了要么改这里重编，要么放 config.plist 覆盖。
     _liveHost          = @"192.168.3.88";
     _livePort          = 8099;   // 实时帧 TCP（obs_live_push.py）
@@ -221,6 +221,8 @@ static NSString *VCJailbreakRoot(void)
 - (NSURL *)assetURL
 {
     if (_assetName.length == 0) return nil;
+
+    // ① 本地沙盒里有就直接用本地文件（最快，无网络依赖）
     NSArray *cands = @[
         [_assetDir stringByAppendingPathComponent:
             [_assetName stringByAppendingPathExtension:@"mp4"]],
@@ -233,6 +235,28 @@ static NSString *VCJailbreakRoot(void)
             return [NSURL fileURLWithPath:p];
         }
     }
+
+    // ② 本地没有就直接返回 HTTP URL —— 让 AVAssetReader 边下边播。
+    //
+    //   以前这里返回 nil，依赖 ensureAssetDownloaded 先同步下载完整个文件。
+    //   7 MB 的素材没问题，但 6.5 GB 的成品要下 30 多分钟，而且
+    //   VCDownloadHTTP 是同步的，抖音整个卡住不能动。
+    //
+    //   AVURLAsset 对 HTTP 源本来就支持按需拉取（配合服务端 Range），
+    //   所以直接给 URL 最合适：只拉几 MB 头部就能开播。
+    if (_liveHost.length > 0) {
+        uint16_t port = _httpPort > 0 ? _httpPort : 8088;
+        NSString *escaped = [_assetName stringByAddingPercentEncodingWithAllowedCharacters:
+                             [NSCharacterSet URLPathAllowedCharacterSet]];
+        NSString *urlStr = [NSString stringWithFormat:@"http://%@:%u/%@.mp4",
+                            _liveHost, port, escaped];
+        NSURL *u = [NSURL URLWithString:urlStr];
+        if (u) {
+            VCLog(@"素材走 HTTP 直连：%@", urlStr);
+            return u;
+        }
+    }
+
     return nil;
 }
 

@@ -63,6 +63,13 @@ NS_ASSUME_NONNULL_BEGIN
 /// 单次生产最长耗时（毫秒）
 @property (nonatomic, readonly) double   maxProduceMs;
 
+// 静音来源细分：报告里「欠载次数」只统计其中一种，
+// 这两项才是「有静音但欠载不涨」的原因。
+@property (nonatomic, readonly) uint64_t silentNoRing;  // 缓冲未就绪的帧数
+@property (nonatomic, readonly) uint64_t silentShort;   // 缓冲不足的帧数
+@property (nonatomic, readonly) uint64_t zeroBytes;     // writable=0 的次数
+@property (nonatomic, readonly) uint64_t totalFilled;   // 实际填充的帧数
+
 @end
 
 NS_ASSUME_NONNULL_END

@@ -363,14 +363,13 @@ static OSStatus VCPipeInputProc(AudioConverterRef cvt,
     double ratio = (_srcFormat.mSampleRate > 0 && _dstFormat.mSampleRate > 0)
                  ? (_srcFormat.mSampleRate / _dstFormat.mSampleRate)
                  : 1.0;
-    // 多给 5% + 32 帧余量。
+    // 只要略多于 wantFrames 就够，**不要多要**。
     //
-    //  只给 wantFrames+2 时，转换器内部缓冲不足会吐不满 ——
-    //  abl.mBuffers[0].mDataByteSize 小于请求值，环形缓冲里就出现
-    //  「半块」，下一块数据紧接着接上，波形断裂 = 一声「啪」。
-    //  实测 15 秒里出现 15 次，间隔 0.185s / 0.371s 交替，
-    //  听感就是电报声。
-    size_t needSrcFrames = (size_t)((double)wantFrames * ratio * 1.05) + 32;
+    //  曾经改成 *1.05+32 想给转换器更多余量，结果适得其反：
+    //  数据凑不齐时会走下面的「延音补齐」，而延音段是恒定值，
+    //  接上真实数据就是一次波形硬跳 —— 15 秒里出现 19 次「啪」，
+    //  比改之前还多。少要一点，凑不齐就不补，交给转换器少吐几帧。
+    size_t needSrcFrames = (size_t)((double)wantFrames * ratio) + 2;
     size_t srcBpf = _srcFormat.mBytesPerFrame;      // 4=mono, 8=stereo（float32）
 
     NSMutableData *srcData = [NSMutableData dataWithCapacity:needSrcFrames * srcBpf];
@@ -407,19 +406,16 @@ static OSStatus VCPipeInputProc(AudioConverterRef cvt,
 
     // 不够就延音补齐（帧数维度，不是样本维度）
     size_t availFrames = srcData.length / srcBpf;
-    if (availFrames < needSrcFrames) {
-        size_t padFrames = needSrcFrames - availFrames;
-        NSMutableData *p2 = [NSMutableData dataWithLength:padFrames * srcBpf];
-        // 用最后一帧的内容重复填充，保持幅度连续
-        const uint8_t *last = (const uint8_t *)srcData.bytes
-                            + (availFrames - 1) * srcBpf;
-        uint8_t *dst = (uint8_t *)p2.mutableBytes;
-        for (size_t k = 0; k < padFrames; k++) {
-            memcpy(dst + k * srcBpf, last, srcBpf);
-        }
-        [srcData appendData:p2];
-        availFrames = needSrcFrames;
-    }
+    // 数据不够就直接用现有的转，**不做延音补齐**。
+    //
+    //  以前凑不齐时会用最后一个样本重复填充到 needSrcFrames，
+    //  但延音段是恒定值，接上后面真实数据就是一次波形硬跳 ——
+    //  15 秒实测 19 次，听感就是电报声里的「啪」。
+    //
+    //  现在：数据不够就让转换器少吐几帧，剩下的由下面
+    //  「produced < outBytes」分支用末样本补齐输出。
+    //  那样补的是输出侧的尾部，波形是连续延伸的，不会断裂。
+
 
     size_t outBytes = wantFrames * _bytesPerFrame;
     NSMutableData *out = [NSMutableData dataWithLength:outBytes];

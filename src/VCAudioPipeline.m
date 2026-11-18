@@ -127,6 +127,10 @@ static OSStatus VCPipeInputProc(AudioConverterRef cvt,
     double   _maxProduceMs;     // 单次生产最长耗时
     double   _startedAt;        // 管道启动时刻（CFAbsoluteTime）
     double   _skipUntilSeconds; // 启动对齐：丢弃该位置之前的解码数据（不 seek）
+    uint64_t _requestedFrames;  // 抖音**请求**的总帧数（含输出静音的部分）
+                                //   必须用它算播放位置，不能用 _consumed ——
+                                //   抖音不会因为收到静音就停下，每 21ms 照样取 1024 帧
+    double   _startPlaySeconds; // 启动那一刻视频所在的素材位置
     NSData  *_probeData;        // 探测源格式时取走的那一块，必须留着复用
     NSMutableData *_srcCarry;   // 上一轮没被转换器吃掉的源数据（字节）
     size_t   _srcCarryFrames;   // 上面那份缓存里的帧数
@@ -213,6 +217,8 @@ static OSStatus VCPipeInputProc(AudioConverterRef cvt,
     _count = 0;
     _decodedMaterialSeconds = 0.0;
     _skipUntilSeconds = 0.0;
+    _requestedFrames = 0;
+    _startPlaySeconds = -1.0;
     _probeData = nil;
     _probeFrames = 0;
     _srcCarry = nil;
@@ -361,13 +367,35 @@ static OSStatus VCPipeInputProc(AudioConverterRef cvt,
     //    · 丢完数据后 _decodedMaterialSeconds 落在正确位置
     {
         static BOOL sAlignedOnce = NO;
-        if (!sAlignedOnce) {
-            double videoT = [[VCFrameSource shared] currentVideoSourceTime];
-            if (videoT > 0.3) {
-                sAlignedOnce = YES;
-                _skipUntilSeconds = videoT;
-                VCLog(@"音频对齐：丢弃 %.2fs 之前的解码数据（不 seek，缓冲不受影响）",
-                      videoT);
+        double videoT = [[VCFrameSource shared] currentVideoSourceTime];
+        if (!sAlignedOnce && videoT > 0.3) {
+            sAlignedOnce = YES;
+            _startPlaySeconds = videoT;
+            _skipUntilSeconds = videoT;
+            VCLog(@"音频对齐：起点 %.2fs，丢弃此前的解码数据", videoT);
+        } else if (sAlignedOnce && _startPlaySeconds >= 0) {
+            // 播放位置 = 起点 + 已请求的帧数（含静音段）
+            double playPos = _startPlaySeconds
+                           + (double)_requestedFrames / _dstFormat.mSampleRate;
+            double drift = playPos - videoT;
+
+            pthread_mutex_lock(&_lock);
+            double buffered = (_dstFormat.mSampleRate > 0)
+                            ? (double)_count / _dstFormat.mSampleRate : 0.0;
+            pthread_mutex_unlock(&_lock);
+
+            // 音频数据位置应该落在 playPos + buffered 附近
+            double expected = playPos + buffered;
+            double err = expected - _decodedMaterialSeconds;
+
+            static double sLastFix = 0;
+            double now = CFAbsoluteTimeGetCurrent();
+            if (fabs(err) > 0.4 && (now - sLastFix) > 2.0) {
+                sLastFix = now;
+                _skipUntilSeconds = expected;
+                VCLog(@"音频对齐修正：播放位置 %.2fs（视频 %.2fs），"
+                      @"应解码到 %.2fs，实际 %.2fs，偏差 %+.0fms",
+                      playPos, videoT, expected, _decodedMaterialSeconds, err * 1000);
             }
         }
     }
@@ -703,6 +731,10 @@ static OSStatus VCPipeInputProc(AudioConverterRef cvt,
 - (void)fillIOData:(AudioBufferList *)ioData frames:(UInt32)frames
 {
     if (!ioData || frames == 0) return;
+
+    // 先记账：抖音请求了多少帧就记多少，不管这次能不能给到数据。
+    // 播放位置必须按这个算 —— 它代表「音频时间轴已经走了多远」。
+    _requestedFrames += frames;
 
     pthread_mutex_lock(&_lock);
 

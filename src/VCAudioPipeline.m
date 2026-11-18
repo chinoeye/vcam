@@ -211,6 +211,7 @@ static OSStatus VCPipeInputProc(AudioConverterRef cvt,
     _readPos = 0;
     _count = 0;
     _decodedMaterialSeconds = 0.0;
+    _skipUntilSeconds = 0.0;
     _probeData = nil;
     _probeFrames = 0;
     _srcCarry = nil;
@@ -346,55 +347,26 @@ static OSStatus VCPipeInputProc(AudioConverterRef cvt,
     size_t cap  = (size_t)(dstRate / 2);
     if (want > cap) want = cap;
 
-    // ---- 音画对齐：只在启动时做一次 ----
+    // ---- 音画对齐：丢弃数据，不 seek ----
     //
-    //  为什么不需要持续校正：
+    //  以前用 seekAudioToTime 对齐，代价太大：
+    //    seek 要重建 reader → 必须清空环形缓冲 → 实时线程欠载 299ms。
+    //    这段静音在抖音那边照样按 1024 帧/21ms 消费，
+    //    等于音频内容凭空少了 299ms → 之后音画永远差 299ms。
     //
-    //      播放位置 = _decodedMaterialSeconds − buffered
-    //
-    //  水位控制在填缓冲时，_decodedMaterialSeconds 和 buffered 同步增长，
-    //  播放位置保持不变。所以只要「启动时」让音频从视频当前位置开始，
-    //  之后两边就自然同步 —— 不需要反复 seek。
-    //
-    //  以前每轮都比对一次再 seek，每次 seek 都清空缓冲：
-    //    ① 缓冲清空 → buffered 变 0 → target 跳变 → 立刻又要 seek
-    //    ② 异步 seek 还没生效 → 读到的是旧位置 → 位置对不上 → 再 seek
-    //    两次叠加就是死循环，实测 634 次欠载 / 13.5 秒静音。
-    //
-    //  现在：只对齐一次；偏差超过 5 秒（文件级异常）才重新对齐。
+    //  现在改成「照常解码，但把对齐点之前的数据丢掉」：
+    //    · reader 不重建 → 不卡顿
+    //    · 缓冲不清空 → 不欠载
+    //    · 丢完数据后 _decodedMaterialSeconds 落在正确位置
     {
-        static double sAlignedAtVideoT = -1.0;
-        static double sLastRealign = 0.0;
-
-        double videoT = [[VCFrameSource shared] currentVideoSourceTime];
-        if (videoT > 0.5) {
-            double now = CFAbsoluteTimeGetCurrent();
-            BOOL needAlign = NO;
-            double alignTo = videoT;
-
-            if (sAlignedAtVideoT < 0) {
-                needAlign = YES;          // 第一次：启动对齐
-            } else {
-                // 估算当前播放位置
-                pthread_mutex_lock(&_lock);
-                double buffered = (_dstFormat.mSampleRate > 0)
-                                ? (double)_count / _dstFormat.mSampleRate : 0.0;
-                pthread_mutex_unlock(&_lock);
-                double playPos = _decodedMaterialSeconds - buffered;
-                double drift = playPos - videoT;
-                if (fabs(drift) > 5.0 && (now - sLastRealign) > 30.0) {
-                    needAlign = YES;      // 只有极端偏差才重新对齐
-                    sLastRealign = now;
-                    alignTo = videoT;
-                }
-            }
-
-            if (needAlign) {
-                sAlignedAtVideoT = alignTo;
-                _seekCount++;
-                VCLog(@"音频对齐 #%d：启动对齐到 %.2fs（视频当前 %.2fs）",
-                      _seekCount, alignTo, videoT);
-                [self seekAudioToTime:alignTo];
+        static BOOL sAlignedOnce = NO;
+        if (!sAlignedOnce) {
+            double videoT = [[VCFrameSource shared] currentVideoSourceTime];
+            if (videoT > 0.3) {
+                sAlignedOnce = YES;
+                _skipUntilSeconds = videoT;
+                VCLog(@"音频对齐：丢弃 %.2fs 之前的解码数据（不 seek，缓冲不受影响）",
+                      videoT);
             }
         }
     }
@@ -497,6 +469,25 @@ static OSStatus VCPipeInputProc(AudioConverterRef cvt,
         if (got > 0 && more.length > 0) {
             haveFrames += (size_t)got;
         }
+    }
+
+    // 启动对齐：把目标位置之前的数据读出来丢掉，不写进缓冲
+    if (_skipUntilSeconds > 0 && _decodedMaterialSeconds < _skipUntilSeconds) {
+        size_t availNow = srcData.length / srcBpf;
+        double remainSec = _skipUntilSeconds - _decodedMaterialSeconds;
+        size_t dropFrames = (size_t)(remainSec * _srcFormat.mSampleRate);
+        if (dropFrames > availNow) dropFrames = availNow;
+        if (dropFrames > 0) {
+            _decodedMaterialSeconds += (double)dropFrames / _srcFormat.mSampleRate;
+            VCLog(@"音频对齐：丢弃 %.3fs（位置 %.2fs → 目标 %.2fs）",
+                  (double)dropFrames / _srcFormat.mSampleRate,
+                  _decodedMaterialSeconds, _skipUntilSeconds);
+        }
+        if (_decodedMaterialSeconds >= _skipUntilSeconds - 0.001) {
+            _skipUntilSeconds = 0;
+            VCLog(@"音频对齐完成，之后正常生产");
+        }
+        return;
     }
 
     if (haveFrames == 0) {

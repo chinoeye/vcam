@@ -358,54 +358,20 @@ static OSStatus VCPipeInputProc(AudioConverterRef cvt,
     size_t cap  = (size_t)(dstRate / 2);
     if (want > cap) want = cap;
 
-    // ---- 音画对齐：丢弃数据，不 seek ----
+    // 不做任何音画对齐 —— 靠 VCPrewarmAudioPipeline 预热解决。
     //
-    //  以前用 seekAudioToTime 对齐，代价太大：
-    //    seek 要重建 reader → 必须清空环形缓冲 → 实时线程欠载 299ms。
-    //    这段静音在抖音那边照样按 1024 帧/21ms 消费，
-    //    等于音频内容凭空少了 299ms → 之后音画永远差 299ms。
+    //  这里曾经有三套对齐机制（闭环校正 / seek 对齐 / 丢弃对齐），
+    //  每一套都会破坏数据流：
+    //    · seek  → 清空缓冲 → 静音 299ms → 音频落后
+    //    · 丢弃  → AVAssetReader 一次返回好几秒，一次循环就丢过头
+    //             （实测丢了 18.5 秒，音频直接短循环）
+    //    · 速率  → 重复/丢弃样本 = 变调，音色不对
     //
-    //  现在改成「照常解码，但把对齐点之前的数据丢掉」：
-    //    · reader 不重建 → 不卡顿
-    //    · 缓冲不清空 → 不欠载
-    //    · 丢完数据后 _decodedMaterialSeconds 落在正确位置
-    {
-        static BOOL sAlignedOnce = NO;
-        double videoT = [[VCFrameSource shared] currentVideoSourceTime];
-        if (!sAlignedOnce && videoT > 0.3) {
-            sAlignedOnce = YES;
-            _startPlaySeconds = videoT;
-            _skipUntilSeconds = videoT;
-            VCLog(@"音频对齐：起点 %.2fs，丢弃此前的解码数据", videoT);
-        } else if (sAlignedOnce && _startPlaySeconds >= 0) {
-            // 播放位置 = 起点 + 已请求的帧数（含静音段）
-            double playPos = _startPlaySeconds
-                           + (double)_requestedFrames / _dstFormat.mSampleRate;
+    //  唯一正确的做法是不让偏差产生：App 启动时预热管道，
+    //  录制第一帧就有真实数据。数据流永远 1:1，一点不改。
+    //  偏差只记录到报告里供诊断，不参与任何处理。
 
-            pthread_mutex_lock(&_lock);
-            double buffered = (_dstFormat.mSampleRate > 0)
-                            ? (double)_count / _dstFormat.mSampleRate : 0.0;
-            pthread_mutex_unlock(&_lock);
 
-            // 音频数据位置应该落在 playPos + buffered 附近
-            double expected = playPos + buffered;
-            double err = expected - _decodedMaterialSeconds;
-
-            // 只记录偏差，交给 produceFrames 用「微调速率」慢慢收敛。
-            //
-            //  以前这里直接 _skipUntilSeconds = expected 丢弃整段，
-            //  丢弃期间没有数据产出 → 缓冲空 → 静音 1941ms → 更落后，
-            //  形成「越修越差」的循环。
-            _playError = err;
-            static double sLastLog = 0;
-            double now = CFAbsoluteTimeGetCurrent();
-            if (fabs(err) > 0.3 && (now - sLastLog) > 3.0) {
-                sLastLog = now;
-                VCLog(@"音频偏差监测：%+.0fms（播放 %.2fs / 视频 %.2fs / 应解码 %.2fs / 实际 %.2fs）",
-                      err * 1000, playPos, videoT, expected, _decodedMaterialSeconds);
-            }
-        }
-    }
 
     // ---- 不做「音画时间比对」用于别的目的 ----
     //
@@ -507,31 +473,9 @@ static OSStatus VCPipeInputProc(AudioConverterRef cvt,
         }
     }
 
-    // 启动对齐：把目标位置之前的数据读出来丢掉。
-    //
-    //  两个关键点，上一版都写错了：
-    //    ① 记账必须用「实际消费的帧数」（availNow），不是「想丢的帧数」。
-    //       写 dropFrames 会让 _decodedMaterialSeconds 少算，
-    //       位置永远追不上目标，于是持续丢弃、持续静音。
-    //    ② 必须在**一次调用内**丢完。跨调用丢的话，每次 return 都让
-    //       实时线程拿不到数据 → 缓冲空 → 闹钟一样的静音，累计好几秒。
-    if (_skipUntilSeconds > 0 && _decodedMaterialSeconds < _skipUntilSeconds) {
-        size_t haveNow = srcData.length / srcBpf;
-        double consumed = (double)haveNow / _srcFormat.mSampleRate;
-        _decodedMaterialSeconds += consumed;
-        int guard = 0;
-        while (_decodedMaterialSeconds < _skipUntilSeconds - 0.001 && guard++ < 400) {
-            CMItemCount got2 = 0;
-            AudioStreamBasicDescription a2 = {0};
-            NSData *more2 = [[VCAudioSource shared] nextPCMWithFrames:&got2 asbd:&a2];
-            if (!more2 || more2.length == 0) break;
-            _decodedMaterialSeconds += (double)got2 / _srcFormat.mSampleRate;
-        }
-        VCLog(@"音频对齐：丢弃完毕，位置 %.2fs（目标 %.2fs，%d 次取块）",
-              _decodedMaterialSeconds, _skipUntilSeconds, guard);
-        _skipUntilSeconds = 0;
-        return;
-    }
+    // （已删除启动丢弃逻辑：它会一次丢掉好几秒数据，导致音频短循环）
+
+
 
     if (haveFrames == 0) {
         _starved++;

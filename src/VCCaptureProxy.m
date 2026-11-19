@@ -62,7 +62,9 @@ static NSLock *VCProxyLock(void)
     double _srcBudget;             // 已废弃，保留字段
     double _playStartTime;         // 开始播放的绝对时刻（PTS 对齐用）
     double _playStartPos;          // 开始播放时素材所在位置（秒）
-    double _lastFetchTime;         // 上次实际出帧的绝对时刻（硬限速用）
+    double _lastFetchTime;         // 已废弃
+    double _quotaStart;            // 当前配额窗口起点（秒）
+    uint32_t _quotaFetched;        // 本窗口已出帧数
     uint64_t _srcFetched;          // 实际从素材取了几个新帧（诊断）
 }
 
@@ -294,89 +296,51 @@ static NSLock *VCProxyLock(void)
         }
     } else {
 
-        // ---- 硬限速：每帧至少间隔 frameDur 才出 ----
+        // ---- 每秒配额限速 ----
         //
-        //  前面所有「按请求节奏推断」的算法都失败，诊断日志给出了确切原因：
-        //    抖音请求 56.9fps（间隔 17.5ms），素材 30fps（一帧 33.3ms）。
-        //    只要每次请求都取一帧，素材就按 56.9×33.3ms = 1.9 秒/秒 消耗，
-        //    视频必然比音频跑得快一倍。
+        //  前面试过的所有做法都基于「和真实时间对齐」，但抖音的请求节奏
+        //  本身不均匀（稳定段 15~20ms，偶发 300ms、680ms 空档），
+        //  一旦按真实时间补帧，素材就被拽到前面去，而且真实时间不能回退，
+        //  结果视频比音频快一倍。
         //
-        //  「追到 target 就停」这个判据本身没错，但 target 按真实时间涨 17.5ms，
-        //  而取一帧 curPos 就跳 33.3ms —— 目标步长比时间步长还大，
-        //  于是每 1.5 次请求必然触发一次取帧，等于没限速。
+        //  改用最简单的配额：**每一秒最多出 sourceFps 帧**。
+        //  和请求频率、请求节奏、真实时间全部解耦。
+        //  一秒内请求再密，第 N 帧之后一律复用；请求稀疏就自然少出几帧。
         //
-        //  真正有效的约束是：**两次出帧之间必须至少隔 frameDur 真实时间**。
-        //  这条约束和请求频率完全解耦：
-        //    请求再密，出帧也不会快于素材帧率；
-        //    请求稀疏时靠后面的追赶逻辑补齐。
+        //  代价是长时间下极慢的漂移（因为用的是固定秒长），
+        //  但一秒内不会超过素材帧率，所以不会出现「快一倍」这种量级的错位。
         CGFloat fps = [VCFrameSource shared].sourceFrameRate;
-        double frameDur = (fps > 1.0) ? (1.0 / fps) : (1.0 / 30.0);
+        if (fps < 1.0) fps = 30.0;
         double now = CACurrentMediaTime();
-        double curPos = [VCFrameSource shared].currentVideoSourceTime;
 
-        if (_playStartTime <= 0) {
-            _playStartTime = now;
-            _playStartPos = curPos;
-        }
-        double target = _playStartPos + (now - _playStartTime);
-        if (target - curPos > 5.0) {          // 素材回绕后重新对齐基准
-            _playStartTime = now;
-            _playStartPos = curPos;
-            target = curPos;
+        if (_quotaStart <= 0 || (now - _quotaStart) >= 1.0) {
+            _quotaStart = now;
+            _quotaFetched = 0;
         }
 
-        int fetched = 0;
+        BOOL quotaOK = (_quotaFetched < (uint32_t)fps);
 
-        // 硬限速：距上次出帧不足 frameDur 就不推进
-        BOOL rateOK = (_lastFetchTime <= 0) || ((now - _lastFetchTime) >= frameDur * 0.98);
-
+        CVPixelBufferRef newPB = NULL;
         if (!_lastSrcPB) {
-            CVPixelBufferRef nb = [[VCFrameSource shared] copyNextPixelBuffer];
-            if (nb) {
-                _lastSrcPB = CVPixelBufferRetain(nb);
-                CVPixelBufferRelease(nb);
-                _lastFetchTime = now;
-                fetched = 1;
-                curPos = [VCFrameSource shared].currentVideoSourceTime;   // 必须同步
-            }
-        } else if (rateOK && curPos < target - frameDur * 0.5) {
-            CVPixelBufferRef nb = [[VCFrameSource shared] copyNextPixelBuffer];
-            if (nb) {
-                CVPixelBufferRelease(_lastSrcPB);
-                _lastSrcPB = CVPixelBufferRetain(nb);
-                CVPixelBufferRelease(nb);
-                _lastFetchTime = now;
-                fetched = 1;
-                // 上一版漏了这一行：取了新帧却不更新 curPos，
-                // 于是「落后」永远显得很大，限速判据被架空。
-                curPos = [VCFrameSource shared].currentVideoSourceTime;
-            }
+            newPB = [[VCFrameSource shared] copyNextPixelBuffer];
+        } else if (quotaOK) {
+            newPB = [[VCFrameSource shared] copyNextPixelBuffer];
         }
 
-        // 严重落后时才连续补帧。阈值从 1.0 秒收紧到 0.25 秒：
-        //  上一版用 1 秒，日志里出现一次补 91 帧（推了 3 秒素材），
-        //  瞬间把视频甩到前面，之后又长时间不动，反而更糟。
-        if (curPos < target - 0.25) {
-            int guard = 0;
-            while (guard++ < 12) {          // 最多补 12 帧 = 0.4 秒
-                CVPixelBufferRef nb = [[VCFrameSource shared] copyNextPixelBuffer];
-                if (!nb) break;
-                CVPixelBufferRelease(_lastSrcPB);
-                _lastSrcPB = CVPixelBufferRetain(nb);
-                CVPixelBufferRelease(nb);
-                fetched++;
-                curPos = [VCFrameSource shared].currentVideoSourceTime;
-                if (curPos >= target - frameDur * 0.5) break;
-            }
-            _lastFetchTime = CACurrentMediaTime();
+        if (newPB) {
+            if (_lastSrcPB) CVPixelBufferRelease(_lastSrcPB);
+            _lastSrcPB = CVPixelBufferRetain(newPB);
+            CVPixelBufferRelease(newPB);
+            _quotaFetched++;
         }
 
         {
             static int sDbg = 0;
-            if (sDbg < 25) {
+            if (sDbg < 20) {
                 sDbg++;
-                VCLog(@"出帧 #%d 落后=%+.3fs 取=%d 限速=%@ curPos=%.3f",
-                      sDbg, target - curPos, fetched, rateOK ? @"Y" : @"N", curPos);
+                VCLog(@"出帧 #%d 本秒已出=%u/%.0f 配额=%@ 素材位置=%.3f",
+                      sDbg, _quotaFetched, fps, quotaOK ? @"可用" : @"已满",
+                      [VCFrameSource shared].currentVideoSourceTime);
             }
         }
 

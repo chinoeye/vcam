@@ -293,56 +293,6 @@ static NSLock *VCProxyLock(void)
             CFRelease(sb);
         }
     } else {
-        // 按素材帧率节流。
-        //
-        //  抖音的 AVCaptureVideoDataOutput 按 60fps 回调，而素材是 30fps。
-        //  以前每次回调都推进一帧素材 → 15 秒录制消耗 30 秒素材
-        //  （实测视频位置 29.93s vs 音频 17.00s，差一整个录制时长）。
-        //  这里缓存上一帧，没到间隔就复用，让视频消耗速度和音频一致。
-        // 累积式节流：用「下一帧的绝对时刻」而不是「距上次多久」。
-        //
-        //  为什么必须改：
-        //    之前用 (now - _lastSrcTime) < minInterval * 0.85 判据。
-        //    素材 60fps → minInterval 16.67ms，阈值 14.2ms；
-        //    而抖音请求间隔实测 14ms —— 每次都刚好挤进阈值，每次都出帧，
-        //    结果消耗 71.6fps（1.19 倍），音画还是差 3.35 秒。
-        //
-        //  累积式判据每 minInterval 只放行一帧，不管请求多密，
-        //  消耗严格等于素材帧率 → 视频和音频都是实时 1:1。
-        // ---- 素材 PTS 对齐实时时钟 ----
-        //
-        //  前面试过三种「按请求节奏节流」的做法，都不稳：
-        //    单次间隔判断    80 fps（1.33 倍）
-        //    累积预算钳 1 帧  54.9 fps
-        //    累积预算容差     49~52 fps
-        //
-        //  根本原因是抖音的请求频率本身在动（实测 99~120fps 之间漂），
-        //  而且请求间隔不均匀，任何「基于请求间隔」的算法都会被带偏。
-        //
-        //  改成以真实时间为准：
-        //    记下开始播放的时刻和当时的素材位置，
-        //    之后每来一次请求就检查「素材位置是否跟上真实时间」，
-        //    落后超过半帧才推进 reader。
-        //  这样素材位置的推进速度严格等于真实时间 1:1，
-        //  跟抖音怎么请求完全无关。
-        CGFloat fps = [VCFrameSource shared].sourceFrameRate;
-        double frameDur = (fps > 1.0) ? (1.0 / fps) : (1.0 / 30.0);
-        double now = CACurrentMediaTime();
-        double curPos = [VCFrameSource shared].currentVideoSourceTime;
-
-        if (_playStartTime <= 0) {
-            // 首次：以当前素材位置为基准
-            _playStartTime = now;
-            _playStartPos = curPos;
-        }
-
-        double target = _playStartPos + (now - _playStartTime);
-        // 素材循环回绕时 target 会跑过素材长度，就地重置基准，避免一直落后
-        if (target - curPos > 5.0) {
-            _playStartTime = now;
-            _playStartPos = curPos;
-            target = curPos;
-        }
 
         // ---- 硬限速：每帧至少间隔 frameDur 才出 ----
         //

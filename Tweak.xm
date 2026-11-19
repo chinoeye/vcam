@@ -1278,6 +1278,16 @@ static NSString *VCRunAudioDiagnosis(void)
         [out appendFormat:@"视频 seek 校正: %d 次  (音画对齐改写过视频读指针)\n",
             g_vcVideoSeekCount];
         [out appendFormat:@"素材时长      : %.2f s\n", [VCFrameSource shared].assetDuration];
+        // 录完之后预览会继续推帧，所以「当前」偏差会越来越大 —— 那个数不算数。
+        // 这三个才是判据。
+        [out appendFormat:@"录制中最大偏差: %.2f s  (音频在走时采样，超过 0.30 应触发校正)\n",
+            g_vcRecordSyncErrMax];
+        if (g_vcRecordEndVideoPos >= 0.0) {
+            [out appendFormat:@"停录瞬间      : 视频 %.2f s / 音频 %.2f s / 偏差 %+.2f s\n",
+                g_vcRecordEndVideoPos, g_vcRecordEndAudioPos, g_vcRecordEndErr];
+        } else {
+            [out appendString:@"停录瞬间      : (还没录过一轮)\n"];
+        }
         [out appendFormat:@"微调次数      : %llu  (稳定后应停止增长)\n", pipe.tuneBlocks];
         [out appendFormat:@"上次欠载时刻  : %.2f s（录音开始后）\n", pipe.lastUnderrunAt];
         [out appendFormat:@"单次生产最长  : %.0f ms\n", pipe.maxProduceMs];

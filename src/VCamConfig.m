@@ -88,35 +88,85 @@ static NSString *VCJailbreakRoot(void)
     _hideOverlayQuickly = NO;
 }
 
+/// 候选目录是否真的可用（能建、能写）。
+///
+/// 必须真的试写一次，不能只看 fileExistsPath ——
+/// 非越狱 / TrollStore 环境下 /var/mobile 对 App 是只读的，
+/// 路径"看起来存在"但写不进去，直接用作素材目录会导致后面的写入全部静默失败。
+static BOOL VCAssetDirUsable(NSString *p, BOOL createIfMissing,
+                            BOOL *outWasCreated)
+{
+    if (p.length == 0) return NO;
+    NSFileManager *fm = [NSFileManager defaultManager];
+    BOOL isDir = NO;
+
+    if ([fm fileExistsAtPath:p isDirectory:&isDir]) {
+        if (!isDir) return NO;
+    } else {
+        if (!createIfMissing) return NO;
+        NSError *err = nil;
+        if (![fm createDirectoryAtPath:p withIntermediateDirectories:YES
+                            attributes:nil error:&err]) {
+            VCLog(@"素材目录候选不可用：%@（%@）", p,
+                  err.localizedDescription ?: @"创建失败");
+            return NO;
+        }
+        if (outWasCreated) *outWasCreated = YES;
+    }
+
+    // 试写一个探针文件，确认真能落地
+    NSString *probe = [p stringByAppendingPathComponent:@".vc_probe"];
+    BOOL ok = [[NSData data] writeToFile:probe atomically:YES];
+    if (ok) [fm removeItemAtPath:probe error:NULL];
+    return ok;
+}
+
 - (NSString *)resolveAssetDirectory
 {
-    // 优先 /Library/Application Support（App 进程可读，不受沙盒限制）
-    // TrollStore 注入的 dylib 跑在 App 自己的沙盒里，只能碰得到本容器的目录。
-    // 老版本那几条 /var/jb、/var/mobile/Library 的路径在无越狱环境下全部无效。
+    NSMutableArray *candidates = [NSMutableArray array];
+
+    // ① 越狱环境优先：抖音沙盒之外。
     //
-    // 现在统一用 App 自己的 Documents ——
-    // 爱思助手 → 文件管理 → 应用 → 抖音 → Documents，可以直接往里拖素材。
-    // 或者把素材下载到「文件」App 再用爱思搬进来。
+    //   素材是个几百 MB 的成品视频，放在 App 自己的 Documents 里
+    //   （`.../Aweme/Documents/VCam/assets/current.mp4`）是唯一的**文件级**
+    //   痕迹 —— API 层我们已经是原地改写、PTS/attachments 全原生，
+    //   抖音看不出画面来源，唯一能抓的就是这个文件名。
+    //
+    //   /var/mobile/Media 在越狱环境下可读可写（需预建并 chown 给 _installd），
+    //   非越狱时它对 App 只读 —— 下面的探针写会失败，自动降级到 ②，
+    //   所以两种环境都不会因此失效。
+    [candidates addObject:@"/var/mobile/Media/VCamAssets"];
+
+    // ② 非越狱 / TrollStore：只有容器内可写。
+    //
+    //   爱思助手 → 文件管理 → 应用 → 抖音 → Documents，可以直接拖素材进来；
+    //   或者下载到「文件」App 再搬。
     NSString *docs = NSSearchPathForDirectoriesInDomains(NSDocumentDirectory,
                                                          NSUserDomainMask, YES).firstObject;
-    NSMutableArray *candidates = [NSMutableArray array];
     if (docs.length > 0) {
         [candidates addObject:[docs stringByAppendingPathComponent:@"VCam/assets"]];
     }
+    // ③ 最后的兜底
     [candidates addObject:[NSTemporaryDirectory() stringByAppendingPathComponent:@"VCam/assets"]];
 
-    NSFileManager *fm = [NSFileManager defaultManager];
     for (NSString *p in candidates) {
-        BOOL isDir = NO;
-        if ([fm fileExistsAtPath:p isDirectory:&isDir] && isDir) {
+        BOOL created = NO;
+        if (VCAssetDirUsable(p, YES, &created)) {
+            if (![p containsString:@"/Documents/"] && ![p containsString:@"/tmp/"]) {
+                VCLog(@"素材目录：%@（沙盒外，越狱路径）", p);
+            } else {
+                VCLog(@"素材目录：%@（沙盒内）", p);
+            }
             return p;
         }
     }
-    // 都不存在就用第一个并创建
-    NSString *first = candidates.firstObject;
-    [fm createDirectoryAtPath:first withIntermediateDirectories:YES
-                   attributes:nil error:NULL];
-    return first;
+
+    // 全都不行：用 Documents 那条，至少路径是合法的
+    NSString *fallback = candidates.count > 1 ? candidates[1] : candidates.lastObject;
+    [[NSFileManager defaultManager] createDirectoryAtPath:fallback
+                              withIntermediateDirectories:YES attributes:nil error:NULL];
+    VCLog(@"素材目录：%@（兜底）", fallback);
+    return fallback;
 }
 
 /// Documents/VCam/config.plist 里的键优先于 UserDefaults。

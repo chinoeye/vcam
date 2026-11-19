@@ -37,6 +37,14 @@ NS_ASSUME_NONNULL_BEGIN
 /// 设置后会自动重建转换器和环形缓冲；格式没变则什么都不做。
 - (void)setTargetFormat:(AudioStreamBasicDescription)format;
 
+/// 把音频素材对齐到视频当前所在位置。
+///
+/// 场景：预览时音频不被消费（App 没在录），素材音频源一直停在原处；
+/// 用户点录制时视频已经跑到第 29 秒了。不对齐的话音频还从 0 秒起，
+/// 音画对齐就会把画面拽回开头 —— 用户看到的「一点录制就从头开始放」。
+/// 副作用更严重：每场录制都是同一段素材的开头，指纹高度重复。
+- (void)alignToVideoPosition;
+
 /// 启动/停止后台生产线程。素材切换、注入开关都会调用。
 - (void)start;
 - (void)stop;

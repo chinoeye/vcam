@@ -54,6 +54,22 @@ NS_ASSUME_NONNULL_BEGIN
 /// 回到文件开头（切换源、恢复播放时用）
 - (void)rewind;
 
+/// 素材总时长（秒）。0 表示未知 / 还没装载完。
+///
+/// 音画对齐要用它把「累计播放秒数」折回到素材内部位置：
+/// 素材只有 17 秒，长跑起来累计秒数会走到 60、120 —— 不折返就永远对不上。
+@property (nonatomic, readonly) NSTimeInterval assetDuration;
+
+/// 把**视频轨**跳到素材内 t 秒处。
+///
+/// 只动视频 reader：不重置音频 reader、不发 reset 通知、不动播放状态。
+/// 用在音画对齐上 —— 视频读指针必须跟住音频真正播到的位置，
+/// 而不是自己从预览阶段一路跑下去。
+- (void)seekVideoToTime:(NSTimeInterval)t;
+
+/// 视频 seek 校正的累计次数（诊断，定义在 .m 里）。
+extern int g_vcVideoSeekCount;
+
 /// 释放解码器（App 退到后台或关闭注入时调用）
 - (void)teardown;
 

@@ -34,6 +34,7 @@
     uint64_t _audioSamplesRead;      // 已从 reader 读出的样本总数（含被丢弃的）
     double _audioSampleRate;
     NSTimeInterval _assetDuration;   // 素材总时长（秒），音画折返用
+    CVPixelBufferRef _pendingPB;     // seek 探针留下的那一帧，优先返回
 }
 
 - (BOOL)restartVideoReaderLocked;
@@ -145,6 +146,30 @@ static volatile BOOL g_videoSeeking = NO;   // 有 seek 在跑（避免排队）
 
             self->_videoSourceSeconds = t;
             g_vcVideoSeekCount++;
+
+            // 探针：立刻从新 reader 取一帧，确认真的能读。
+            //  以前只看 startReading 的返回值就当成功了，但 startReading 成功
+            //  不等于 copyNextSampleBuffer 能出帧（timeRange 起点越界、reader
+            //  被上层状态拖住都会返回 nil），而外层只看到「位置被赋值了」，
+            //  于是每秒 seek 一次、每秒画面不动 —— 实测就是这个症状。
+            CMSampleBufferRef probe = [self->_videoOutput copyNextSampleBuffer];
+            if (probe) {
+                CMTime pts = CMSampleBufferGetPresentationTimeStamp(probe);
+                double at = CMTIME_IS_VALID(pts) ? CMTimeGetSeconds(pts) : -1.0;
+                // 顺手把这一帧留下来当下一次输出：seek 之后画面要立刻跟上位置，
+                //  否则「位置已经跳过去了、画面还是旧的」会持续一整帧。
+                CVPixelBufferRef pb = CMSampleBufferGetImageBuffer(probe);
+                if (pb) {
+                    if (self->_pendingPB) CVPixelBufferRelease(self->_pendingPB);
+                    self->_pendingPB = CVPixelBufferRetain(pb);
+                }
+                VCLog(@"seek 后取帧正常：目标 %.2f s，首帧 PTS %.3f s", t, at);
+                CFRelease(probe);
+            } else {
+                VCLog(@"seek 后取帧失败：目标 %.2f s，status=%ld，error=%@",
+                      t, (long)self->_videoReader.status,
+                      self->_videoReader.error.localizedDescription ?: @"无");
+            }
 
             // 注意：这里**不碰音频 reader**。
             // restartVideoReaderLocked 会把音频一起拉回 0，那是「素材回绕」的语义；
@@ -335,13 +360,28 @@ static volatile BOOL g_videoSeeking = NO;   // 有 seek 在跑（避免排队）
 // 我们只负责把像素换掉。
 - (CVPixelBufferRef)copyNextPixelBuffer
 {
-    if (!_ready || VCamConfig.shared.paused) return NULL;
+    if (!_ready) {
+        static int sNoReady = 0;
+        if (sNoReady++ < 3) VCLog(@"取帧失败：帧源未就绪（_ready=NO）");
+        return NULL;
+    }
+    if (VCamConfig.shared.paused) return NULL;
 
     CVPixelBufferRef result = NULL;
     // tryLock 而不是 lock：后台正在 seek 时不能把采集线程挂在这儿等。
     //  拿不到锁就返回 NULL，上层复用上一帧继续输出，画面最多停一两帧。
-    if (![_lock tryLock]) return NULL;
+    if (![_lock tryLock]) {
+        static int sBusy = 0;
+        if (sBusy++ < 3) VCLog(@"取帧失败：帧源锁被后台 seek 占用");
+        return NULL;
+    }
     @try {
+        // seek 刚留下的那一帧优先输出：位置已经跳到目标，画面必须立刻跟上
+        if (_pendingPB) {
+            result = _pendingPB;
+            _pendingPB = NULL;
+            return result;
+        }
         for (int attempt = 0; attempt < 2 && !result; attempt++) {
             if (!_videoReader || _videoReader.status != AVAssetReaderStatusReading) {
                 if (![self restartVideoReaderLocked]) break;
@@ -674,6 +714,7 @@ int g_vcSeekCount = 0;
     _currentURL = nil;
     _ready = NO;
     _frameCount = 0;
+    if (_pendingPB) { CVPixelBufferRelease(_pendingPB); _pendingPB = NULL; }
 }
 
 - (void)notify:(NSString *)status

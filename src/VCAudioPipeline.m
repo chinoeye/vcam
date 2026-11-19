@@ -200,6 +200,9 @@ static OSStatus VCPipeInputProc(AudioConverterRef cvt,
     if (same) return;
 
     BOOL wasRunning = _running;
+    // 重建前先记一笔：这个管道有没有真的被消费过。
+    //  没被消费过 = 现在还是「预热期」，重建就等于重新起跑，素材读指针要一起拨回 0。
+    BOOL everConsumed = (_consumed > 0);
     [self stop];
 
     // 清空所有状态
@@ -251,6 +254,25 @@ static OSStatus VCPipeInputProc(AudioConverterRef cvt,
           (unsigned)_dstFormat.mBitsPerChannel, (unsigned)_dstFormat.mBytesPerFrame);
 
     pthread_mutex_unlock(&_lock);
+
+    // ★ 第 16 版：把素材读指针也拨回 0。
+    //
+    //  病灶在这里：bootstrap 时管道先用默认格式（48000）预热，从素材 0 秒
+    //  解了 2.18 秒压在环形缓冲里。录制开始时真实格式（44100）到了，
+    //  上面把 _decodedMaterialSeconds 归零、缓冲重建 —— 但**音频源自己的
+    //  读指针还停在素材 2.18 秒处**。
+    //
+    //  结果是：管道以为自己在 0 秒，实际吐出来的是素材第 2 秒的声音；
+    //  音画对齐又忠实按「音频位置 0」把画面拉到 0 —— 于是画面 0 秒配声音 2 秒，
+    //  恒定错 2 秒，而且怎么调都不动。
+    //
+    //  实测铁证（IMG_1091.MOV，v15）：全速率扫描在速率 1.00 处给出
+    //  相关峰 +0.69（其它档只有 0.017），对应素材位置 **1.96 s** ——
+    //  速率完全正确，只是整体偏移了预热那两秒。
+    if (!everConsumed) {
+        [[VCAudioSource shared] seekToTime:0.0];
+        VCLog(@"音频管道：重建（尚未消费过），素材读指针拨回 0");
+    }
 
     if (!_ring) {
         VCLog(@"音频管道：环形缓冲分配失败");

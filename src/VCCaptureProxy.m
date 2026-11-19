@@ -337,6 +337,7 @@ static NSLock *VCProxyLock(void)
                 CVPixelBufferRelease(nb);
                 _lastFetchTime = now;
                 fetched = 1;
+                curPos = [VCFrameSource shared].currentVideoSourceTime;   // 必须同步
             }
         } else if (rateOK && curPos < target - frameDur * 0.5) {
             CVPixelBufferRef nb = [[VCFrameSource shared] copyNextPixelBuffer];
@@ -346,13 +347,18 @@ static NSLock *VCProxyLock(void)
                 CVPixelBufferRelease(nb);
                 _lastFetchTime = now;
                 fetched = 1;
+                // 上一版漏了这一行：取了新帧却不更新 curPos，
+                // 于是「落后」永远显得很大，限速判据被架空。
+                curPos = [VCFrameSource shared].currentVideoSourceTime;
             }
         }
 
-        // 严重落后（超过 1 秒）时允许连续补帧，避免长时间卡在一个位置
-        if (curPos < target - 1.0) {
+        // 严重落后时才连续补帧。阈值从 1.0 秒收紧到 0.25 秒：
+        //  上一版用 1 秒，日志里出现一次补 91 帧（推了 3 秒素材），
+        //  瞬间把视频甩到前面，之后又长时间不动，反而更糟。
+        if (curPos < target - 0.25) {
             int guard = 0;
-            while (guard++ < 90) {
+            while (guard++ < 12) {          // 最多补 12 帧 = 0.4 秒
                 CVPixelBufferRef nb = [[VCFrameSource shared] copyNextPixelBuffer];
                 if (!nb) break;
                 CVPixelBufferRelease(_lastSrcPB);
@@ -360,6 +366,7 @@ static NSLock *VCProxyLock(void)
                 CVPixelBufferRelease(nb);
                 fetched++;
                 curPos = [VCFrameSource shared].currentVideoSourceTime;
+                if (curPos >= target - frameDur * 0.5) break;
             }
             _lastFetchTime = CACurrentMediaTime();
         }

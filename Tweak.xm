@@ -1043,8 +1043,8 @@ static void VCBootstrap(void)
 
         // 静默模式：注入没开就完全不碰素材、不连实时源、不解码。
         if (VCInjectionActive()) {
-            VCRemoteLog(@"bootstrap: asset=%@ host=%@:%u src=%ld inject=%d",
-                        cfg.assetName, cfg.liveHost, cfg.httpPort,
+            VCRemoteLog(@"bootstrap: asset=%@ dir=%@ host=%@:%u src=%ld inject=%d",
+                        cfg.assetName, [cfg assetDirectory], cfg.liveHost, cfg.httpPort,
                         (long)cfg.sourceKind, cfg.injectEnabled);
 
             // 实时源先连上，跟素材下载互不干扰

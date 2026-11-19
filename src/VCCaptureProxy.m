@@ -312,7 +312,6 @@ static NSLock *VCProxyLock(void)
         //  容差 0.15 秒用于吸收第一帧的起始位差和定时抖动。
         CGFloat fps = [VCFrameSource shared].sourceFrameRate;
         if (fps < 1.0) fps = 30.0;
-        double frameDur = 1.0 / fps;
         double now = CACurrentMediaTime();
         double curPos = [VCFrameSource shared].currentVideoSourceTime;
 

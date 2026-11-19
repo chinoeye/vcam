@@ -326,6 +326,15 @@ static NSLock *VCProxyLock(void)
         }
         _lastSrcTime = now;
 
+        // 上限放宽到 3 帧的量。
+        //
+        //  之前钳在 1 帧（16.67ms）：抖音的请求间隔并不均匀，
+        //  多数 8.33ms、偶尔 30~50ms。那次攒下的时间被钳掉，
+        //  长期平均就只有 52.2fps（该 60）。
+        //  放宽到 3 帧既能吸收抖动，又不至于卡顿后一次性爆发太多帧。
+        double cap = minInterval * 3.0;
+        if (_srcBudget > cap) _srcBudget = cap;
+
         // 用 92% 的阈值而不是 100%。
         //
         //  抖音的请求间隔是 8.33ms 的整数倍，两次累加得 16.66ms，
@@ -355,8 +364,7 @@ static NSLock *VCProxyLock(void)
             //
             //  允许负值，亏损才会在下一轮被自然补回来，长期平均严格 1:1。
             _srcBudget -= minInterval;
-            if (_srcBudget < -minInterval) _srcBudget = -minInterval;  // 只防极端
-            if (_srcBudget > minInterval) _srcBudget = minInterval;
+            if (_srcBudget < -minInterval) _srcBudget = -minInterval;
         }
 
         if (takeNew) {

@@ -508,7 +508,18 @@ double g_vcRecordEndErr      = 0.0;   // 停录瞬间的偏差
     }
 
     if (!src) {
-        // 帧源暂时空（素材没加载好、实时源断线），丢帧而不是透传真画面
+        // 素材还没装载好 → 透传系统给的原始帧，绝不能丢。
+        //
+        //  丢帧的后果实测过：进录制页时素材还在下载，帧源返回 NULL，
+        //  这里 dropOut=YES 把每一帧都丢掉 → App 拿不到任何画面 → 黑屏 →
+        //  系统 watchdog 直接把抖音杀掉（"进入录制页黑屏闪退"）。
+        //
+        //  素材就绪之后的「暂时空」仍然丢帧 —— 那时透传会把真实摄像头画面
+        //  放出去，那是另一类问题。
+        if (![VCFrameSource shared].isReady) {
+            if (dropOut) *dropOut = NO;
+            return;
+        }
         if (dropOut) *dropOut = YES;
         return;
     }

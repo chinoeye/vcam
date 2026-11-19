@@ -59,7 +59,9 @@ static NSLock *VCProxyLock(void)
     CVPixelBufferRef _lastSrcPB;   // 上一帧源数据，用于按素材帧率节流
     double _lastSrcTime;           // 上次出帧时刻
     double _nextFrameTime;         // 下一帧允许出的绝对时刻（已废弃，保留字段）
-    double _srcBudget;             // 视频出帧时间预算（秒），累计式节流
+    double _srcBudget;             // 已废弃，保留字段
+    double _playStartTime;         // 开始播放的绝对时刻（PTS 对齐用）
+    double _playStartPos;          // 开始播放时素材所在位置（秒）
     uint64_t _srcFetched;          // 实际从素材取了几个新帧（诊断）
 }
 
@@ -306,71 +308,51 @@ static NSLock *VCProxyLock(void)
         //
         //  累积式判据每 minInterval 只放行一帧，不管请求多密，
         //  消耗严格等于素材帧率 → 视频和音频都是实时 1:1。
-        double now = CACurrentMediaTime();
+        // ---- 素材 PTS 对齐实时时钟 ----
+        //
+        //  前面试过三种「按请求节奏节流」的做法，都不稳：
+        //    单次间隔判断    80 fps（1.33 倍）
+        //    累积预算钳 1 帧  54.9 fps
+        //    累积预算容差     49~52 fps
+        //
+        //  根本原因是抖音的请求频率本身在动（实测 99~120fps 之间漂），
+        //  而且请求间隔不均匀，任何「基于请求间隔」的算法都会被带偏。
+        //
+        //  改成以真实时间为准：
+        //    记下开始播放的时刻和当时的素材位置，
+        //    之后每来一次请求就检查「素材位置是否跟上真实时间」，
+        //    落后超过半帧才推进 reader。
+        //  这样素材位置的推进速度严格等于真实时间 1:1，
+        //  跟抖音怎么请求完全无关。
         CGFloat fps = [VCFrameSource shared].sourceFrameRate;
-        double minInterval = (fps > 1.0) ? (1.0 / fps) : (1.0 / 30.0);
+        double frameDur = (fps > 1.0) ? (1.0 / fps) : (1.0 / 30.0);
+        double now = CACurrentMediaTime();
+        double curPos = [VCFrameSource shared].currentVideoSourceTime;
 
-        // 真正的累积预算：把流逝的时间攒起来，够一帧才放行。
-        //
-        //  上一版用 _nextFrameTime = now + minInterval（取帧后重置计时器），
-        //  这是「重置式」而不是累积式：抖音的请求间隔有抖动，
-        //  只要某次落在了 16.67ms 之后，就整帧放行，
-        //  而重置又把后面本该复用的一次机会吃掉了。
-        //  实测结果是 1216 帧 / 15.2 秒 = 80fps，仍是 1.33 倍消耗。
-        //
-        //  累积式不受抖动影响：时间一直在累加，够 16.67ms 才消费一次，
-        //  长期平均严格等于素材帧率。
-        if (_lastSrcTime > 0) {
-            double dt = now - _lastSrcTime;
-            if (dt > 0 && dt < 1.0) _srcBudget += dt;   // 卡顿超过 1 秒不累积
+        if (_playStartTime <= 0) {
+            // 首次：以当前素材位置为基准
+            _playStartTime = now;
+            _playStartPos = curPos;
         }
-        _lastSrcTime = now;
 
-        // 上限放宽到 3 帧的量。
-        //
-        //  之前钳在 1 帧（16.67ms）：抖音的请求间隔并不均匀，
-        //  多数 8.33ms、偶尔 30~50ms。那次攒下的时间被钳掉，
-        //  长期平均就只有 52.2fps（该 60）。
-        //  放宽到 3 帧既能吸收抖动，又不至于卡顿后一次性爆发太多帧。
-        double cap = minInterval * 3.0;
-        if (_srcBudget > cap) _srcBudget = cap;
-
-        // 用 92% 的阈值而不是 100%。
-        //
-        //  抖音的请求间隔是 8.33ms 的整数倍，两次累加得 16.66ms，
-        //  而 minInterval 是 16.666...ms —— 差 0.006ms 就判为「不够」，
-        //  这一帧被吞掉，下次要等三次累加（25ms）才放行。
-        //  实测就是 834 帧 / 15.2 秒 = 54.9fps，不到素材的 60fps，画面一顿一顿。
-        //
-        //  阈值取 92%（15.33ms）后，两次累加稳定放行，
-        //  输出严格 60fps；累积预算仍然保证长期平均不漂移（超出部分会被减掉）。
-        // 容差 5%：请求间隔是 8.33ms 的整数倍，两次累加 16.66ms，
-        // 而 minInterval 是 16.666ms，差 0.006ms 就误判。
-        // 取 95%（15.83ms）能稳定放行两次，输出 60fps。
-        double threshold = minInterval * 0.95;
+        double target = _playStartPos + (now - _playStartTime);
+        // 素材循环回绕时 target 会跑过素材长度，就地重置基准，避免一直落后
+        if (target - curPos > 5.0) {
+            _playStartTime = now;
+            _playStartPos = curPos;
+            target = curPos;
+        }
 
         BOOL takeNew = NO;
         if (!_lastSrcPB) {
             takeNew = YES;
-            _srcBudget = 0;
-        } else if (_srcBudget >= threshold) {
-            takeNew = YES;
-            // 关键：扣完整间隔后允许预算为负。
-            //
-            //  上一版写了 if (_srcBudget < 0) _srcBudget = 0，
-            //  于是「按 15.33ms 放行、扣 16.67ms」产生的 1.34ms 亏欠被抹掉，
-            //  每次都要重新攒满阈值 —— 净效果是越跑越慢，
-            //  实测 49.4fps（比不加容差时的 54.9 还低），视频落后音频 2.68 秒。
-            //
-            //  允许负值，亏损才会在下一轮被自然补回来，长期平均严格 1:1。
-            _srcBudget -= minInterval;
-            if (_srcBudget < -minInterval) _srcBudget = -minInterval;
+        } else if (curPos < target - frameDur * 0.5) {
+            takeNew = YES;              // 落后超过半帧，推进 reader
         }
 
         if (takeNew) {
             src = [[VCFrameSource shared] copyNextPixelBuffer];
             if (src) {
-                _srcFetched++;
                 if (_lastSrcPB) CVPixelBufferRelease(_lastSrcPB);
                 _lastSrcPB = CVPixelBufferRetain(src);
             } else {

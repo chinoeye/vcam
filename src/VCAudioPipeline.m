@@ -881,6 +881,16 @@ static OSStatus VCPipeInputProc(AudioConverterRef cvt,
 
 - (double)lastUnderrunAt { return _lastUnderrunAt; }
 - (double)decodedMaterialSeconds { return _decodedMaterialSeconds; }
+
+- (double)playedSeconds
+{
+    // 取走的帧数 ÷ 输出采样率 = 真正播出去的时长。单调递增，不受缓冲深度抖动影响。
+    pthread_mutex_lock(&_lock);
+    uint64_t c = _consumed;
+    Float64 r = _dstFormat.mSampleRate;
+    pthread_mutex_unlock(&_lock);
+    return r > 0 ? (double)c / (double)r : 0.0;
+}
 - (double)videoSourceSeconds { return [[VCFrameSource shared] currentVideoSourceTime]; }
 - (uint64_t)tuneBlocks { return _tuneBlocks; }
 - (uint64_t)silentNoRing { return _silentNoRing; }

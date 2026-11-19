@@ -335,7 +335,10 @@ static NSLock *VCProxyLock(void)
         //
         //  阈值取 92%（15.33ms）后，两次累加稳定放行，
         //  输出严格 60fps；累积预算仍然保证长期平均不漂移（超出部分会被减掉）。
-        double threshold = minInterval * 0.92;
+        // 容差 5%：请求间隔是 8.33ms 的整数倍，两次累加 16.66ms，
+        // 而 minInterval 是 16.666ms，差 0.006ms 就误判。
+        // 取 95%（15.83ms）能稳定放行两次，输出 60fps。
+        double threshold = minInterval * 0.95;
 
         BOOL takeNew = NO;
         if (!_lastSrcPB) {
@@ -343,9 +346,17 @@ static NSLock *VCProxyLock(void)
             _srcBudget = 0;
         } else if (_srcBudget >= threshold) {
             takeNew = YES;
-            _srcBudget -= minInterval;          // 仍按完整间隔扣，保持长期 1:1
-            if (_srcBudget < 0) _srcBudget = 0;
-            if (_srcBudget > minInterval) _srcBudget = minInterval;  // 不积压
+            // 关键：扣完整间隔后允许预算为负。
+            //
+            //  上一版写了 if (_srcBudget < 0) _srcBudget = 0，
+            //  于是「按 15.33ms 放行、扣 16.67ms」产生的 1.34ms 亏欠被抹掉，
+            //  每次都要重新攒满阈值 —— 净效果是越跑越慢，
+            //  实测 49.4fps（比不加容差时的 54.9 还低），视频落后音频 2.68 秒。
+            //
+            //  允许负值，亏损才会在下一轮被自然补回来，长期平均严格 1:1。
+            _srcBudget -= minInterval;
+            if (_srcBudget < -minInterval) _srcBudget = -minInterval;  // 只防极端
+            if (_srcBudget > minInterval) _srcBudget = minInterval;
         }
 
         if (takeNew) {

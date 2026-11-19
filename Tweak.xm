@@ -378,13 +378,24 @@ static OSStatus hook_AudioUnitSetProperty(AudioUnit unit,
         data && size == sizeof(AudioStreamBasicDescription)) {
         AudioStreamBasicDescription asbd =
             *(const AudioStreamBasicDescription *)data;
-        if (asbd.mSampleRate > 0 && fabs(asbd.mSampleRate - 48000.0) > 1.0) {
-            static int sCount = 0;
-            if (sCount++ < 3) {
-                VCLog(@"AudioUnitSetProperty: 采样率 %.0f -> 48000", asbd.mSampleRate);
-            }
-            asbd.mSampleRate = 48000.0;
-            return orig_AudioUnitSetProperty(unit, prop, scope, elem, &asbd, size);
+
+        // ★ 第 15 版：**不再把采样率改成 48000**。
+        //
+        //  以前这里会把 44100 强行改成 48000，理由是「素材是 48k，省一次重采样」。
+        //  代价是致命的：AudioUnit 跑在 48k，而抖音写文件时仍然按它自己记录的
+        //  44100 封装 —— 于是每一秒的真实时间被写成 1.088 秒的音频，
+        //  音频整体慢 8.8%、降调 8.8%，而且和画面越拉越远。
+        //
+        //  实测铁证（IMG_1090.MOV，16.35 s 的录制成品）：
+        //      音频样本数 731136（按 48k 产出） ÷ 44100 = 16.58 s
+        //      成品音轨 L/R 相关系数 = 1.000000  ← 确实是我们的单声道复制
+        //      但与素材音轨做互相关，任何位置都只有 0.03  ← 时基被改了
+        //
+        //  保持 App 自己请求的采样率，让我们的填充与它的写入时基一致。
+        static int sCount = 0;
+        if (sCount++ < 3) {
+            VCLog(@"AudioUnitSetProperty: 采样率 %.0f（保持原样，不强改）",
+                  asbd.mSampleRate);
         }
     }
     // 遇到「输入回调」或「格式设置」时挂 RenderNotify。

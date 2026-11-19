@@ -58,7 +58,9 @@ static NSLock *VCProxyLock(void)
     BOOL _loggedFirstReplacement;
     CVPixelBufferRef _lastSrcPB;   // 上一帧源数据，用于按素材帧率节流
     double _lastSrcTime;           // 上次出帧时刻
-    double _nextFrameTime;         // 下一帧允许出的绝对时刻（累积式节流）
+    double _nextFrameTime;         // 下一帧允许出的绝对时刻（已废弃，保留字段）
+    double _srcBudget;             // 视频出帧时间预算（秒），累计式节流
+    uint64_t _srcFetched;          // 实际从素材取了几个新帧（诊断）
 }
 
 + (instancetype)proxyForTarget:(id)target kind:(VCProxyKind)kind output:(id)output
@@ -308,19 +310,43 @@ static NSLock *VCProxyLock(void)
         CGFloat fps = [VCFrameSource shared].sourceFrameRate;
         double minInterval = (fps > 1.0) ? (1.0 / fps) : (1.0 / 30.0);
 
-        if (_lastSrcPB && now < _nextFrameTime) {
-            src = CVPixelBufferRetain(_lastSrcPB);
-        } else {
+        // 真正的累积预算：把流逝的时间攒起来，够一帧才放行。
+        //
+        //  上一版用 _nextFrameTime = now + minInterval（取帧后重置计时器），
+        //  这是「重置式」而不是累积式：抖音的请求间隔有抖动，
+        //  只要某次落在了 16.67ms 之后，就整帧放行，
+        //  而重置又把后面本该复用的一次机会吃掉了。
+        //  实测结果是 1216 帧 / 15.2 秒 = 80fps，仍是 1.33 倍消耗。
+        //
+        //  累积式不受抖动影响：时间一直在累加，够 16.67ms 才消费一次，
+        //  长期平均严格等于素材帧率。
+        if (_lastSrcTime > 0) {
+            double dt = now - _lastSrcTime;
+            if (dt > 0 && dt < 1.0) _srcBudget += dt;   // 卡顿超过 1 秒不累积
+        }
+        _lastSrcTime = now;
+
+        BOOL takeNew = NO;
+        if (!_lastSrcPB) {
+            takeNew = YES;
+            _srcBudget = 0;
+        } else if (_srcBudget >= minInterval) {
+            takeNew = YES;
+            _srcBudget -= minInterval;
+            if (_srcBudget > minInterval) _srcBudget = minInterval;  // 不积压
+        }
+
+        if (takeNew) {
             src = [[VCFrameSource shared] copyNextPixelBuffer];
             if (src) {
+                _srcFetched++;
                 if (_lastSrcPB) CVPixelBufferRelease(_lastSrcPB);
                 _lastSrcPB = CVPixelBufferRetain(src);
-                _lastSrcTime = now;
-                // 以 now 为基准推进，但落后太多时不要疯狂追帧
-                _nextFrameTime = now + minInterval;
-                if (_nextFrameTime < now - 0.5) _nextFrameTime = now + minInterval;
+            } else {
+                takeNew = NO;
             }
         }
+        if (!src && _lastSrcPB) src = CVPixelBufferRetain(_lastSrcPB);
     }
 
     if (!src) {

@@ -9,6 +9,7 @@
 #import "VCSampleBufferFactory.h"
 #import "VCOverlay.h"
 #import "VCamConfig.h"
+#import "VCAudioPipeline.h"
 #import "VCLog.h"
 
 #import <AudioToolbox/AudioToolbox.h>
@@ -48,6 +49,7 @@ static NSLock *VCProxyLock(void)
 - (void)rewriteAudioBufferInPlace:(CMSampleBufferRef)buffer
                              drop:(BOOL *)dropOut;
 - (BOOL)syncInjectingState;
+- (void)syncVideoToAudioClockNow:(double)now;
 @end
 
 // 视频出帧配额 —— 必须是全局的，不能是实例变量。
@@ -279,6 +281,55 @@ static uint64_t g_videoTotalFetched = 0;     // 累计出帧数，只增不减
 //
 //  改成原地改写后，PTS / attachments / format description 全是原生，
 //  App 完全感知不到差异。代价是每帧一次 memcpy 或一次 GPU 缩放。
+// ------------------------------------------------------------------ 音画对齐
+//
+//  问题现场（实测）：
+//      视频位置 24.73 s  /  音频播放位置 15.25 s  /  偏差 -9.50 s
+//      743 帧 ÷ 30 = 24.77 s ≈ 视频位置  →  帧率本来就是严格的 30 fps
+//
+//  也就是说「视频消耗倍数 1.624」根本不是限速失效：
+//  分子（视频读指针）从**预览阶段第一次出帧**就开始算，
+//  分母（录制时长）从**按下录制**才开始算 —— 预览期消耗的 9.5 秒全被算成了超速。
+//
+//  音频为什么没有这个问题：AudioUnit 只在真正开始录制（或录音页）才有回调，
+//  音频管道从那一刻才起跑，所以「音频播放位置 15.25 ≈ 录制时长 15.23」。
+//
+//  结论：视频读指针不该自己跑，它必须跟住音频真正播到的位置。
+//  音频是实时率输出的，它才是真实时间轴。
+- (void)syncVideoToAudioClockNow:(double)now
+{
+    VCAudioPipeline *pipe = [VCAudioPipeline shared];
+    if (!pipe.isRunning || pipe.producedFrames < 4800) return;   // 音频还没跑起来，别动视频
+
+    VCFrameSource *src = [VCFrameSource shared];
+    double dur = src.assetDuration;
+    if (!(dur > 0.5)) return;                                    // 时长未知，不做折返
+
+    // 真正「播出去」的素材位置 = 已产出位置 − 还压在环形缓冲里的秒数。
+    // 用解码进度会天然超前一个缓冲深度（实测 1.2~1.8 秒），越校越偏。
+    double audioPos = pipe.decodedMaterialSeconds - pipe.currentDrift;
+    if (audioPos < 0) audioPos = 0;
+    if (audioPos > dur) audioPos = fmod(audioPos, dur);          // 长跑折返，素材只有十几秒
+
+    double vpos = src.currentVideoSourceTime;
+    double err  = vpos - audioPos;
+
+    // 阈值 0.5 s：正常抖动（编码/缓冲）只有几十毫秒，超过半秒一定是真错位。
+    // 限频 1 s：seek 要重建 reader（~140 ms），不能每帧都做。
+    static double sLastSeekAt = 0.0;
+    static int    sSyncLogs   = 0;
+    if (fabs(err) > 0.5 && (now - sLastSeekAt) > 1.0) {
+        sLastSeekAt = now;
+        [src seekVideoToTime:audioPos];
+
+        if (sSyncLogs < 20) {
+            sSyncLogs++;
+            VCLog(@"音画对齐 #%d：视频 %.2f s -> 音频 %.2f s（原来差 %+.2f s，已校正 %d 次）",
+                  sSyncLogs, vpos, audioPos, err, g_vcVideoSeekCount);
+        }
+    }
+}
+
 - (void)rewriteVideoBufferInPlace:(CMSampleBufferRef)buffer drop:(BOOL *)dropOut
 {
     extern volatile int g_statVideoDelegates;
@@ -327,6 +378,11 @@ static uint64_t g_videoTotalFetched = 0;     // 累计出帧数，只增不减
         CGFloat fps = [VCFrameSource shared].sourceFrameRate;
         if (fps < 1.0) fps = 30.0;
         double now = CACurrentMediaTime();
+
+        // ---- 先对齐音画，再谈节流 ----
+        //  顺序不能反：对齐会把读指针挪到音频位置，
+        //  挪完这一帧才算「真的从素材里取了一帧」，配额计数才有意义。
+        [self syncVideoToAudioClockNow:now];
 
         if (g_videoSessionStart <= 0) {
             g_videoSessionStart = now;

@@ -57,7 +57,8 @@ static NSLock *VCProxyLock(void)
     __weak id _output;
     BOOL _loggedFirstReplacement;
     CVPixelBufferRef _lastSrcPB;   // 上一帧源数据，用于按素材帧率节流
-    double _lastSrcTime;
+    double _lastSrcTime;           // 上次出帧时刻
+    double _nextFrameTime;         // 下一帧允许出的绝对时刻（累积式节流）
 }
 
 + (instancetype)proxyForTarget:(id)target kind:(VCProxyKind)kind output:(id)output
@@ -293,11 +294,21 @@ static NSLock *VCProxyLock(void)
         //  以前每次回调都推进一帧素材 → 15 秒录制消耗 30 秒素材
         //  （实测视频位置 29.93s vs 音频 17.00s，差一整个录制时长）。
         //  这里缓存上一帧，没到间隔就复用，让视频消耗速度和音频一致。
+        // 累积式节流：用「下一帧的绝对时刻」而不是「距上次多久」。
+        //
+        //  为什么必须改：
+        //    之前用 (now - _lastSrcTime) < minInterval * 0.85 判据。
+        //    素材 60fps → minInterval 16.67ms，阈值 14.2ms；
+        //    而抖音请求间隔实测 14ms —— 每次都刚好挤进阈值，每次都出帧，
+        //    结果消耗 71.6fps（1.19 倍），音画还是差 3.35 秒。
+        //
+        //  累积式判据每 minInterval 只放行一帧，不管请求多密，
+        //  消耗严格等于素材帧率 → 视频和音频都是实时 1:1。
         double now = CACurrentMediaTime();
         CGFloat fps = [VCFrameSource shared].sourceFrameRate;
         double minInterval = (fps > 1.0) ? (1.0 / fps) : (1.0 / 30.0);
 
-        if (_lastSrcPB && (now - _lastSrcTime) < minInterval * 0.85) {
+        if (_lastSrcPB && now < _nextFrameTime) {
             src = CVPixelBufferRetain(_lastSrcPB);
         } else {
             src = [[VCFrameSource shared] copyNextPixelBuffer];
@@ -305,6 +316,9 @@ static NSLock *VCProxyLock(void)
                 if (_lastSrcPB) CVPixelBufferRelease(_lastSrcPB);
                 _lastSrcPB = CVPixelBufferRetain(src);
                 _lastSrcTime = now;
+                // 以 now 为基准推进，但落后太多时不要疯狂追帧
+                _nextFrameTime = now + minInterval;
+                if (_nextFrameTime < now - 0.5) _nextFrameTime = now + minInterval;
             }
         }
     }

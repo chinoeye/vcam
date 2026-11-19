@@ -70,6 +70,14 @@ NS_ASSUME_NONNULL_BEGIN
 /// 视频 seek 校正的累计次数（诊断，定义在 .m 里）。
 extern int g_vcVideoSeekCount;
 
+/// 音画对齐的诊断量（定义在 VCCaptureProxy.m）：
+///   录制中（音频在走时）的最大偏差 —— 这个数为准
+///   停录瞬间的视频/音频位置与偏差 —— 录完之后预览会继续推进，那时的瞬时值不算数
+extern double g_vcRecordSyncErrMax;
+extern double g_vcRecordEndVideoPos;
+extern double g_vcRecordEndAudioPos;
+extern double g_vcRecordEndErr;
+
 /// 释放解码器（App 退到后台或关闭注入时调用）
 - (void)teardown;
 

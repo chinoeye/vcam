@@ -315,6 +315,10 @@ static OSStatus VCPipeInputProc(AudioConverterRef cvt,
 
 // ------------------------------------------------------------------ 启停
 
+static volatile BOOL g_audioAligning = NO;
+
+- (BOOL)isAligning { return g_audioAligning; }
+
 /// 把音频素材对齐到视频当前所在位置（录制起点的无缝衔接）。
 ///
 /// 只在偏差真的大到「明显错开」时才动（> 2 s），
@@ -336,9 +340,17 @@ static OSStatus VCPipeInputProc(AudioConverterRef cvt,
 
     if (fabs(cur - target) < 2.0) return;             // 已经很接近，别折腾
 
+    // 对齐期间必须让视频侧知道：这段窗口里音频位置还在旧值上，
+    //  视频对齐如果照着旧值校，就会把画面拽回开头（实测 #1 拽到 0.02 s），
+    //  等音频跳完再拽回来（#2 拽到 103 s）—— 画面来回跳两次。
+    g_audioAligning = YES;
     dispatch_async(_queue, ^{
         VCLog(@"录制起点对齐：音频素材 %.2f s → %.2f s（视频当前位置）", cur, target);
         [self seekAudioToTime:target];
+        // 缓冲清空后立刻补一段，缩短开头的空窗
+        [self produceFrames:(size_t)(_dstFormat.mSampleRate * 0.5)];
+        g_audioAligning = NO;
+        VCLog(@"录制起点对齐完成");
     });
 }
 

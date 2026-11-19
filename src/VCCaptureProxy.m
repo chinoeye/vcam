@@ -62,6 +62,7 @@ static NSLock *VCProxyLock(void)
     double _srcBudget;             // 已废弃，保留字段
     double _playStartTime;         // 开始播放的绝对时刻（PTS 对齐用）
     double _playStartPos;          // 开始播放时素材所在位置（秒）
+    double _lastFetchTime;         // 上次实际出帧的绝对时刻（硬限速用）
     uint64_t _srcFetched;          // 实际从素材取了几个新帧（诊断）
 }
 
@@ -343,44 +344,82 @@ static NSLock *VCProxyLock(void)
             target = curPos;
         }
 
-        // ---- 追赶式对齐 ----
+        // ---- 硬限速：每帧至少间隔 frameDur 才出 ----
         //
-        //  诊断日志暴露的真相：
-        //    抖音的请求间隔极不均匀，稳定段 40~80ms，但会出现 300ms、682ms 的空档。
-        //    之前每次请求只推进一帧（33.3ms），遇到 682ms 空档就欠了 20 帧，
-        //    curPos 永远追不上 target，差值从 0 一路滚到 2.6 秒，
-        //    视频就比音频慢 2.6 秒 —— 而且永远补不回来。
+        //  前面所有「按请求节奏推断」的算法都失败，诊断日志给出了确切原因：
+        //    抖音请求 56.9fps（间隔 17.5ms），素材 30fps（一帧 33.3ms）。
+        //    只要每次请求都取一帧，素材就按 56.9×33.3ms = 1.9 秒/秒 消耗，
+        //    视频必然比音频跑得快一倍。
         //
-        //  改成循环追赶：一次请求里连续取帧，直到素材位置追上真实时间。
-        //  请求密的时候每次只取 0~1 帧（正常播放），
-        //  请求稀疏的时候一次补几帧（追上进度）。
-        //  这样素材消耗严格 1:1，音画不再漂移。
+        //  「追到 target 就停」这个判据本身没错，但 target 按真实时间涨 17.5ms，
+        //  而取一帧 curPos 就跳 33.3ms —— 目标步长比时间步长还大，
+        //  于是每 1.5 次请求必然触发一次取帧，等于没限速。
+        //
+        //  真正有效的约束是：**两次出帧之间必须至少隔 frameDur 真实时间**。
+        //  这条约束和请求频率完全解耦：
+        //    请求再密，出帧也不会快于素材帧率；
+        //    请求稀疏时靠后面的追赶逻辑补齐。
+        CGFloat fps = [VCFrameSource shared].sourceFrameRate;
+        double frameDur = (fps > 1.0) ? (1.0 / fps) : (1.0 / 30.0);
+        double now = CACurrentMediaTime();
+        double curPos = [VCFrameSource shared].currentVideoSourceTime;
+
+        if (_playStartTime <= 0) {
+            _playStartTime = now;
+            _playStartPos = curPos;
+        }
+        double target = _playStartPos + (now - _playStartTime);
+        if (target - curPos > 5.0) {          // 素材回绕后重新对齐基准
+            _playStartTime = now;
+            _playStartPos = curPos;
+            target = curPos;
+        }
+
         int fetched = 0;
-        int guard = 0;
-        while (guard++ < 120) {          // 最多补 120 帧 = 4 秒，防止极端死循环
-            BOOL needNew = NO;
-            if (!_lastSrcPB) {
-                needNew = YES;
-            } else if (curPos < target - frameDur * 0.5) {
-                needNew = YES;
-            }
-            if (!needNew) break;
 
+        // 硬限速：距上次出帧不足 frameDur 就不推进
+        BOOL rateOK = (_lastFetchTime <= 0) || ((now - _lastFetchTime) >= frameDur * 0.98);
+
+        if (!_lastSrcPB) {
             CVPixelBufferRef nb = [[VCFrameSource shared] copyNextPixelBuffer];
-            if (!nb) break;
+            if (nb) {
+                _lastSrcPB = CVPixelBufferRetain(nb);
+                CVPixelBufferRelease(nb);
+                _lastFetchTime = now;
+                fetched = 1;
+            }
+        } else if (rateOK && curPos < target - frameDur * 0.5) {
+            CVPixelBufferRef nb = [[VCFrameSource shared] copyNextPixelBuffer];
+            if (nb) {
+                CVPixelBufferRelease(_lastSrcPB);
+                _lastSrcPB = CVPixelBufferRetain(nb);
+                CVPixelBufferRelease(nb);
+                _lastFetchTime = now;
+                fetched = 1;
+            }
+        }
 
-            if (_lastSrcPB) CVPixelBufferRelease(_lastSrcPB);
-            _lastSrcPB = nb;
-            fetched++;
-            curPos = [VCFrameSource shared].currentVideoSourceTime;
+        // 严重落后（超过 1 秒）时允许连续补帧，避免长时间卡在一个位置
+        if (curPos < target - 1.0) {
+            int guard = 0;
+            while (guard++ < 90) {
+                CVPixelBufferRef nb = [[VCFrameSource shared] copyNextPixelBuffer];
+                if (!nb) break;
+                CVPixelBufferRelease(_lastSrcPB);
+                _lastSrcPB = CVPixelBufferRetain(nb);
+                CVPixelBufferRelease(nb);
+                fetched++;
+                curPos = [VCFrameSource shared].currentVideoSourceTime;
+            }
+            _lastFetchTime = CACurrentMediaTime();
         }
 
         {
             static int sDbg = 0;
-            if (sDbg < 30) {
+            if (sDbg < 25) {
                 sDbg++;
-                VCLog(@"出帧 #%d 落后=%+.3fs 本次取=%d 帧 curPos=%.3f",
-                      sDbg, target - curPos, fetched, curPos);
+                VCLog(@"出帧 #%d 落后=%+.3fs 取=%d 限速=%@ curPos=%.3f",
+                      sDbg, target - curPos, fetched, rateOK ? @"Y" : @"N", curPos);
             }
         }
 

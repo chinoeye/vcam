@@ -315,6 +315,33 @@ static OSStatus VCPipeInputProc(AudioConverterRef cvt,
 
 // ------------------------------------------------------------------ 启停
 
+/// 把音频素材对齐到视频当前所在位置（录制起点的无缝衔接）。
+///
+/// 只在偏差真的大到「明显错开」时才动（> 2 s），
+/// 这样预览 → 录制 → 停 → 再录这一串操作里不会反复 seek。
+- (void)alignToVideoPosition
+{
+    VCFrameSource *fs = [VCFrameSource shared];
+    if (!fs.isReady) return;
+
+    double dur = fs.assetDuration;
+    double vpos = fs.currentVideoSourceTime;
+    if (!(vpos > 0.5)) return;                        // 视频就在开头，不用动
+
+    double target = (dur > 0.5) ? fmod(vpos, dur) : vpos;
+
+    pthread_mutex_lock(&_lock);
+    double cur = _decodedMaterialSeconds;
+    pthread_mutex_unlock(&_lock);
+
+    if (fabs(cur - target) < 2.0) return;             // 已经很接近，别折腾
+
+    dispatch_async(_queue, ^{
+        VCLog(@"录制起点对齐：音频素材 %.2f s → %.2f s（视频当前位置）", cur, target);
+        [self seekAudioToTime:target];
+    });
+}
+
 - (void)start
 {
     if (_running) return;

@@ -343,35 +343,48 @@ static NSLock *VCProxyLock(void)
             target = curPos;
         }
 
-        BOOL takeNew = NO;
-        if (!_lastSrcPB) {
-            takeNew = YES;
-        } else if (curPos < target - frameDur * 0.5) {
-            takeNew = YES;              // 落后超过半帧，推进 reader
+        // ---- 追赶式对齐 ----
+        //
+        //  诊断日志暴露的真相：
+        //    抖音的请求间隔极不均匀，稳定段 40~80ms，但会出现 300ms、682ms 的空档。
+        //    之前每次请求只推进一帧（33.3ms），遇到 682ms 空档就欠了 20 帧，
+        //    curPos 永远追不上 target，差值从 0 一路滚到 2.6 秒，
+        //    视频就比音频慢 2.6 秒 —— 而且永远补不回来。
+        //
+        //  改成循环追赶：一次请求里连续取帧，直到素材位置追上真实时间。
+        //  请求密的时候每次只取 0~1 帧（正常播放），
+        //  请求稀疏的时候一次补几帧（追上进度）。
+        //  这样素材消耗严格 1:1，音画不再漂移。
+        int fetched = 0;
+        int guard = 0;
+        while (guard++ < 120) {          // 最多补 120 帧 = 4 秒，防止极端死循环
+            BOOL needNew = NO;
+            if (!_lastSrcPB) {
+                needNew = YES;
+            } else if (curPos < target - frameDur * 0.5) {
+                needNew = YES;
+            }
+            if (!needNew) break;
+
+            CVPixelBufferRef nb = [[VCFrameSource shared] copyNextPixelBuffer];
+            if (!nb) break;
+
+            if (_lastSrcPB) CVPixelBufferRelease(_lastSrcPB);
+            _lastSrcPB = nb;
+            fetched++;
+            curPos = [VCFrameSource shared].currentVideoSourceTime;
         }
 
-        // 前 40 次请求打点，用来核对 target 和 curPos 的实际关系
         {
             static int sDbg = 0;
-            if (sDbg < 40) {
+            if (sDbg < 30) {
                 sDbg++;
-                VCLog(@"出帧判定 #%d now=%.4f target=%.4f curPos=%.4f 差=%+.4f 阈值=%.4f → %@",
-                      sDbg, now - _playStartTime, target, curPos,
-                      target - curPos, frameDur * 0.5,
-                      takeNew ? @"取新帧" : @"复用");
+                VCLog(@"出帧 #%d 落后=%+.3fs 本次取=%d 帧 curPos=%.3f",
+                      sDbg, target - curPos, fetched, curPos);
             }
         }
 
-        if (takeNew) {
-            src = [[VCFrameSource shared] copyNextPixelBuffer];
-            if (src) {
-                if (_lastSrcPB) CVPixelBufferRelease(_lastSrcPB);
-                _lastSrcPB = CVPixelBufferRetain(src);
-            } else {
-                takeNew = NO;
-            }
-        }
-        if (!src && _lastSrcPB) src = CVPixelBufferRetain(_lastSrcPB);
+        if (_lastSrcPB) src = CVPixelBufferRetain(_lastSrcPB);
     }
 
     if (!src) {

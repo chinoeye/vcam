@@ -298,6 +298,10 @@ double g_vcRecordEndErr      = 0.0;   // 停录瞬间的偏差
 {
     VCAudioPipeline *pipe = [VCAudioPipeline shared];
 
+    // 音频正在做「录制起点对齐」：这个窗口里它的位置还是旧值，
+    //  照着旧值校就会把画面拽回开头，等它跳完再拽回来 —— 画面来回跳。
+    if (pipe.isAligning) return;
+
     // 门槛 1：音频必须真的被**消费**过。
     //
     //  isRunning 不够 —— 管道在 bootstrap 时就启动了，预览页也一直是「运行中」，
@@ -362,6 +366,9 @@ double g_vcRecordEndErr      = 0.0;   // 停录瞬间的偏差
     if (needSeek) {
         sLastSeekAt = now;
         [src seekVideoToTime:audioPos];
+        // seek 之后时间轴基准整个跳了，配额基准跟着重置，别让它算成"超速"
+        g_videoSessionStart = now;
+        g_videoTotalFetched = 0;
 
         if (sSyncLogs < 20) {
             sSyncLogs++;
@@ -491,8 +498,15 @@ double g_vcRecordEndErr      = 0.0;   // 停录瞬间的偏差
             if (CACurrentMediaTime() - loopT0 > 0.018) break;
 
             // 配额（防超速）与追帧（防落后）同时生效
-            BOOL canFetchNow = ((double)g_videoTotalFetched <
-                                (now - g_videoSessionStart) * (double)fps + 2.0);
+            //
+            //  录制期间（有音频时钟）配额必须让路：
+            //    素材 30 fps 时配额只给 45 帧/秒，而正常推进要 30 帧、
+            //    追回 1 秒落后还要 30 帧 —— 60 > 45，追帧永远被截断，
+            //    结果就是「每秒固定落后 1 秒 → 每秒 seek 一次」的死循环（实测）。
+            //    有音频时钟时它本身就是硬约束（音频实时率输出），不会超速。
+            BOOL quotaOK = ((double)g_videoTotalFetched <
+                            (now - g_videoSessionStart) * (double)fps + 2.0);
+            BOOL canFetchNow = (audioTarget > 0.0) ? YES : quotaOK;
             if (_lastSrcPB && !canFetchNow) break;          // 配额满，复用上一帧
             if (audioTarget > 0.0 && _lastSrcPB &&
                 [VCFrameSource shared].currentVideoSourceTime + 0.002 >= audioTarget) {

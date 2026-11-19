@@ -446,28 +446,55 @@ double g_vcRecordEndErr      = 0.0;   // 停录瞬间的偏差
         }
 
         double allowed = (now - g_videoSessionStart) * (double)fps + 2.0;
-        BOOL quotaOK = ((double)g_videoTotalFetched < allowed);
 
-        CVPixelBufferRef newPB = NULL;
-        if (!_lastSrcPB || quotaOK) {
-            newPB = [[VCFrameSource shared] copyNextPixelBuffer];
+        // ---- 追帧：素材帧率 ≠ 输出帧率时必须一次取多帧 ----
+        //
+        //  病灶：以前每次采集回调只取**一帧**素材。
+        //    素材 30 fps、抖音 30 fps 回调 → 1:1，刚好。
+        //    素材 60 fps、回调还是 30 次/秒 → 每秒只走 30 帧素材 = 0.5 秒内容
+        //    → 画面变成**半速**，声音却按真实时间走，音画立刻错开。
+        //    （60 fps 素材在视频号里很常见，这就是个通用坑，不是这一个素材的问题。）
+        //
+        //  正确做法：以音频时间轴为目标位置，一次回调里连续取帧、把该丢的丢掉，
+        //  直到读指针追上目标。这样不管素材是 24 / 25 / 30 / 60 / 120 fps，
+        //  输出都是真实时间速度。
+        double audioTarget = -1.0;
+        {
+            VCAudioPipeline *pipe = [VCAudioPipeline shared];
+            if (pipe.isRunning && pipe.consumedFrames > 0) {
+                double p = pipe.decodedMaterialSeconds - pipe.currentDrift;
+                if (isfinite(p) && p >= 0.0) audioTarget = p;
+            }
         }
 
-        if (newPB) {
+        int guard = 0;
+        while (guard < 8) {
+            // 配额（防超速）与追帧（防落后）同时生效
+            BOOL canFetchNow = ((double)g_videoTotalFetched <
+                                (now - g_videoSessionStart) * (double)fps + 2.0);
+            if (_lastSrcPB && !canFetchNow) break;          // 配额满，复用上一帧
+            if (audioTarget > 0.0 && _lastSrcPB &&
+                [VCFrameSource shared].currentVideoSourceTime + 0.002 >= audioTarget) {
+                break;                                       // 已追上目标位置
+            }
+
+            CVPixelBufferRef pb = [[VCFrameSource shared] copyNextPixelBuffer];
+            if (!pb) break;
+
             if (_lastSrcPB) CVPixelBufferRelease(_lastSrcPB);
-            _lastSrcPB = CVPixelBufferRetain(newPB);
-            CVPixelBufferRelease(newPB);
+            _lastSrcPB = CVPixelBufferRetain(pb);
+            CVPixelBufferRelease(pb);
             g_videoTotalFetched++;
+            guard++;
         }
 
         {
             static int sDbg = 0;
             if (sDbg < 25) {
                 sDbg++;
-                VCLog(@"出帧 #%d 已出=%llu 允许=%.1f 配额=%@ 素材位置=%.3f",
-                      sDbg, g_videoTotalFetched, allowed,
-                      quotaOK ? @"可用" : @"已满", 
-                      [VCFrameSource shared].currentVideoSourceTime);
+                VCLog(@"出帧 #%d 已出=%llu 允许=%.1f 本次取=%d 目标=%.2f 素材位置=%.3f",
+                      sDbg, g_videoTotalFetched, allowed, guard,
+                      audioTarget, [VCFrameSource shared].currentVideoSourceTime);
             }
         }
 

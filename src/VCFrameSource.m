@@ -81,57 +81,82 @@
 // ------------------------------------------------------------------ 视频 seek（音画对齐用）
 
 int g_vcVideoSeekCount = 0;
+static volatile BOOL g_videoSeeking = NO;   // 有 seek 在跑（避免排队）
 
 - (void)seekVideoToTime:(NSTimeInterval)t
 {
     if (!isfinite(t) || t < 0) return;
+    if (g_videoSeeking) return;             // 已经有一次在跑了，别排队
 
-    [_lock lock];
-    @try {
-        if (!_ready || !_asset) return;
+    // ★ 必须异步。
+    //
+    //  600 秒 / 348 MB 的素材上重建 AVAssetReader（cancelReading + init +
+    //  startReading + 定位）实测要几百毫秒。以前这在采集回调线程里同步做，
+    //  AVCaptureVideoDataOutput 的队列直接被按死 —— 现象就是
+    //  「预览一切正常，点录制立刻卡死」（音画对齐第一次 seek 正好发生在这一刻）。
+    //
+    //  现在丢到串行队列去做，采集线程拿不到锁就跳过这一帧（复用上一帧），
+    //  画面最多停几帧，不会卡死。
+    static dispatch_queue_t seekQueue;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        seekQueue = dispatch_queue_create("vcam.video.seek", DISPATCH_QUEUE_SERIAL);
+    });
 
-        AVAssetTrack *vtrack = [[_asset tracksWithMediaType:AVMediaTypeVideo] firstObject];
-        if (!vtrack) return;
+    g_videoSeeking = YES;
+    dispatch_async(seekQueue, ^{
+        double t0 = CACurrentMediaTime();
+        [self->_lock lock];
+        @try {
+            if (!self->_ready || !self->_asset) return;
 
-        @try { [_videoReader cancelReading]; } @catch (NSException *e) {}
+            AVAssetTrack *vtrack = [[self->_asset tracksWithMediaType:AVMediaTypeVideo] firstObject];
+            if (!vtrack) return;
 
-        NSError *err = nil;
-        _videoReader = [[AVAssetReader alloc] initWithAsset:_asset error:&err];
-        _videoOutput = nil;
-        if (!_videoReader) {
-            VCLog(@"视频 seek 失败: %@", err);
-            _ready = NO;
-            return;
+            @try { [self->_videoReader cancelReading]; } @catch (NSException *e) {}
+
+            NSError *err = nil;
+            self->_videoReader = [[AVAssetReader alloc] initWithAsset:self->_asset error:&err];
+            self->_videoOutput = nil;
+            if (!self->_videoReader) {
+                VCLog(@"视频 seek 失败: %@", err);
+                self->_ready = NO;
+                return;
+            }
+
+            NSDictionary *vsettings = @{
+                (id)kCVPixelBufferPixelFormatTypeKey: @(self->_pixelFormat),
+                (id)kCVPixelBufferIOSurfacePropertiesKey: @{},
+            };
+            self->_videoOutput = [[AVAssetReaderTrackOutput alloc]
+                            initWithTrack:vtrack outputSettings:vsettings];
+            self->_videoOutput.alwaysCopiesSampleData = YES;
+            if (![self->_videoReader canAddOutput:self->_videoOutput]) return;
+            [self->_videoReader addOutput:self->_videoOutput];
+
+            // 从目标位置起读
+            self->_videoReader.timeRange = CMTimeRangeMake(CMTimeMakeWithSeconds(t, 1000),
+                                                      kCMTimePositiveInfinity);
+            if (![self->_videoReader startReading]) {
+                VCLog(@"视频 seek 启动失败: %@", self->_videoReader.error);
+                self->_ready = NO;
+                return;
+            }
+
+            self->_videoSourceSeconds = t;
+            g_vcVideoSeekCount++;
+
+            // 注意：这里**不碰音频 reader**。
+            // restartVideoReaderLocked 会把音频一起拉回 0，那是「素材回绕」的语义；
+            // 音画对齐只该挪视频，否则两条轨道互相拽，永远收敛不了。
+        } @finally {
+            [self->_lock unlock];
         }
-
-        NSDictionary *vsettings = @{
-            (id)kCVPixelBufferPixelFormatTypeKey: @(_pixelFormat),
-            (id)kCVPixelBufferIOSurfacePropertiesKey: @{},
-        };
-        _videoOutput = [[AVAssetReaderTrackOutput alloc]
-                        initWithTrack:vtrack outputSettings:vsettings];
-        _videoOutput.alwaysCopiesSampleData = YES;
-        if (![_videoReader canAddOutput:_videoOutput]) return;
-        [_videoReader addOutput:_videoOutput];
-
-        // 从目标位置起读。往前不留余量：这里要的就是「这一帧」。
-        _videoReader.timeRange = CMTimeRangeMake(CMTimeMakeWithSeconds(t, 1000),
-                                                  kCMTimePositiveInfinity);
-        if (![_videoReader startReading]) {
-            VCLog(@"视频 seek 启动失败: %@", _videoReader.error);
-            _ready = NO;
-            return;
-        }
-
-        _videoSourceSeconds = t;
-        g_vcVideoSeekCount++;
-
-        // 注意：这里**不碰音频 reader**。
-        // restartVideoReaderLocked 会把音频一起拉回 0，那是「素材回绕」的语义；
-        // 音画对齐只该挪视频，否则两条轨道互相拽，永远收敛不了。
-    } @finally {
-        [_lock unlock];
-    }
+        double ms = (CACurrentMediaTime() - t0) * 1000.0;
+        g_videoSeeking = NO;
+        VCLog(@"视频 seek 完成：目标 %.2f s，耗时 %.0f ms（累计 %d 次）",
+              t, ms, g_vcVideoSeekCount);
+    });
 }
 
 // ------------------------------------------------------------------ 装载
@@ -313,7 +338,9 @@ int g_vcVideoSeekCount = 0;
     if (!_ready || VCamConfig.shared.paused) return NULL;
 
     CVPixelBufferRef result = NULL;
-    [_lock lock];
+    // tryLock 而不是 lock：后台正在 seek 时不能把采集线程挂在这儿等。
+    //  拿不到锁就返回 NULL，上层复用上一帧继续输出，画面最多停一两帧。
+    if (![_lock tryLock]) return NULL;
     @try {
         for (int attempt = 0; attempt < 2 && !result; attempt++) {
             if (!_videoReader || _videoReader.status != AVAssetReaderStatusReading) {

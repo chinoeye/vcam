@@ -45,6 +45,9 @@ NS_ASSUME_NONNULL_BEGIN
 /// 副作用更严重：每场录制都是同一段素材的开头，指纹高度重复。
 - (void)alignToVideoPosition;
 
+/// 起点对齐是否正在进行（视频对齐要在这期间让路，否则两边互相拽）。
+@property (nonatomic, readonly) BOOL isAligning;
+
 /// 启动/停止后台生产线程。素材切换、注入开关都会调用。
 - (void)start;
 - (void)stop;

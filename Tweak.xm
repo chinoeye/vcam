@@ -803,9 +803,12 @@ static void VCStartStatReporter(void)
 ///   在这里提前跑，等用户真去点录制时缓冲已经满了，
 ///   AudioUnitRender 第一次调用就能拿到真实数据，没有静音段。
 ///
-/// 格式用 48000/2ch/16bit 预设：这是实测抖音的系统格式。
-/// 万一不同，首次 AudioUnitRender 会调用 setTargetFormat 重建一次 ——
-/// 那时候缓冲会重新填，但只发生一次，不影响正常录制。
+/// 格式用 44100/2ch/16bit：这是抖音**真实**的系统格式（日志实测）。
+///
+///  以前这里写的是 48000 —— 那是我们强行改采样率时代的残留。
+///  结果每次录制都会因为「格式不符」重建一次管道：
+///  预热的 2 秒白填，还得靠 setTargetFormat 重新填，录制开头就有缺口。
+///  现在预设与真实一致，录制开始时缓冲已经是满的。
 static void VCPrewarmAudioPipeline(void)
 {
     VCamConfig *cfg = VCamConfig.shared;
@@ -816,7 +819,7 @@ static void VCPrewarmAudioPipeline(void)
     }
 
     AudioStreamBasicDescription def = {0};
-    def.mSampleRate       = 48000;
+    def.mSampleRate       = 44100;
     def.mFormatID         = kAudioFormatLinearPCM;
     def.mFormatFlags      = kAudioFormatFlagIsSignedInteger |
                             kAudioFormatFlagsNativeEndian |

@@ -63,6 +63,14 @@ static NSLock *VCProxyLock(void)
 static double   g_videoSessionStart = 0.0;   // 首次出帧的绝对时刻，只赋值一次
 static uint64_t g_videoTotalFetched = 0;     // 累计出帧数，只增不减
 
+// 音画对齐的诊断量（报告读它们）。
+//  为什么单独记：录完之后预览会继续推帧，直接用「当前视频位置 − 当前音频位置」
+//  会把停录后那几秒算成误差。分开记，报告里才说人话。
+double g_vcRecordSyncErrMax  = 0.0;   // 本轮录制中（音频还在走）的最大偏差
+double g_vcRecordEndVideoPos = -1.0;  // 停录瞬间的视频位置（-1 = 还没录过）
+double g_vcRecordEndAudioPos = -1.0;  // 停录瞬间的音频位置
+double g_vcRecordEndErr      = 0.0;   // 停录瞬间的偏差
+
 @implementation VCCaptureProxy
 {
     __weak id _target;
@@ -316,17 +324,42 @@ static uint64_t g_videoTotalFetched = 0;     // 累计出帧数，只增不减
         sPrevAudioPos = audioPos;
         sPrevAudioAt  = now;
     } else if (now - sPrevAudioAt > 0.5) {
-        return;                                                  // 半秒没前进 → 静止
+        // 音频停走了 = 这一轮录制结束。趁视频还没继续跑远，快照一次。
+        //  报告里的「音画偏差」如果在这里不冻结，就会把停录后预览推进的量
+        //  算进去 —— 实测录完 3 秒再点诊断，报告显示 -2.77 s，
+        //  其实录制中一直 < 0.3 s。那个数字只会误导人。
+        if (g_vcRecordEndVideoPos < 0.0) {
+            g_vcRecordEndVideoPos  = src.currentVideoSourceTime;
+            g_vcRecordEndAudioPos  = audioPos;
+            g_vcRecordEndErr       = g_vcRecordEndVideoPos - audioPos;
+        }
+        return;
     }
 
     double vpos = src.currentVideoSourceTime;
     double err  = vpos - audioPos;
 
+    // 音频重新开始走 = 新一轮录制。先把上一轮留下的快照清掉。
+    if (g_vcRecordEndVideoPos >= 0.0) {
+        g_vcRecordEndVideoPos = -1.0;
+        g_vcRecordEndAudioPos = -1.0;
+        g_vcRecordEndErr      = 0.0;
+        g_vcRecordSyncErrMax  = 0.0;
+    }
+
     // 阈值 0.3 s：第 12 版对齐后还剩 0.33 s，口型错位是能看出来的，收一点。
     // 限频 1 s：seek 要重建 reader（~140 ms），不能每帧都做。
     static double sLastSeekAt = 0.0;
     static int    sSyncLogs   = 0;
-    if (fabs(err) > 0.3 && (now - sLastSeekAt) > 1.0) {
+    BOOL needSeek = (fabs(err) > 0.3 && (now - sLastSeekAt) > 1.0);
+
+    // 只统计**稳态**误差。正在被校正的那一帧记的是「待修复的错误」（录制刚开始时
+    // 会是预览期攒下的 20 多秒），把它算进最大值会让人以为一直没对齐。
+    if (!needSeek && fabs(err) > g_vcRecordSyncErrMax) {
+        g_vcRecordSyncErrMax = fabs(err);
+    }
+
+    if (needSeek) {
         sLastSeekAt = now;
         [src seekVideoToTime:audioPos];
 

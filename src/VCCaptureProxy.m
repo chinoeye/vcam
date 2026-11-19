@@ -50,6 +50,17 @@ static NSLock *VCProxyLock(void)
 - (BOOL)syncInjectingState;
 @end
 
+// 视频出帧配额 —— 必须是全局的，不能是实例变量。
+//
+//  抖音在预览、录制、切页时会反复重建 VCCaptureProxy（每次 proxyForTarget:
+//  都是新对象）。如果配额存在实例里，新实例的计数从 0 开始，
+//  「总帧数 ≤ 时间×帧率」这条约束就被反复重置 —— 实测跑出 1005 帧
+//  而上限本该是 457 帧，等于完全没限速。
+//
+//  放成文件级静态量，所有实例共享同一份会话起点和累计计数。
+static double   g_videoSessionStart = 0.0;   // 首次出帧的绝对时刻，只赋值一次
+static uint64_t g_videoTotalFetched = 0;     // 累计出帧数，只增不减
+
 @implementation VCCaptureProxy
 {
     __weak id _target;
@@ -317,13 +328,13 @@ static NSLock *VCProxyLock(void)
         if (fps < 1.0) fps = 30.0;
         double now = CACurrentMediaTime();
 
-        if (_sessionStart <= 0) {
-            _sessionStart = now;
-            _totalFetched = 0;
+        if (g_videoSessionStart <= 0) {
+            g_videoSessionStart = now;
+            g_videoTotalFetched = 0;
         }
 
-        double allowed = (now - _sessionStart) * (double)fps + 2.0;
-        BOOL quotaOK = ((double)_totalFetched < allowed);
+        double allowed = (now - g_videoSessionStart) * (double)fps + 2.0;
+        BOOL quotaOK = ((double)g_videoTotalFetched < allowed);
 
         CVPixelBufferRef newPB = NULL;
         if (!_lastSrcPB || quotaOK) {
@@ -334,7 +345,7 @@ static NSLock *VCProxyLock(void)
             if (_lastSrcPB) CVPixelBufferRelease(_lastSrcPB);
             _lastSrcPB = CVPixelBufferRetain(newPB);
             CVPixelBufferRelease(newPB);
-            _totalFetched++;
+            g_videoTotalFetched++;
         }
 
         {
@@ -342,7 +353,7 @@ static NSLock *VCProxyLock(void)
             if (sDbg < 25) {
                 sDbg++;
                 VCLog(@"出帧 #%d 已出=%llu 允许=%.1f 配额=%@ 素材位置=%.3f",
-                      sDbg, _totalFetched, allowed,
+                      sDbg, g_videoTotalFetched, allowed,
                       quotaOK ? @"可用" : @"已满", 
                       [VCFrameSource shared].currentVideoSourceTime);
             }

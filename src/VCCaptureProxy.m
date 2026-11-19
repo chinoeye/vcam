@@ -350,6 +350,18 @@ static NSLock *VCProxyLock(void)
             takeNew = YES;              // 落后超过半帧，推进 reader
         }
 
+        // 前 40 次请求打点，用来核对 target 和 curPos 的实际关系
+        {
+            static int sDbg = 0;
+            if (sDbg < 40) {
+                sDbg++;
+                VCLog(@"出帧判定 #%d now=%.4f target=%.4f curPos=%.4f 差=%+.4f 阈值=%.4f → %@",
+                      sDbg, now - _playStartTime, target, curPos,
+                      target - curPos, frameDur * 0.5,
+                      takeNew ? @"取新帧" : @"复用");
+            }
+        }
+
         if (takeNew) {
             src = [[VCFrameSource shared] copyNextPixelBuffer];
             if (src) {

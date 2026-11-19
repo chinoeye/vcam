@@ -33,6 +33,7 @@
     uint64_t _audioSamplesOut;       // 已输出给 App 的音频样本总数
     uint64_t _audioSamplesRead;      // 已从 reader 读出的样本总数（含被丢弃的）
     double _audioSampleRate;
+    NSTimeInterval _assetDuration;   // 素材总时长（秒），音画折返用
 }
 
 - (BOOL)restartVideoReaderLocked;
@@ -75,6 +76,63 @@
 - (CGFloat)sourceAspectRatio { return _aspect; }
 - (CGFloat)sourceFrameRate { return _fps > 1.0 ? _fps : 30.0; }
 - (NSTimeInterval)currentVideoSourceTime { return _videoSourceSeconds; }
+- (NSTimeInterval)assetDuration { return _assetDuration; }
+
+// ------------------------------------------------------------------ 视频 seek（音画对齐用）
+
+int g_vcVideoSeekCount = 0;
+
+- (void)seekVideoToTime:(NSTimeInterval)t
+{
+    if (!isfinite(t) || t < 0) return;
+
+    [_lock lock];
+    @try {
+        if (!_ready || !_asset) return;
+
+        AVAssetTrack *vtrack = [[_asset tracksWithMediaType:AVMediaTypeVideo] firstObject];
+        if (!vtrack) return;
+
+        @try { [_videoReader cancelReading]; } @catch (NSException *e) {}
+
+        NSError *err = nil;
+        _videoReader = [[AVAssetReader alloc] initWithAsset:_asset error:&err];
+        _videoOutput = nil;
+        if (!_videoReader) {
+            VCLog(@"视频 seek 失败: %@", err);
+            _ready = NO;
+            return;
+        }
+
+        NSDictionary *vsettings = @{
+            (id)kCVPixelBufferPixelFormatTypeKey: @(_pixelFormat),
+            (id)kCVPixelBufferIOSurfacePropertiesKey: @{},
+        };
+        _videoOutput = [[AVAssetReaderTrackOutput alloc]
+                        initWithTrack:vtrack outputSettings:vsettings];
+        _videoOutput.alwaysCopiesSampleData = YES;
+        if (![_videoReader canAddOutput:_videoOutput]) return;
+        [_videoReader addOutput:_videoOutput];
+
+        // 从目标位置起读。往前不留余量：这里要的就是「这一帧」。
+        _videoReader.timeRange = CMTimeRangeMake(CMTimeMakeWithSeconds(t, 1000),
+                                                  kCMTimePositiveInfinity);
+        if (![_videoReader startReading]) {
+            VCLog(@"视频 seek 启动失败: %@", _videoReader.error);
+            _ready = NO;
+            return;
+        }
+
+        _videoSourceSeconds = t;
+        g_vcVideoSeekCount++;
+
+        // 注意：这里**不碰音频 reader**。
+        // restartVideoReaderLocked 会把音频一起拉回 0，那是「素材回绕」的语义；
+        // 音画对齐只该挪视频，否则两条轨道互相拽，永远收敛不了。
+    } @finally {
+        [_lock unlock];
+    }
+}
 
 // ------------------------------------------------------------------ 装载
 
@@ -119,6 +177,21 @@
 
         _fps = (vtrack.nominalFrameRate > 1.0f) ? vtrack.nominalFrameRate : 30.0;
         VCLog(@"素材帧率 %.2f fps", _fps);
+
+        // 素材时长：音画对齐折返要用。
+        // 远程 HTTP 源 asset.duration 可能不准，轨道 timeRange 更可靠，优先用它。
+        _assetDuration = 0.0;
+        CMTimeRange tr = vtrack.timeRange;
+        if (CMTIME_IS_VALID(tr.duration) && CMTIME_IS_NUMERIC(tr.duration)) {
+            _assetDuration = CMTimeGetSeconds(tr.duration);
+        }
+        if (!(_assetDuration > 0.0)) {
+            CMTime d = _asset.duration;
+            if (CMTIME_IS_VALID(d) && CMTIME_IS_NUMERIC(d)) {
+                _assetDuration = CMTimeGetSeconds(d);
+            }
+        }
+        VCLog(@"素材时长 %.2f s", _assetDuration);
 
         CGSize size = vtrack.naturalSize;
         if (size.width > 0 && size.height > 0) {

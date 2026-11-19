@@ -270,8 +270,27 @@ static OSStatus VCPipeInputProc(AudioConverterRef cvt,
     //  相关峰 +0.69（其它档只有 0.017），对应素材位置 **1.96 s** ——
     //  速率完全正确，只是整体偏移了预热那两秒。
     if (!everConsumed) {
-        [[VCAudioSource shared] seekToTime:0.0];
-        VCLog(@"音频管道：重建（尚未消费过），素材读指针拨回 0");
+        // ★ 第 22 版：从「预览当前所在位置」起播，而不是素材开头。
+        //
+        //  以前固定 seek 0：预览跑到 14 秒，一点录制音频从 0 起跑，
+        //  音画对齐再把画面拽回 0 —— 用户看到的就是「一点录制就从头开始放」。
+        //  副作用更大：每次录制都是同一段素材的同一个开头，指纹高度重复。
+        //
+        //  现在沿用预览位置，录制起点无缝衔接，每场位置还都不一样。
+        double startSec = 0.0;
+        VCFrameSource *fs = [VCFrameSource shared];
+        double dur = fs.assetDuration;
+        double vpos = fs.currentVideoSourceTime;
+        if (isfinite(vpos) && vpos > 0.0) {
+            startSec = (dur > 0.5) ? fmod(vpos, dur) : vpos;
+        }
+        [[VCAudioSource shared] seekToTime:startSec];
+
+        pthread_mutex_lock(&_lock);
+        _decodedMaterialSeconds = startSec;
+        pthread_mutex_unlock(&_lock);
+
+        VCLog(@"音频管道：重建（尚未消费过），从素材 %.2f s 起播（延续预览位置）", startSec);
     }
 
     if (!_ring) {

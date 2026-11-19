@@ -445,7 +445,7 @@ double g_vcRecordEndErr      = 0.0;   // 停录瞬间的偏差
             g_videoTotalFetched = 0;
         }
 
-        double allowed = (now - g_videoSessionStart) * (double)fps + 2.0;
+        double allowed = (now - g_videoSessionStart) * (double)fps * 1.5 + 4.0;
 
         // ---- 追帧：素材帧率 ≠ 输出帧率时必须一次取多帧 ----
         //
@@ -465,6 +465,12 @@ double g_vcRecordEndErr      = 0.0;   // 停录瞬间的偏差
                 double p = pipe.decodedMaterialSeconds - pipe.currentDrift;
                 if (isfinite(p) && p >= 0.0) audioTarget = p;
             }
+        }
+        // 预览期没有音频时钟（还没开录，没人消费音频），退化成真实时间当目标。
+        //  不退的话就变成「每次回调取一帧」—— 60 fps 素材在预览页会以半速播放，
+        //  看着像慢动作，很容易被当成同步出问题。
+        if (audioTarget < 0.0 && g_videoSessionStart > 0.0) {
+            audioTarget = now - g_videoSessionStart;
         }
 
         int guard = 0;

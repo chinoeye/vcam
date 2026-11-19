@@ -599,6 +599,14 @@ static OSStatus hook_AudioUnitRender(AudioUnit unit,
     [pipe fillIOData:ioData frames:frames];
     g_audioBail = 0;
     g_audioWriteOK++;
+
+    // 第一次真正开始取音频 = 用户按下了录制（或进了录音页）。
+    //  这一刻视频已经跑到了某处（预览期一直在播），必须把素材音频也挪过去，
+    //  否则音画对齐会把画面拽回素材开头 —— 「一点录制就从头开始放」。
+    if (g_audioWriteOK == 1) {
+        [pipe alignToVideoPosition];
+    }
+
     return st;
 }
 

@@ -62,6 +62,13 @@ NS_ASSUME_NONNULL_BEGIN
 @property (nonatomic, readonly) double   lastUnderrunAt;
 /// 音频已解码到素材的哪个时间（秒）
 @property (nonatomic, readonly) double   decodedMaterialSeconds;
+/// 真正「播出去」的时长（秒）= 实时线程取走的帧数 ÷ 输出采样率。
+///
+/// 和 decodedMaterialSeconds − currentDrift 的区别：那个是「解码 − 缓冲」，
+/// 缓冲深度一变它就跳（预热缓冲从 2 s 掉到 0.3 s 时会瞬间跳 1.7 s）。
+/// 视频追帧拿它当目标，就会在一次回调里疯狂取帧 → 采集线程被解码堵死 → 卡死。
+/// 这个值单调、平滑，才是视频该跟的时钟。
+@property (nonatomic, readonly) double   playedSeconds;
 /// 视频当前解码到素材的哪个时间（秒）—— 对齐基准
 @property (nonatomic, readonly) double   videoSourceSeconds;
 /// 累计微调次数。稳定后应停止增长。

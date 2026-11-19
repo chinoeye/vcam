@@ -1053,18 +1053,38 @@ static void VCBootstrap(void)
             }
 
             // 素材可能还在电脑上 —— 抖音是「苹果正版」，爱思助手不给浏览
-            // 沙盒，没法手动拖文件进去。所以这里后台拉一次再加载。
+            // 沙盒，没法手动拖文件进去。
+            //
+            // ★ 第 19 版：**先加载，再后台补缓存**，绝不能等下载完。
+            //
+            //  以前这里是「ensureAssetDownloaded 下完 → 才 VCLoadAssetNow」。
+            //  7 MB 的素材没事，348 MB 的就要几分钟 —— 而这几分钟里用户点进
+            //  录制页，帧源一帧都拿不到：黑屏，然后被系统 watchdog 杀掉。
+            //  实测日志：
+            //      本地无素材，从 192.168.3.88:8088 拉 /current.mp4
+            //      出帧 #1..已出=0 本次取=0 素材位置=0.000   ← 连续 25 次拿不到帧
+            //      （进程消失）
+            //
+            //  现在assetURL 本来就是「本地有就用本地，没有就 HTTP 直连」，
+            //  所以直接加载即可：小素材本地秒开，大素材按需拉几 MB 开播。
+            //  下载退化成后台缓存，只为下次启动更快，不再挡路。
             dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
                 VCamConfig *c = VCamConfig.shared;
                 if (c.sourceKind == VCSourceKindAsset) {
+                    dispatch_async(dispatch_get_main_queue(), ^{
+                        VCLoadAssetNow();
+                        VCPrewarmAudioPipeline();
+                        VCStartStatReporter();
+                    });
                     BOOL got = [c ensureAssetDownloaded];
-                    VCRemoteLog(@"素材就位=%d 目录=%@", got, [c assetDirectory]);
+                    VCRemoteLog(@"后台缓存%@（不影响当前播放）", got ? @"已就绪" : @"未完成");
+                } else {
+                    dispatch_async(dispatch_get_main_queue(), ^{
+                        VCLoadAssetNow();
+                        VCPrewarmAudioPipeline();
+                        VCStartStatReporter();
+                    });
                 }
-                dispatch_async(dispatch_get_main_queue(), ^{
-                    VCLoadAssetNow();
-                    VCPrewarmAudioPipeline();
-                    VCStartStatReporter();
-                });
             });
         } else {
             VCRemoteLog(@"注入未启用 → 静默模式：不加载素材、不连实时源");

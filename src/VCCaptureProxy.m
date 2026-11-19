@@ -296,34 +296,43 @@ static NSLock *VCProxyLock(void)
         }
     } else {
 
-        // ---- 每秒配额限速 ----
+        // ---- 硬上限：素材推进量不得超过真实时间流逝量 ----
         //
-        //  前面试过的所有做法都基于「和真实时间对齐」，但抖音的请求节奏
-        //  本身不均匀（稳定段 15~20ms，偶发 300ms、680ms 空档），
-        //  一旦按真实时间补帧，素材就被拽到前面去，而且真实时间不能回退，
-        //  结果视频比音频快一倍。
+        //  前面八版都在用各种办法「估算请求节奏再限制出帧」，
+        //  但抖音的请求频率、节奏都在动，任何估算都会被带偏。
         //
-        //  改用最简单的配额：**每一秒最多出 sourceFps 帧**。
-        //  和请求频率、请求节奏、真实时间全部解耦。
-        //  一秒内请求再密，第 N 帧之后一律复用；请求稀疏就自然少出几帧。
+        //  这里换成一个不依赖任何估算的数学约束：
         //
-        //  代价是长时间下极慢的漂移（因为用的是固定秒长），
-        //  但一秒内不会超过素材帧率，所以不会出现「快一倍」这种量级的错位。
+        //      素材位置 − 起始位置  ≤  真实时间 − 起始时间  + 容差
+        //
+        //  只要这条不等式成立，素材就永远不可能比真实时间跑得快，
+        //  1:1 是硬上限。请求再密也只是复用旧帧，
+        //  请求稀疏时素材自然落后一点，不会反过来被拽到前面。
+        //
+        //  容差 0.15 秒用于吸收第一帧的起始位差和定时抖动。
         CGFloat fps = [VCFrameSource shared].sourceFrameRate;
         if (fps < 1.0) fps = 30.0;
+        double frameDur = 1.0 / fps;
         double now = CACurrentMediaTime();
+        double curPos = [VCFrameSource shared].currentVideoSourceTime;
 
-        if (_quotaStart <= 0 || (now - _quotaStart) >= 1.0) {
-            _quotaStart = now;
-            _quotaFetched = 0;
+        if (_playStartTime <= 0) {
+            _playStartTime = now;
+            _playStartPos = curPos;
         }
 
-        BOOL quotaOK = (_quotaFetched < (uint32_t)fps);
+        // 素材回绕（curPos 突然变小）时重新定基准
+        if (curPos + 1.0 < _playStartPos) {
+            _playStartTime = now;
+            _playStartPos = curPos;
+        }
+
+        double materialAdvanced = curPos - _playStartPos;
+        double realElapsed = now - _playStartTime;
+        BOOL overSpeed = (materialAdvanced > realElapsed + 0.15);
 
         CVPixelBufferRef newPB = NULL;
-        if (!_lastSrcPB) {
-            newPB = [[VCFrameSource shared] copyNextPixelBuffer];
-        } else if (quotaOK) {
+        if (!_lastSrcPB || !overSpeed) {
             newPB = [[VCFrameSource shared] copyNextPixelBuffer];
         }
 
@@ -331,16 +340,15 @@ static NSLock *VCProxyLock(void)
             if (_lastSrcPB) CVPixelBufferRelease(_lastSrcPB);
             _lastSrcPB = CVPixelBufferRetain(newPB);
             CVPixelBufferRelease(newPB);
-            _quotaFetched++;
         }
 
         {
             static int sDbg = 0;
-            if (sDbg < 20) {
+            if (sDbg < 25) {
                 sDbg++;
-                VCLog(@"出帧 #%d 本秒已出=%u/%.0f 配额=%@ 素材位置=%.3f",
-                      sDbg, _quotaFetched, fps, quotaOK ? @"可用" : @"已满",
-                      [VCFrameSource shared].currentVideoSourceTime);
+                VCLog(@"出帧 #%d 素材推进=%.3fs 真实流逝=%.3fs 超速=%@ 位置=%.3f",
+                      sDbg, materialAdvanced, realElapsed,
+                      overSpeed ? @"是→复用" : @"否→出帧", curPos);
             }
         }
 

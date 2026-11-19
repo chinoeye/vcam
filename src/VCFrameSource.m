@@ -6,6 +6,7 @@
 #import "VCSampleBufferFactory.h"
 #import "VCamConfig.h"
 #import "VCLog.h"
+#import "VCAudioSource.h"   // 回绕时要用 VCAudioSourceShouldResetNotification
 
 #import <math.h>
 

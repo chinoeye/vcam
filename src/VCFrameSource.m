@@ -52,15 +52,6 @@
         inst = [[VCFrameSource alloc] init];
     });
     return inst;
-
-    // 视频回绕：通知独立的音频源一起回到素材开头。
-    //
-    //  音频现在是独立模块（VCAudioSource），有自己的 reader 和队列。
-    //  如果不通知它，视频回到 0 秒而音频还在素材中段，
-    //  音画立刻错开半个素材长度，而且每循环一次就多错一次。
-    [[NSNotificationCenter defaultCenter]
-        postNotificationName:@"VCAudioSourceShouldResetNotification"
-                      object:nil];
 }
 
 - (instancetype)init
@@ -325,6 +316,12 @@
     _audioSamplesOut = 0;
     _audioConsumedSourceFrames = 0;   // 循环回绕，消费计数一起归零
     _videoSourceSeconds = 0.0;
+
+    // 视频绕回素材开头 —— 必须通知音频源一起重置，
+    //  否则视频在 0 秒而音频还在素材中段，每循环一次就多错一个素材长度。
+    [[NSNotificationCenter defaultCenter]
+        postNotificationName:VCAudioSourceShouldResetNotification
+                      object:nil];
 
     return YES;
 }

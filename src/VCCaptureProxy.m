@@ -462,7 +462,14 @@ double g_vcRecordEndErr      = 0.0;   // 停录瞬间的偏差
         {
             VCAudioPipeline *pipe = [VCAudioPipeline shared];
             if (pipe.isRunning && pipe.consumedFrames > 0) {
-                double p = pipe.decodedMaterialSeconds - pipe.currentDrift;
+                // 用「已播时长」当目标：单调、平滑。
+                //
+                //  以前用 decodedMaterialSeconds − currentDrift，那是「解码 − 缓冲」，
+                //  缓冲深度一变它就跳。实测录制刚启动时预热缓冲从 2 s 掉到 0.3 s，
+                //  这个值在一帧之内从 0.10 跳到 0.49 再跳到 0.91 ——
+                //  追帧循环当场吃满 8 帧上限，1080p 解码把采集线程堵死，
+                //  表现就是「一点录制就卡死」。
+                double p = pipe.playedSeconds;
                 if (isfinite(p) && p >= 0.0) audioTarget = p;
             }
         }
@@ -474,7 +481,15 @@ double g_vcRecordEndErr      = 0.0;   // 停录瞬间的偏差
         }
 
         int guard = 0;
-        while (guard < 8) {
+        double loopT0 = CACurrentMediaTime();
+        while (guard < 4) {
+            // 采集线程不能被解码堵死：一帧间隔 33 ms，这里最多花 18 ms。
+            //  1080p 素材软解一帧 20~40 ms，目标位置一旦跳变，无上限地追帧
+            //  就会把 AVCaptureVideoDataOutput 的队列彻底堵住 —— 预览冻结、
+            //  录制页卡死（实测 94 秒没有任何回调）。宁可这帧少追一点，
+            //  下一帧继续，也不能把实时线程拖住。
+            if (CACurrentMediaTime() - loopT0 > 0.018) break;
+
             // 配额（防超速）与追帧（防落后）同时生效
             BOOL canFetchNow = ((double)g_videoTotalFetched <
                                 (now - g_videoSessionStart) * (double)fps + 2.0);

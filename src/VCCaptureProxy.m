@@ -568,9 +568,56 @@ double g_vcRecordEndErr      = 0.0;   // 停录瞬间的偏差
 
     if (!_loggedFirstReplacement) {
         _loggedFirstReplacement = YES;
-        VCLog(@"首帧注入成功（原地改写）%zux%zu fmt=0x%x",
-              CVPixelBufferGetWidth(dst), CVPixelBufferGetHeight(dst),
-              (unsigned)CVPixelBufferGetPixelFormatType(dst));
+        VCLog(@"首帧注入成功（原地改写）");
+    }
+
+    // ---- 格式诊断：偏白/偏色的元凶基本都在这里 ----
+    //
+    //  原地改写时，CMSampleBuffer 的 format description（含 YCbCr 矩阵、
+    //  primaries、transfer function）是**系统给的那份**，没动过；
+    //  而像素是我们按素材的样子转出来写进去的。
+    //  两者只要有一项对不上，出来的就是偏色 / 偏白 / 对比度变平。
+    //
+    //  range 尤其关键：素材经 H.264 出来是 420v（video range，Y 16~235），
+    //  系统 buffer 若是 420f（full range，Y 0~255），按错方向映射就等于
+    //  把亮度整体拉伸一遍 —— 暗部发灰、亮部裁切，看着就是"偏白"。
+    {
+        static OSType sLastDFmt = 0;
+        static size_t sLastDW = 0, sLastDH = 0;
+        OSType dFmt = CVPixelBufferGetPixelFormatType(dst);
+        size_t dW = CVPixelBufferGetWidth(dst);
+        size_t dH = CVPixelBufferGetHeight(dst);
+        if (dFmt != sLastDFmt || dW != sLastDW || dH != sLastDH) {
+            sLastDFmt = dFmt; sLastDW = dW; sLastDH = dH;
+
+            CMFormatDescriptionRef fd = CMSampleBufferGetFormatDescription(buffer);
+            CFDictionaryRef ext = fd ? CMFormatDescriptionGetExtensions(fd) : NULL;
+            NSString *mMatrix = @"(无声明)", *mPrim = @"(无声明)", *mTf = @"(无声明)";
+            if (ext) {
+                id v = (__bridge id)CFDictionaryGetValue(ext, kCVImageBufferYCbCrMatrixKey);
+                if (v) mMatrix = [v description];
+                v = (__bridge id)CFDictionaryGetValue(ext, kCVImageBufferColorPrimariesKey);
+                if (v) mPrim = [v description];
+                v = (__bridge id)CFDictionaryGetValue(ext, kCVImageBufferTransferFunctionKey);
+                if (v) mTf = [v description];
+            }
+
+            NSString *dRange = (dFmt == kCVPixelFormatType_420YpCbCr8BiPlanarFullRange) ? @"full(0-255)" :
+                               (dFmt == kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange) ? @"video(16-235)" : @"?";
+
+            OSType sFmt = _lastSrcPB ? CVPixelBufferGetPixelFormatType(_lastSrcPB) : 0;
+            NSString *sRange = (sFmt == kCVPixelFormatType_420YpCbCr8BiPlanarFullRange) ? @"full(0-255)" :
+                               (sFmt == kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange) ? @"video(16-235)" : @"?";
+            size_t sW = _lastSrcPB ? CVPixelBufferGetWidth(_lastSrcPB) : 0;
+            size_t sH = _lastSrcPB ? CVPixelBufferGetHeight(_lastSrcPB) : 0;
+
+            VCLog(@"── 注入格式诊断 ──");
+            VCLog(@"  dst  %zux%zu fmt=0x%x  range=%@", dW, dH, (unsigned)dFmt, dRange);
+            VCLog(@"  dst  matrix=%@ primaries=%@ transfer=%@", mMatrix, mPrim, mTf);
+            VCLog(@"  src  %zux%zu fmt=0x%x  range=%@", sW, sH, (unsigned)sFmt, sRange);
+            VCLog(@"  路径 %@", (sW == dW && sH == dH && sFmt == dFmt)
+                  ? @"同尺寸同格式 memcpy" : @"VTPixelTransferSession 缩放+转换");
+        }
     }
 
     [[VCSampleBufferFactory shared] updateJPEGFromPixelBuffer:dst];

@@ -100,6 +100,15 @@ double g_vcRecordEndErr      = 0.0;   // 停录瞬间的偏差
     double _sessionStart;          // 本次会话首次出帧的绝对时刻（永不重置）
     uint64_t _totalFetched;        // 累计出帧数（只增不减）
     uint64_t _srcFetched;          // 实际从素材取了几个新帧（诊断）
+
+    // ---- 绿幕抠像 ----
+    //  每帧流程：备份真实画面 Y/UV → 素材覆盖 → 只把「非绿色」区域还原。
+    //  缓冲按需分配一次后复用（720x1280 约 1.4 MB）。
+    uint8_t *_gkRealY;
+    uint8_t *_gkRealUV;
+    size_t   _gkRealYCap;
+    size_t   _gkRealUVCap;
+    int      _gkLoggedFrames;
 }
 
 + (instancetype)proxyForTarget:(id)target kind:(VCProxyKind)kind output:(id)output
@@ -478,6 +487,124 @@ static double VCComputeLumaGainFromRealCamera(double realLuma)
     return gain;
 }
 
+// ------------------------------------------------------------------ 绿幕抠像
+//
+//  思路：摄像头对着绿幕时，绿幕区域显示素材，别的（手、商品）保留真实画面。
+//
+//  为什么这么做而不是「亮度跟随」：
+//    亮度跟随会去改素材的明暗 —— 素材就不是原来那个素材了。
+//    绿幕抠像是「素材一格不动，只把绿幕挖掉换成素材」，
+//    素材本身零改动，只是叠加了一层真实的东西。
+//
+//  实现：素材覆盖**之前**备份真实画面，覆盖**之后**把非绿色区域写回去。
+//    YCbCr 里绿幕的特征是 Cb/Cr 都明显低于 128（纯绿大约 Cb=54 / Cr=34），
+//    用「到纯绿参考点的距离」判断比单看某一路稳，能覆盖偏黄偏青的绿幕。
+//
+//  开销：720x1280 的 UV 平面是 360x640 = 23 万次循环，每帧约 3~6 ms。
+//    只在 greenKeyEnabled 时执行，关掉是零成本。
+
+- (void)gkBackupRealFrame:(CVPixelBufferRef)dst
+{
+    if (!dst || CVPixelBufferGetPlaneCount(dst) < 2) return;
+    if (CVPixelBufferLockBaseAddress(dst, kCVPixelBufferLock_ReadOnly) != kCVReturnSuccess) return;
+
+    uint8_t *y  = CVPixelBufferGetBaseAddressOfPlane(dst, 0);
+    uint8_t *uv = CVPixelBufferGetBaseAddressOfPlane(dst, 1);
+    size_t yH   = CVPixelBufferGetHeightOfPlane(dst, 0);
+    size_t yBpr = CVPixelBufferGetBytesPerRowOfPlane(dst, 0);
+    size_t uvH  = CVPixelBufferGetHeightOfPlane(dst, 1);
+    size_t uvBpr = CVPixelBufferGetBytesPerRowOfPlane(dst, 1);
+
+    size_t yLen  = yH * yBpr;
+    size_t uvLen = uvH * uvBpr;
+
+    if (y && yLen) {
+        if (!_gkRealY || _gkRealYCap < yLen) {
+            free(_gkRealY);
+            _gkRealY = (uint8_t *)malloc(yLen);
+            _gkRealYCap = _gkRealY ? yLen : 0;
+        }
+        if (_gkRealY) memcpy(_gkRealY, y, yLen);
+    }
+    if (uv && uvLen) {
+        if (!_gkRealUV || _gkRealUVCap < uvLen) {
+            free(_gkRealUV);
+            _gkRealUV = (uint8_t *)malloc(uvLen);
+            _gkRealUVCap = _gkRealUV ? uvLen : 0;
+        }
+        if (_gkRealUV) memcpy(_gkRealUV, uv, uvLen);
+    }
+
+    CVPixelBufferUnlockBaseAddress(dst, kCVPixelBufferLock_ReadOnly);
+}
+
+- (void)gkRestoreNonGreenInto:(CVPixelBufferRef)dst
+{
+    if (!_gkRealY || !_gkRealUV) return;
+    if (!dst || CVPixelBufferGetPlaneCount(dst) < 2) return;
+    if (CVPixelBufferLockBaseAddress(dst, 0) != kCVReturnSuccess) return;
+
+    uint8_t *y   = CVPixelBufferGetBaseAddressOfPlane(dst, 0);
+    uint8_t *uv  = CVPixelBufferGetBaseAddressOfPlane(dst, 1);
+    size_t yW    = CVPixelBufferGetWidthOfPlane(dst, 0);
+    size_t yH    = CVPixelBufferGetHeightOfPlane(dst, 0);
+    size_t yBpr  = CVPixelBufferGetBytesPerRowOfPlane(dst, 0);
+    size_t uvW   = CVPixelBufferGetWidthOfPlane(dst, 1);
+    size_t uvH   = CVPixelBufferGetHeightOfPlane(dst, 1);
+    size_t uvBpr = CVPixelBufferGetBytesPerRowOfPlane(dst, 1);
+
+    double th = VCamConfig.shared.greenKeyThreshold;
+    if (!(th > 0.01)) th = 0.35;
+    int radius = (int)(th * 120.0);      // 0.35 → 42
+    if (radius < 10) radius = 10;
+    int r2 = radius * radius;
+
+    long nonGreen = 0, total = 0;
+
+    for (size_t uy = 0; uy < uvH; uy++) {
+        uint8_t *drow = uv + uy * uvBpr;
+        uint8_t *rrow = _gkRealUV + uy * uvBpr;
+        for (size_t ux = 0; ux < uvW; ux++) {
+            size_t off = ux * 2;
+            if (off + 1 >= uvBpr) break;
+            int cb = (int)rrow[off]     - 54;    // 相对纯绿的 Cb
+            int cr = (int)rrow[off + 1] - 34;    // 相对纯绿的 Cr
+            total++;
+            if (cb * cb + cr * cr <= r2) continue;   // 是绿色 → 保留素材
+
+            // 不是绿色 → 还原真实画面（UV + 对应的 2x2 亮度块）
+            drow[off]     = rrow[off];
+            drow[off + 1] = rrow[off + 1];
+            nonGreen++;
+
+            for (int dy = 0; dy < 2; dy++) {
+                size_t yy = uy * 2 + dy;
+                if (yy >= yH) break;
+                uint8_t *dyl = y + yy * yBpr;
+                uint8_t *ryl = _gkRealY + yy * yBpr;
+                size_t x0 = ux * 2;
+                if (x0 < yW)     dyl[x0] = ryl[x0];
+                if (x0 + 1 < yW) dyl[x0 + 1] = ryl[x0 + 1];
+            }
+        }
+    }
+
+    CVPixelBufferUnlockBaseAddress(dst, 0);
+
+    if (_gkLoggedFrames < 6) {
+        _gkLoggedFrames++;
+        VCLog(@"绿幕：非绿区域 %.1f%%（阈值 %.2f → 半径 %d）",
+              total ? (100.0 * nonGreen / (double)total) : 0.0, th, radius);
+    }
+}
+
+- (void)dealloc
+{
+    free(_gkRealY);  _gkRealY = NULL;
+    free(_gkRealUV); _gkRealUV = NULL;
+    if (_lastSrcPB) CVPixelBufferRelease(_lastSrcPB);
+}
+
 - (void)rewriteVideoBufferInPlace:(CMSampleBufferRef)buffer drop:(BOOL *)dropOut
 {
     extern volatile int g_statVideoDelegates;
@@ -699,11 +826,18 @@ static double VCComputeLumaGainFromRealCamera(double realLuma)
         [VCSampleBufferFactory shared].lumaGain = VCComputeLumaGainFromRealCamera(realLuma);
     }
 
+    // 绿幕：素材覆盖**之前**把真实画面备份下来
+    BOOL gk = VCamConfig.shared.greenKeyEnabled;
+    if (gk) [self gkBackupRealFrame:dst];
+
     if (![[VCSampleBufferFactory shared] copyPixelBuffer:src into:dst]) {
         CVPixelBufferRelease(src);
         if (dropOut) *dropOut = YES;
         return;
     }
+
+    // 绿幕：素材已经铺满，把「非绿色」区域（手、商品、任何挡镜头的东西）还原回去
+    if (gk) [self gkRestoreNonGreenInto:dst];
 
     if (!_loggedFirstReplacement) {
         _loggedFirstReplacement = YES;

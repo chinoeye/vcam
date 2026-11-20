@@ -54,6 +54,13 @@ typedef NS_ENUM(NSInteger, VCAudioMode) {
 /// 色度和对比度不碰 —— 实测它们本来就没被改。
 @property (nonatomic, assign) double outputGamma;
 
+/// 写入前对饱和度做的反补偿（1.0 = 不补，<1 = 降饱和）。
+///
+///  为什么必须和 outputGamma 一起用：在 YUV 空间里饱和度 ∝ |U-128| / Y，
+///  只压 Y 不动 UV，色度会被相对放大 —— 实测只压亮度的版本饱和度凭空涨了 52%，
+///  看着比原来更"冲"。配合 0.65 左右能把色度收回去。
+@property (nonatomic, assign) double outputSaturation;
+
 // ---- 伪装 ----
 @property (nonatomic, assign) BOOL jitterTimestamps;     // 时间戳抖动
 @property (nonatomic, assign) BOOL hideJailbreak;        // 越狱痕迹抹除

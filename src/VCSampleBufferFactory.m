@@ -361,6 +361,42 @@ static void VCSampleYRange(CVPixelBufferRef pb, const char *tag)
     CVPixelBufferUnlockBaseAddress(pb, kCVPixelBufferLock_ReadOnly);
 }
 
+// 亮度反补偿：把开播页那条提亮曲线抵掉。
+//
+//  只动 Y 平面（亮度），色度 U/V 完全不动 —— 实测开播页只改了亮度曲线
+//  （暗部 +130%、中间调 +19%、高光封顶），对比度和饱和度基本没变。
+//
+//  gamma > 1 是压暗：out = 255 × (in/255)^gamma
+//  对 720x1280 来说 92 万次查表，约 1~3 ms，可接受。
+static void VCApplyOutputGamma(CVPixelBufferRef dst, double gamma)
+{
+    if (!dst || !(gamma > 0.01) || fabs(gamma - 1.0) < 0.005) return;
+    if (CVPixelBufferGetPlaneCount(dst) < 1) return;
+    if (CVPixelBufferLockBaseAddress(dst, 0) != kCVReturnSuccess) return;
+
+    static uint8_t sLut[256];
+    static double  sLutGamma = -1.0;
+    if (fabs(sLutGamma - gamma) > 0.001) {
+        for (int i = 0; i < 256; i++) {
+            double v = pow(i / 255.0, gamma) * 255.0;
+            sLut[i] = (uint8_t)(v < 0 ? 0 : (v > 255 ? 255 : v + 0.5));
+        }
+        sLutGamma = gamma;
+    }
+
+    uint8_t *base = CVPixelBufferGetBaseAddressOfPlane(dst, 0);
+    size_t h   = CVPixelBufferGetHeightOfPlane(dst, 0);
+    size_t w   = CVPixelBufferGetWidthOfPlane(dst, 0);
+    size_t bpr = CVPixelBufferGetBytesPerRowOfPlane(dst, 0);
+    if (base) {
+        for (size_t y = 0; y < h; y++) {
+            uint8_t *row = base + y * bpr;
+            for (size_t x = 0; x < w; x++) row[x] = sLut[row[x]];
+        }
+    }
+    CVPixelBufferUnlockBaseAddress(dst, 0);
+}
+
 - (BOOL)copyPixelBuffer:(CVPixelBufferRef)src into:(CVPixelBufferRef)dst
 {
     if (!src || !dst) return NO;
@@ -463,6 +499,18 @@ static void VCSampleYRange(CVPixelBufferRef pb, const char *tag)
         VCLog(@"写入系统帧失败 %d (src %zux%zu 0x%x -> dst %zux%zu 0x%x)",
               (int)st, sw, sh, (unsigned)sf, dw, dh, (unsigned)df);
         return NO;
+    }
+
+    // 开播页那条提亮曲线的反补偿（config.plist 的 outputGamma，1.0 = 不补）
+    {
+        static int sGammaLogs = 0;
+        double g = VCamConfig.shared.outputGamma;
+        if (g > 0.01 && fabs(g - 1.0) > 0.005) {
+            if (sGammaLogs++ < 3) {
+                VCLog(@"亮度反补偿 gamma=%.2f 已应用", g);
+            }
+            VCApplyOutputGamma(dst, g);
+        }
     }
     return YES;
 }

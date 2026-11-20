@@ -91,6 +91,8 @@ static NSString *VCJailbreakRoot(void)
     _outputGamma = 1.0;
     _outputSaturation = 1.0;
     _audioOffsetMs = 0.0;   // 素材自带音画错位时用，正数=声音往后推
+    _greenKeyEnabled = NO;
+    _greenKeyThreshold = 0.35;
     // 默认关：先让用户确认"不参与"时画面是什么样，再决定要不要开。
     _realCameraInfluence = 0.0;
 }
@@ -198,6 +200,8 @@ static BOOL VCAssetDirUsable(NSString *p, BOOL createIfMissing,
     if (d[@"outputGamma"])       _outputGamma = [d[@"outputGamma"] doubleValue];
     if (d[@"outputSaturation"])  _outputSaturation = [d[@"outputSaturation"] doubleValue];
     if (d[@"audioOffsetMs"])     _audioOffsetMs = [d[@"audioOffsetMs"] doubleValue];
+    if (d[@"greenKeyEnabled"])   _greenKeyEnabled = [d[@"greenKeyEnabled"] boolValue];
+    if (d[@"greenKeyThreshold"]) _greenKeyThreshold = [d[@"greenKeyThreshold"] doubleValue];
     if (d[@"realCameraInfluence"]) _realCameraInfluence = [d[@"realCameraInfluence"] doubleValue];
 
     // 实时源（OBS 推流）：sourceKind=1 时走 VCLiveSource

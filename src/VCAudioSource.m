@@ -147,6 +147,13 @@ NSString *const VCAudioSourceShouldResetNotification =
         }
         [self->_reader addOutput:self->_output];
 
+        // 首次加载也要带上音画偏移（素材自带「声音比画面快 0.5 秒」）
+        if (self->_offsetSeconds > 0.001) {
+            self->_reader.timeRange = CMTimeRangeMake(
+                CMTimeMakeWithSeconds(self->_offsetSeconds, 1000), kCMTimePositiveInfinity);
+            VCLog(@"音频源：起点偏移 %.2f s（补偿素材自带的音画错位）", self->_offsetSeconds);
+        }
+
         if (![self->_reader startReading]) {
             inner = self->_reader.error;
             VCLog(@"音频源：startReading 失败 %@",
@@ -186,6 +193,9 @@ NSString *const VCAudioSourceShouldResetNotification =
 
 - (void)reset
 {
+    // 注意：这里不能调 seekToTime —— 它内部会 dispatch_sync 到 _queue，
+    //  而我们此刻已经在 _queue 上，会直接死锁。
+    //  偏移由 restartLocked 里的 timeRange 处理。
     dispatch_async(_queue, ^{
         [self restartLocked];
     });
@@ -224,6 +234,12 @@ NSString *const VCAudioSourceShouldResetNotification =
     if (![_reader canAddOutput:_output]) { _ready = NO; return; }
     [_reader addOutput:_output];
 
+    // 重置也要带上音画偏移，否则每回绕一次丢一次补偿
+    if (_offsetSeconds > 0.001) {
+        _reader.timeRange = CMTimeRangeMake(
+            CMTimeMakeWithSeconds(_offsetSeconds, 1000), kCMTimePositiveInfinity);
+    }
+
     if (![_reader startReading]) {
         VCLog(@"音频源：重置后 startReading 失败 %@",
               _reader.error.localizedDescription);
@@ -242,6 +258,11 @@ NSString *const VCAudioSourceShouldResetNotification =
 ///  留余量会让音频永远落后一个固定的偏移。
 - (void)seekToTime:(double)seconds
 {
+    // 统一在这里加偏移：所有调用方（重定位、回绕、起点对齐）都不用关心。
+    //  实测素材自带「声音比画面快 0.5 秒」，offsetSeconds = +0.5 就把它抵掉。
+    seconds += _offsetSeconds;
+    if (seconds < 0) seconds = 0;
+
     // 必须同步：异步的话调用方设置好 _decodedMaterialSeconds 后立刻继续生产，
     // 而 seek 还没真正生效，读到的仍是旧位置的数据 —— 位置永远对不上。
     // 这里会阻塞几百毫秒，但调用方是后台生产线程，可以接受。

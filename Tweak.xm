@@ -414,6 +414,9 @@ static OSStatus hook_AudioUnitSetProperty(AudioUnit unit,
 static volatile int    g_auHookInstalled = 0;
 static volatile int    g_auRenderHits    = 0;
 static volatile int    g_auBus1Hits      = 0;
+// 心跳定时器：必须全局持有，放在 block 里的局部变量出作用域就被 ARC 释放，
+// 定时器会随之中止，等于没加。
+static dispatch_source_t g_heartbeatSource = nil;
 static volatile UInt32 g_auLastBus       = 0xFFFF;
 static volatile UInt32 g_auLastFrames    = 0;
 static volatile UInt32 g_auLastBuffers   = 0;
@@ -1156,19 +1159,18 @@ static void VCBootstrap(void)
         //    日志里心跳还在、别的没了  → 卡在具体某条链路上（主线程或采集队列）
         //    心跳也停了                → 整个进程被挂住
         dispatch_queue_t beatQ = dispatch_queue_create("vcam.heartbeat", DISPATCH_QUEUE_SERIAL);
-        static dispatch_source_t sBeat = nil;      // 必须静态持有，否则 ARC 会把它释放掉
         dispatch_source_t beat = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0, beatQ);
         dispatch_source_set_timer(beat, dispatch_time(DISPATCH_TIME_NOW, 1 * NSEC_PER_SEC),
                                   1 * NSEC_PER_SEC, 100 * NSEC_PER_MSEC);
         dispatch_source_set_event_handler(beat, ^{
             extern volatile int g_statVideoDelegates;
             static int sLastDelegates = -1;
-            int now = g_statVideoDelegates;
-            VCLog(@"[心跳] 采集帧计数=%d（较上次 %+d）", now,
-                  sLastDelegates < 0 ? 0 : now - sLastDelegates);
-            sLastDelegates = now;
+            int cur = g_statVideoDelegates;
+            VCLog(@"[心跳] 采集帧计数=%d（较上次 %+d）", cur,
+                  sLastDelegates < 0 ? 0 : cur - sLastDelegates);
+            sLastDelegates = cur;
         });
-        sBeat = beat;
+        g_heartbeatSource = beat;
         dispatch_resume(beat);
     });
 }

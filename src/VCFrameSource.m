@@ -61,7 +61,18 @@
 {
     if ((self = [super init])) {
         _lock = [[NSLock alloc] init];
-        _pixelFormat = kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange;
+        // ★ 解码输出用 BGRA，而不是 420v。
+        //
+        //  原因：素材是 BT.709（1080p 惯例），系统采集 buffer 声明 BT.601（720p 惯例）。
+        //  VTPixelTransferSession 做 YUV→YUV 时**不查矩阵**（实测：给它挂
+        //  kCVImageBufferYCbCrMatrixKey 也没用），只做缩放和 range 扩展 ——
+        //  于是 709 编出来的数据被当 601 解释：绿区变亮约 20%、红区变暗，
+        //  暖色为主的直播间画面整体提亮发白。
+        //
+        //  改成让解码器输出 RGB（AVAssetReader 会按素材自己的 709 声明正确转），
+        //  再由 VT 做 RGB→YUV(601)。RGB→YUV 这一步 VT 按目标分辨率选矩阵，可靠。
+        //  顺带省掉 YUV→YUV 来回下采样的色度损失。
+        _pixelFormat = kCVPixelFormatType_32BGRA;
         _fps = 30.0;
         _aspect = 1080.0 / 1920.0;
         _audioSampleRate = 48000.0;

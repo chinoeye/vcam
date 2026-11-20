@@ -480,10 +480,10 @@ static double VCComputeLumaGainFromRealCamera(double realLuma)
     extern volatile int g_statVideoDelegates;
     g_statVideoDelegates++;
 
-    // 采集回调耗时：超过 50ms 就记一笔。
-    //  卡死时这里能看出是哪一帧开始变慢的（解码？转换？还是某次 seek）。
+    // 采集回调耗时：正常结束路径上量一次，超过 50ms 记一笔。
+    //  卡死时能看出是哪一帧开始变慢（解码 / 转换 / seek）。
     double __t0 = CACurrentMediaTime();
-    @try {
+
     if (dropOut) *dropOut = NO;
     if (!buffer) return;
 
@@ -753,13 +753,12 @@ static double VCComputeLumaGainFromRealCamera(double realLuma)
     [VCOverlay pushVideoSampleBuffer:buffer];
 
     CVPixelBufferRelease(src);
-    } @finally {
-        double ms = (CACurrentMediaTime() - __t0) * 1000.0;
-        if (ms > 50.0) {
-            static int sSlowLogs = 0;
-            if (sSlowLogs++ < 15) {
-                VCLog(@"采集回调耗时 %.0f ms（超过 50ms，会造成卡顿/丢帧）", ms);
-            }
+
+    double __ms = (CACurrentMediaTime() - __t0) * 1000.0;
+    if (__ms > 50.0) {
+        static int sSlowLogs = 0;
+        if (sSlowLogs++ < 15) {
+            VCLog(@"采集回调耗时 %.0f ms（超过 50ms，会卡顿/丢帧）", __ms);
         }
     }
 }

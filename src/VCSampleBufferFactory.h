@@ -25,6 +25,13 @@ NS_ASSUME_NONNULL_BEGIN
 /// 目标帧率，用于填 duration
 @property (nonatomic, assign) double fps;
 
+/// 写入时对亮度的额外增益（1.0 = 不变）。
+///
+/// 由「真实摄像头参与」那条链路每帧算出来：真实画面的平均亮度相对启动时
+/// 偏移多少，素材就跟着亮/暗多少 —— 屋里开灯、拉窗帘，直播画面会跟着变。
+/// 这是预录素材做不出来的东西。
+@property (nonatomic, assign) double lumaGain;
+
 /// 视频：把 pixelBuffer 包成 CMSampleBuffer。
 /// 返回的 buffer 由调用方负责 CFRelease。
 /// 时间戳带人工抖动 + 强制单调递增，模拟真实传感器的调度浮动。

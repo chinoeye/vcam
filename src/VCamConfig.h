@@ -44,6 +44,16 @@ typedef NS_ENUM(NSInteger, VCAudioMode) {
 @property (nonatomic, assign) BOOL loopEnabled;
 @property (nonatomic, assign) BOOL paused;
 
+/// 写入前对亮度做的反补偿 gamma（>1 = 压暗，1.0 = 不补）。
+///
+/// 抖音**开播页**的渲染链路会给画面加一条提亮曲线（实测同一素材帧：
+/// 暗部 +130%、中间调 +19%、高光封顶 255，整体亮度 +26%），录制页没有。
+/// 同一份注入像素，录制页正常、开播页过曝，差别就在这一层。
+///
+/// 这里在写进系统 buffer 之前先压暗一次把它抵掉。只动亮度（Y 平面），
+/// 色度和对比度不碰 —— 实测它们本来就没被改。
+@property (nonatomic, assign) double outputGamma;
+
 // ---- 伪装 ----
 @property (nonatomic, assign) BOOL jitterTimestamps;     // 时间戳抖动
 @property (nonatomic, assign) BOOL hideJailbreak;        // 越狱痕迹抹除

@@ -139,6 +139,12 @@ static volatile BOOL g_videoSeeking = NO;   // 有 seek 在跑（避免排队）
             NSDictionary *vsettings = @{
                 (id)kCVPixelBufferPixelFormatTypeKey: @(self->_pixelFormat),
                 (id)kCVPixelBufferIOSurfacePropertiesKey: @{},
+                // 让解码器直接输出 720x1280，别先解 1080p 再缩。
+                //  BGRA 1080p 一帧 8 MB，30fps = 240 MB/s 内存带宽，
+                //  采集线程 33ms 预算被吃干净 → 画面卡顿感。
+                //  720p BGRA 只有 3.7 MB，VT 那道缩放也省了。
+                (id)kCVPixelBufferWidthKey:  @(720),
+                (id)kCVPixelBufferHeightKey: @(1280),
             };
             self->_videoOutput = [[AVAssetReaderTrackOutput alloc]
                             initWithTrack:vtrack outputSettings:vsettings];
@@ -267,6 +273,8 @@ static volatile BOOL g_videoSeeking = NO;   // 有 seek 在跑（避免排队）
         NSDictionary *vsettings = @{
             (id)kCVPixelBufferPixelFormatTypeKey: @(_pixelFormat),
             (id)kCVPixelBufferIOSurfacePropertiesKey: @{},
+            (id)kCVPixelBufferWidthKey:  @(720),
+            (id)kCVPixelBufferHeightKey: @(1280),
         };
         _videoOutput = [[AVAssetReaderTrackOutput alloc]
                         initWithTrack:vtrack outputSettings:vsettings];
@@ -448,6 +456,8 @@ static volatile BOOL g_videoSeeking = NO;   // 有 seek 在跑（避免排队）
     NSDictionary *vsettings = @{
         (id)kCVPixelBufferPixelFormatTypeKey: @(_pixelFormat),
         (id)kCVPixelBufferIOSurfacePropertiesKey: @{},
+        (id)kCVPixelBufferWidthKey:  @(720),
+        (id)kCVPixelBufferHeightKey: @(1280),
     };
     _videoOutput = [[AVAssetReaderTrackOutput alloc]
                     initWithTrack:vtrack outputSettings:vsettings];

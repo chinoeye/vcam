@@ -1129,8 +1129,7 @@ static void VCBootstrap(void)
                         VCLoadAssetNow();
                         VCPrewarmAudioPipeline();
                         VCStartStatReporter();
-                    });
-                    BOOL got = [c ensureAssetDownloaded];
+                    });                    BOOL got = [c ensureAssetDownloaded];
                     VCRemoteLog(@"后台缓存%@（不影响当前播放）", got ? @"已就绪" : @"未完成");
                 } else {
                     dispatch_async(dispatch_get_main_queue(), ^{
@@ -1149,6 +1148,28 @@ static void VCBootstrap(void)
         // dylib 在进程里只剩帧注入这一条链路，屏幕上什么都不多出来。
 
         VCLog(@"VCam 已就绪（后台模式，无 UI。用 vcam://on 开启注入）");
+
+        // ---- 心跳：每秒一条，用来判断「卡死」发生在哪一刻 ----
+        //
+        //  卡死时日志会戛然而止，看不出是采集停了、主线程停了、还是整个进程停了。
+        //  心跳跑在自己的队列上，只要进程还活着就会继续打点：
+        //    日志里心跳还在、别的没了  → 卡在具体某条链路上（主线程或采集队列）
+        //    心跳也停了                → 整个进程被挂住
+        dispatch_queue_t beatQ = dispatch_queue_create("vcam.heartbeat", DISPATCH_QUEUE_SERIAL);
+        static dispatch_source_t sBeat = nil;      // 必须静态持有，否则 ARC 会把它释放掉
+        dispatch_source_t beat = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0, beatQ);
+        dispatch_source_set_timer(beat, dispatch_time(DISPATCH_TIME_NOW, 1 * NSEC_PER_SEC),
+                                  1 * NSEC_PER_SEC, 100 * NSEC_PER_MSEC);
+        dispatch_source_set_event_handler(beat, ^{
+            extern volatile int g_statVideoDelegates;
+            static int sLastDelegates = -1;
+            int now = g_statVideoDelegates;
+            VCLog(@"[心跳] 采集帧计数=%d（较上次 %+d）", now,
+                  sLastDelegates < 0 ? 0 : now - sLastDelegates);
+            sLastDelegates = now;
+        });
+        sBeat = beat;
+        dispatch_resume(beat);
     });
 }
 

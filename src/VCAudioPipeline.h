@@ -45,6 +45,13 @@ NS_ASSUME_NONNULL_BEGIN
 /// 副作用更严重：每场录制都是同一段素材的开头，指纹高度重复。
 - (void)alignToVideoPosition;
 
+/// 把音频素材直接回到 0 秒（清空环形缓冲，重填）。
+///
+/// 录制起点和素材回绕都用这个 —— 那种场景下**视频也回到了 0**，
+/// 音频跟着回 0 才对。用 alignToVideoPosition 会把音频拽到视频的旧位置，
+/// 结果是视频 0、音频 11 秒，画面直接冻住（实测踩过）。
+- (void)resetToStart;
+
 /// 起点对齐是否正在进行（视频对齐要在这期间让路，否则两边互相拽）。
 @property (nonatomic, readonly) BOOL isAligning;
 

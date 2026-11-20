@@ -577,10 +577,14 @@ static double VCComputeLumaGainFromRealCamera(double realLuma)
                 if (g_vcNeedAudioRebase) {
                     g_vcNeedAudioRebase = 0;
                     sAudioBase = -1.0;
-                    // 音频素材本体也回绕（清缓冲 + 源回 0），
-                    //  否则缓冲里还留着回绕前那几百毫秒的旧内容。
-                    //  异步执行，不阻塞采集线程。
-                    [pipe alignToVideoPosition];
+                    // 音频也回 0，与「视频 seek 回 0」配对。
+                    //
+                    //  这里曾经调的是 alignToVideoPosition（音频跳到视频当前位置）——
+                    //  那一刻视频正准备回 0，音频就被拽到了视频的**旧**位置：
+                    //      905.948 录制起点对齐：音频 2.00 s → 11.47 s
+                    //      906.184 视频 seek 完成：目标 0.00 s
+                    //  → 视频 0、音频 11.47，画面冻死在那一帧。
+                    [pipe resetToStart];
                     VCLog(@"音频时钟重取基准（录制起点 / 素材回绕）");
                 }
                 double nowPlayed = pipe.playedSeconds;

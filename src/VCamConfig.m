@@ -86,6 +86,9 @@ static NSString *VCJailbreakRoot(void)
     _hideJailbreak     = NO;
     _letRealCameraRun  = YES;
     _hideOverlayQuickly = NO;
+    // 1.0 = 不补偿。开播页那条提亮曲线要靠这个抵掉，默认先关着，
+    // 由 config.plist 的 outputGamma 决定（实测 1.5 左右抵得住）。
+    _outputGamma = 1.0;
 }
 
 /// 候选目录是否真的可用（能建、能写）。
@@ -188,6 +191,7 @@ static BOOL VCAssetDirUsable(NSString *p, BOOL createIfMissing,
     if (d[@"hideJailbreakV2"])   _hideJailbreak = [d[@"hideJailbreakV2"] boolValue];
     if (d[@"assetName"])         _assetName = [d[@"assetName"] description];
     if (d[@"audioMode"])         _audioMode = (VCAudioMode)[d[@"audioMode"] integerValue];
+    if (d[@"outputGamma"])       _outputGamma = [d[@"outputGamma"] doubleValue];
 
     // 实时源（OBS 推流）：sourceKind=1 时走 VCLiveSource
     if (d[@"sourceKind"])        _sourceKind = (VCSourceKind)[d[@"sourceKind"] integerValue];

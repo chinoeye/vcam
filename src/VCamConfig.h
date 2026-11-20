@@ -67,6 +67,20 @@ typedef NS_ENUM(NSInteger, VCAudioMode) {
 ///  设 500 就能拉回来。只影响音频读取起点，面板里不用手动对轴。
 @property (nonatomic, assign) double audioOffsetMs;
 
+/// 绿幕抠像开关。
+///
+///  开了之后：摄像头对着绿幕，**绿幕区域显示素材**，非绿区域（手、商品、
+///  任何挡在镜头前的东西）保留真实摄像头画面。
+///
+///  和 realCameraInfluence 是两条完全不同的路：
+///    realCameraInfluence  改素材亮度（素材会变，实测不想要）
+///    greenKeyEnabled      素材不动，只是把绿幕"挖掉"换成素材
+@property (nonatomic, assign) BOOL greenKeyEnabled;
+
+/// 绿色判定半径（0~1，越大抠得越狠）。
+///  0.15 只抠很纯的绿；0.35 默认；0.6 连偏黄偏青的绿幕都能抠掉。
+@property (nonatomic, assign) double greenKeyThreshold;
+
 /// 真实摄像头对画面的影响力（0 = 不参与，1 = 完全跟随）。
 ///
 /// 手机镜头实时拍着环境，我们**不把真实画面叠上去**，只用它的平均亮度

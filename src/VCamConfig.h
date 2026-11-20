@@ -61,6 +61,12 @@ typedef NS_ENUM(NSInteger, VCAudioMode) {
 ///  看着比原来更"冲"。配合 0.65 左右能把色度收回去。
 @property (nonatomic, assign) double outputSaturation;
 
+/// 音频相对视频的偏移（毫秒，正数=声音往后推）。
+///
+///  素材自带音画错位时用：实测这段录播「声音比画面快 0.5 秒」，
+///  设 500 就能拉回来。只影响音频读取起点，面板里不用手动对轴。
+@property (nonatomic, assign) double audioOffsetMs;
+
 /// 真实摄像头对画面的影响力（0 = 不参与，1 = 完全跟随）。
 ///
 /// 手机镜头实时拍着环境，我们**不把真实画面叠上去**，只用它的平均亮度

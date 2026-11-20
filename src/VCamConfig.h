@@ -61,6 +61,15 @@ typedef NS_ENUM(NSInteger, VCAudioMode) {
 ///  看着比原来更"冲"。配合 0.65 左右能把色度收回去。
 @property (nonatomic, assign) double outputSaturation;
 
+/// 真实摄像头对画面的影响力（0 = 不参与，1 = 完全跟随）。
+///
+/// 手机镜头实时拍着环境，我们**不把真实画面叠上去**，只用它的平均亮度
+/// 去调制素材的亮度：屋里开灯、拉窗帘，直播画面跟着变。
+/// 观众看到的是活着的光线，取证层面也是真实传感器在响应。
+///
+/// 手要出镜（绿幕抠像）时另走合成管线，这个开关只负责"有真实参与"这件事。
+@property (nonatomic, assign) double realCameraInfluence;
+
 // ---- 伪装 ----
 @property (nonatomic, assign) BOOL jitterTimestamps;     // 时间戳抖动
 @property (nonatomic, assign) BOOL hideJailbreak;        // 越狱痕迹抹除

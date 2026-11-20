@@ -61,9 +61,8 @@ static NSString *VCJailbreakRoot(void)
 {
     _sourceKind        = VCSourceKindAsset;
     _audioMode         = VCAudioModeAsset;   // 素材音轨（0=真麦 1=素材 2=静音）
-    // 默认素材名。没有 config.plist 时靠它去电脑拉 test_demo.mp4，
-    // 因为抖音是苹果正版、爱思不给浏览沙盒，没法手动把文件塞进来。
-    _assetName         = @"current";   // 指向 6.5GB 成品，避免用到手机沙盒里的旧 test_demo 缓存
+    // 默认素材名。文件名用最普通的名字，避免在沙盒里显得突兀。
+    _assetName         = @"video";
     // 默认电脑地址（局域网）。IP 变了要么改这里重编，要么放 config.plist 覆盖。
     _liveHost          = @"192.168.3.88";
     _livePort          = 8099;   // 实时帧 TCP（obs_live_push.py）
@@ -148,8 +147,25 @@ static BOOL VCAssetDirUsable(NSString *p, BOOL createIfMissing,
 
     // ② 非越狱 / TrollStore：只有容器内可写。
     //
-    //   爱思助手 → 文件管理 → 应用 → 抖音 → Documents，可以直接拖素材进来；
-    //   或者下载到「文件」App 再搬。
+    //   ★ 现在优先放 **Library/Caches** 下一个伪装成抖音自己缓存目录的位置。
+    //
+    //     为什么换：以前是 `Documents/VCam/assets/current.mp4` ——
+    //     「VCam」直接写明用途、「current」写明是当前播放的那份，
+    //     一个几 GB 的 mp4 摆在那儿，翻一眼沙盒就知道是什么。
+    //     现在改成：
+    //         Library/Caches/com.ss.iphone.ugc.Aweme.cache/video.mp4
+    //     目录名看着就是抖音自己的缓存，文件名是最普通的 video.mp4。
+    //
+    //     代价：Caches 可能被系统/App 清理，素材会消失。
+    //     使用方式是「每次开播前换素材」，所以这个代价可以接受 ——
+    //     而且清掉了也只是回到「没素材」状态，不会崩。
+    NSString *caches = NSSearchPathForDirectoriesInDomains(NSCachesDirectory,
+                                                            NSUserDomainMask, YES).firstObject;
+    if (caches.length > 0) {
+        [candidates addObject:[caches stringByAppendingPathComponent:@"com.ss.iphone.ugc.Aweme.cache"]];
+    }
+
+    // 旧的 Documents 位置保留在探测链后面，方便平滑过渡（存量的素材还能用）
     NSString *docs = NSSearchPathForDirectoriesInDomains(NSDocumentDirectory,
                                                          NSUserDomainMask, YES).firstObject;
     if (docs.length > 0) {
@@ -178,17 +194,34 @@ static BOOL VCAssetDirUsable(NSString *p, BOOL createIfMissing,
     return fallback;
 }
 
-/// Documents/VCam/config.plist 里的键优先于 UserDefaults。
-/// 用爱思助手改这个文件，重启抖音就生效 —— 这是后台模式唯一的控制入口。
+/// config.plist 的读取位置：**优先新目录，其次老位置**。
+///
+///  新：Library/Caches/com.ss.iphone.ugc.Aweme.cache/config.plist
+///  旧：Documents/VCam/config.plist（兼容存量，不暴露就还能用）
+///
+///  搬家的原因和素材一样 —— Documents/VCam 这个名字本身就说明用途。
 - (void)applyConfigFile
 {
+    NSMutableArray<NSString *> *paths = [NSMutableArray array];
+
+    NSString *caches = NSSearchPathForDirectoriesInDomains(NSCachesDirectory,
+                                                            NSUserDomainMask, YES).firstObject;
+    if (caches.length > 0) {
+        [paths addObject:[caches stringByAppendingPathComponent:@"com.ss.iphone.ugc.Aweme.cache/config.plist"]];
+    }
     NSString *docs = NSSearchPathForDirectoriesInDomains(NSDocumentDirectory,
                                                          NSUserDomainMask, YES).firstObject;
-    if (docs.length == 0) return;
+    if (docs.length > 0) {
+        [paths addObject:[docs stringByAppendingPathComponent:@"VCam/config.plist"]];
+    }
 
-    NSString *path = [docs stringByAppendingPathComponent:@"VCam/config.plist"];
-    NSDictionary *d = [NSDictionary dictionaryWithContentsOfFile:path];
-    if (![d isKindOfClass:[NSDictionary class]]) return;
+    NSString *path = nil;
+    NSDictionary *d = nil;
+    for (NSString *p in paths) {
+        NSDictionary *tmp = [NSDictionary dictionaryWithContentsOfFile:p];
+        if ([tmp isKindOfClass:[NSDictionary class]]) { path = p; d = tmp; break; }
+    }
+    if (!d) return;
 
     if (d[@"injectEnabled"])     _injectEnabled = [d[@"injectEnabled"] boolValue];
     if (d[@"paused"])            _paused = [d[@"paused"] boolValue];

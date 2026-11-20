@@ -498,6 +498,13 @@ static volatile BOOL g_audioAligning = NO;
     _probeData = nil;
     _probeFrames = 0;
     _decodedMaterialSeconds = targetSeconds;
+    // ★ 转换器内部也压着数据，必须一起清。
+    //
+    //  以前只清环形缓冲和 carry，AudioConverter 自己的内部缓冲没动 ——
+    //  seek 之后头几百毫秒吐出来的还是旧位置的内容，成品音频于是
+    //  「频谱跟素材一模一样、时域相关性只有 0.1」：
+    //  每一小块都对，块与块之间是错位的。
+    if (_conv) AudioConverterReset(_conv);
     pthread_mutex_unlock(&_lock);
 }
 

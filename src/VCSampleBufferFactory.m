@@ -389,6 +389,26 @@
         }
     }
 
+    // ---- 告诉 VTPixelTransferSession 源和目标各是什么矩阵 ----
+    //
+    //  实测（诊断日志）：素材解码出来是 1080p / 420v / BT.709，
+    //  系统采集 buffer 是 720p / 420f，format description 声明 **BT.601**
+    //  （720p 的惯例）。两边矩阵不同。
+    //
+    //  但 VT 拿到的是 CVPixelBuffer，看不到 CMSampleBuffer 的 format
+    //  description —— 它按分辨率猜，两边都猜成 601，于是只做缩放和 range
+    //  扩展，**不做矩阵转换**。结果 709 的 YCbCr 被写进声明为 601 的 buffer，
+    //  偏色、发灰、对比度变平（看起来就是"偏白"）。
+    //
+    //  把矩阵显式挂在 buffer 上，VT 才有机会做真正的矩阵转换。
+    //  若实测证明它忽略这两个 attachment，就必须改 Metal 自己算 709→601。
+    CVBufferSetAttachment(src, kCVImageBufferYCbCrMatrixKey,
+                          kCVImageBufferYCbCrMatrix_ITU_R_709_2,
+                          kCVAttachmentMode_ShouldPropagate);
+    CVBufferSetAttachment(dst, kCVImageBufferYCbCrMatrixKey,
+                          kCVImageBufferYCbCrMatrix_ITU_R_601_4,
+                          kCVAttachmentMode_ShouldPropagate);
+
     OSStatus st = VTPixelTransferSessionTransferImage(_transfer, src, dst);
     {
         static int sConvLogs = 0;

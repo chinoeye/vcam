@@ -390,6 +390,15 @@
     }
 
     OSStatus st = VTPixelTransferSessionTransferImage(_transfer, src, dst);
+    {
+        static int sConvLogs = 0;
+        if (sConvLogs < 6) {
+            sConvLogs++;
+            VCLog(@"像素转换 %zux%zu 0x%x → %zux%zu 0x%x  %@",
+                  sw, sh, (unsigned)sf, dw, dh, (unsigned)df,
+                  st == noErr ? @"成功" : @"失败");
+        }
+    }
     if (st != noErr) {
         VCLog(@"写入系统帧失败 %d (src %zux%zu 0x%x -> dst %zux%zu 0x%x)",
               (int)st, sw, sh, (unsigned)sf, dw, dh, (unsigned)df);

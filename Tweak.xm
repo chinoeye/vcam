@@ -1089,6 +1089,9 @@ static void VCLoadAssetNow(void)
     }
 
     NSError *err = nil;
+    // 音画偏移必须在 loadURL 之前设好 —— 首次加载时 reader 的 timeRange
+    //  就要带上它，否则第一段音频仍然是错的。
+    [VCAudioSource shared].offsetSeconds = VCamConfig.shared.audioOffsetMs / 1000.0;
     [[VCAudioSource shared] loadURL:url error:NULL];
         if (![[VCFrameSource shared] reloadWithURL:url error:&err]) {
         VCRemoteLog(@"装载失败：%@ (%@)", err.localizedDescription, url.lastPathComponent);

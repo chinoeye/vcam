@@ -671,8 +671,42 @@ static OSStatus hook_AudioUnitRender(AudioUnit unit,
 // 只在「真摄像头不启动」的模式下需要伪造。
 // 默认让真摄像头空转，它自己就会报出正确的硬件参数，比我们伪造得更真。
 
-%hook AVCaptureDevice
+// ==================================================================
+#pragma mark - 显示层：关掉 EDR（HDR）渲染
+// ==================================================================
+//
+//  现象：同一次注入、同一份像素，录制页颜色正常，开播页偏白。
+//  截图像素统计（750x1334，取素材区域）：
+//
+//                录制页      开播页
+//    Y 均值      185.4      219.3     (+18.3%)
+//    饱和度      0.1929     0.0753    (-61%)     ← 提亮永远做不到这个
+//    色温 B/R    0.820      0.927     （暖色被拉平）
+//
+//  亮度升、饱和暴跌、色温中性化 —— 这是 tonemap 的指纹，不是"调亮"。
+//  AVSampleBufferDisplayLayer 一旦 wantsExtendedDynamicRangeContent = YES，
+//  就会把 SDR 内容映射到 EDR 显示范围，正好产生这三件事。
+//  直播页为了支持 HDR 直播几乎必然打开它；录制页没开，所以两边不一样。
+//
+//  我们送进去的是 SDR 素材，就该按 SDR 显示 —— 强制关掉。
+%hook AVSampleBufferDisplayLayer
 
+- (void)setWantsExtendedDynamicRangeContent:(BOOL)flag
+{
+    if (flag && VCamConfig.shared.injectEnabled) {
+        static int sLogs = 0;
+        if (sLogs++ < 3) {
+            VCLog(@"拦截 EDR 渲染（wantsExtendedDynamicRangeContent=YES → NO）");
+        }
+        %orig(NO);
+        return;
+    }
+    %orig(flag);
+}
+
+%end
+
+%hook AVCaptureDevice
 - (BOOL)isConnected
 {
     if (!VCIsBackCamera(self)) return %orig;

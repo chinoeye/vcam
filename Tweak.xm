@@ -614,8 +614,13 @@ static OSStatus hook_AudioUnitRender(AudioUnit unit,
     //  T230 疯狂触发 634 次造成 13.5 秒静音。结论写在 T187：
     //  「实时链路里禁止任何 seek」。这一次是唯一允许的例外，因为它只发生一次。
     if (g_audioWriteOK == 1) {
-        // 让帧源把音频时钟基准也重置 —— playedSeconds 是累计量（预览期也在涨），
-        //  必须与「视频回 0 秒」同一起跑线，否则追帧会一路加速。
+        // 只让帧源重取音频时钟基准，**不 seek 音频素材**。
+        //
+        //  录制之前音频管道压根没被消费过，它的预热缓冲里就是从素材 0 秒
+        //  开始解码出来的正确内容。再 seek 一次只是把 reader 重建一遍，
+        //  还会把转换器里的残留数据带进来 —— 实测那样出来的音频
+        //  「频谱跟素材一样、时域对不上」，块与块之间错位。
+        //  素材回绕那种情况才需要真的 seek（由 VCFrameSource 另行置位）。
         extern volatile int g_vcNeedAudioRebase;
         g_vcNeedAudioRebase = 1;
         VCLog(@"录制起点：视频读指针回到素材 0 秒（一次性），音频时钟重取基准");

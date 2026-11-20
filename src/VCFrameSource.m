@@ -485,6 +485,18 @@ static volatile BOOL g_videoSeeking = NO;   // 有 seek 在跑（避免排队）
         postNotificationName:VCAudioSourceShouldResetNotification
                       object:nil];
 
+    // ★ 音频**时钟**也要重置。
+    //
+    //  只通知 VCAudioSource 不够：音频管道那层的 playedSeconds 是累计量，
+    //  回绕不会让它归零。实测素材 600 秒播满回绕后：
+    //      素材=2.80   音频=601.05     ← 素材回 0，音频还在 601
+    //  差距 600 秒永远追不上，每个采集回调取满 4 帧 → 画面 3 倍速。
+    //  这正是「播着播着突然加速」的真凶：素材长度一到就触发。
+    {
+        extern volatile int g_vcNeedAudioRebase;
+        g_vcNeedAudioRebase = 1;
+    }
+
     return YES;
 }
 

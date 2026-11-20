@@ -609,14 +609,18 @@ static double VCComputeLumaGainFromRealCamera(double realLuma)
         }
 
         int guard = 0;
+        int fetchedThisCallback = 0;
         double loopT0 = CACurrentMediaTime();
         while (guard < 4) {
-            // 采集线程不能被解码堵死：一帧间隔 33 ms，这里最多花 18 ms。
-            //  1080p 素材软解一帧 20~40 ms，目标位置一旦跳变，无上限地追帧
-            //  就会把 AVCaptureVideoDataOutput 的队列彻底堵住 —— 预览冻结、
-            //  录制页卡死（实测 94 秒没有任何回调）。宁可这帧少追一点，
-            //  下一帧继续，也不能把实时线程拖住。
-            if (CACurrentMediaTime() - loopT0 > 0.018) break;
+            // 采集线程不能被解码堵死，但也不能卡得太紧。
+            //
+            //  以前是 18 ms：1080p BGRA 解码一帧要 20~30 ms，18 ms 连一帧都取不完，
+            //  于是「抖音 29.48 fps 回调 vs 素材 30 fps」这点固有差距永远补不上，
+            //  视频内容每秒只走 0.959 秒，15 秒录制下来比音频落后 0.6 秒 ——
+            //  这就是「音画对不上」的实测来源。
+            //
+            //  放宽到 28 ms（仍小于一帧间隔 33.9 ms），让追帧有机会一次取两帧。
+            if (CACurrentMediaTime() - loopT0 > 0.028) break;
 
             // 配额（防超速）与追帧（防落后）同时生效
             //
@@ -642,6 +646,7 @@ static double VCComputeLumaGainFromRealCamera(double realLuma)
             CVPixelBufferRelease(pb);
             g_videoTotalFetched++;
             guard++;
+            fetchedThisCallback++;
         }
 
         {
@@ -656,13 +661,15 @@ static double VCComputeLumaGainFromRealCamera(double realLuma)
 
         // 节奏日志：每 2 秒一行，长期跑也能看出是哪一边失控。
         //  正常时三条数应该几乎相等；素材 > 真实 = 加速，素材 < 真实 = 卡顿。
+        //  最后两项是「本次实际取了几帧」——用来判断追帧有没有被时间上限截断：
+        //  稳定在 1 说明刚好跟上，频繁 2~4 说明在补差距，持续 0 说明被锁/解码拖住。
         {
             static double sLastPaceLog = 0.0;
             if (now - sLastPaceLog > 2.0) {
                 sLastPaceLog = now;
-                VCLog(@"节奏 素材=%.2f 音频=%.2f 真实=%.2f 本次取=%d",
+                VCLog(@"节奏 素材=%.2f 音频=%.2f 真实=%.2f 本次取=%d 累计出帧=%llu",
                       [VCFrameSource shared].currentVideoSourceTime,
-                      audioTarget, wallSeconds, guard);
+                      audioTarget, wallSeconds, fetchedThisCallback, g_videoTotalFetched);
             }
         }
 

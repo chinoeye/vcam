@@ -89,6 +89,7 @@ static NSString *VCJailbreakRoot(void)
     // 1.0 = 不补偿。开播页那条提亮曲线要靠这个抵掉，默认先关着，
     // 由 config.plist 的 outputGamma 决定（实测 1.5 左右抵得住）。
     _outputGamma = 1.0;
+    _outputSaturation = 1.0;
 }
 
 /// 候选目录是否真的可用（能建、能写）。
@@ -192,6 +193,7 @@ static BOOL VCAssetDirUsable(NSString *p, BOOL createIfMissing,
     if (d[@"assetName"])         _assetName = [d[@"assetName"] description];
     if (d[@"audioMode"])         _audioMode = (VCAudioMode)[d[@"audioMode"] integerValue];
     if (d[@"outputGamma"])       _outputGamma = [d[@"outputGamma"] doubleValue];
+    if (d[@"outputSaturation"])  _outputSaturation = [d[@"outputSaturation"] doubleValue];
 
     // 实时源（OBS 推流）：sourceKind=1 时走 VCLiveSource
     if (d[@"sourceKind"])        _sourceKind = (VCSourceKind)[d[@"sourceKind"] integerValue];

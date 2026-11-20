@@ -393,6 +393,80 @@ double g_vcRecordEndErr      = 0.0;   // 停录瞬间的偏差
 //
 //  改成原地改写后，PTS / attachments / format description 全是原生，
 //  App 完全感知不到差异。代价是每帧一次 memcpy 或一次 GPU 缩放。
+// ------------------------------------------------------------------ 真实摄像头参与
+//
+//  思路：dst 在这一刻还是**真实摄像头画面**（我们还没覆盖它）。
+//  覆盖之前先读一眼它的亮度，用这个亮度相对「启动时基准」的偏移，
+//  去调制素材的亮度 —— 屋里开灯、拉窗帘、换光源，直播画面会跟着变。
+//
+//  为什么值得做：预录素材最大的破绽就是"死的" —— 环境变了画面不变。
+//  真实摄像头的传感器噪声和自动曝光是活的，这一层让输出也活起来。
+//
+//  成本：720x1280 每 16 像素采一点 ≈ 3600 次读，微秒级。
+
+static double VCSampleLumaFast(CVPixelBufferRef pb)
+{
+    if (!pb || CVPixelBufferGetPlaneCount(pb) < 1) return -1.0;
+    if (CVPixelBufferLockBaseAddress(pb, kCVPixelBufferLock_ReadOnly) != kCVReturnSuccess) {
+        return -1.0;
+    }
+
+    double sum = 0;
+    size_t n = 0;
+    uint8_t *base = CVPixelBufferGetBaseAddressOfPlane(pb, 0);
+    size_t h   = CVPixelBufferGetHeightOfPlane(pb, 0);
+    size_t w   = CVPixelBufferGetWidthOfPlane(pb, 0);
+    size_t bpr = CVPixelBufferGetBytesPerRowOfPlane(pb, 0);
+
+    if (base) {
+        for (size_t y = 0; y < h; y += 16) {
+            const uint8_t *row = base + y * bpr;
+            for (size_t x = 0; x < w; x += 16) {
+                sum += row[x];
+                n++;
+            }
+        }
+    }
+    CVPixelBufferUnlockBaseAddress(pb, kCVPixelBufferLock_ReadOnly);
+    return n ? (sum / (double)n) : -1.0;
+}
+
+/// 由真实画面亮度算素材的亮度增益。返回 1.0 表示不干预。
+static double VCComputeLumaGainFromRealCamera(double realLuma)
+{
+    double influence = VCamConfig.shared.realCameraInfluence;
+    if (!(influence > 0.001) || !(realLuma > 0)) return 1.0;
+
+    static double sSmooth = -1.0;
+    static double sBaseline = -1.0;
+    static int    sLogs = 0;
+
+    // 指数平滑：真实场景的测光本身就在抖，直接用会闪
+    sSmooth = (sSmooth < 0) ? realLuma : (sSmooth * 0.85 + realLuma * 0.15);
+
+    if (sBaseline < 0) {
+        sBaseline = sSmooth;
+        VCLog(@"真实摄像头参与：基准亮度 %.1f，influence=%.2f", sBaseline, influence);
+        return 1.0;
+    }
+
+    // 偏移量归一化到 [-1, 1]：128 级 ≈ 满量程
+    double delta = (sSmooth - sBaseline) / 128.0;
+    if (delta >  1.0) delta =  1.0;
+    if (delta < -1.0) delta = -1.0;
+
+    // 最大 ±35%，避免环境剧变时画面跟着失控
+    double gain = 1.0 + delta * influence * 0.35;
+    if (gain < 0.70) gain = 0.70;
+    if (gain > 1.30) gain = 1.30;
+
+    if (sLogs < 5 && fabs(gain - 1.0) > 0.02) {
+        sLogs++;
+        VCLog(@"光照跟随：真实 %.1f（基准 %.1f）→ 素材增益 %.3f", sSmooth, sBaseline, gain);
+    }
+    return gain;
+}
+
 - (void)rewriteVideoBufferInPlace:(CMSampleBufferRef)buffer drop:(BOOL *)dropOut
 {
     extern volatile int g_statVideoDelegates;
@@ -558,6 +632,12 @@ double g_vcRecordEndErr      = 0.0;   // 停录瞬间的偏差
         }
         if (dropOut) *dropOut = YES;
         return;
+    }
+
+    // 覆盖之前先读一眼真实画面，算出素材该跟着亮多少
+    {
+        double realLuma = VCSampleLumaFast(dst);
+        [VCSampleBufferFactory shared].lumaGain = VCComputeLumaGainFromRealCamera(realLuma);
     }
 
     if (![[VCSampleBufferFactory shared] copyPixelBuffer:src into:dst]) {

@@ -573,7 +573,11 @@ static double VCComputeLumaGainFromRealCamera(double realLuma)
                 if (g_vcNeedAudioRebase) {
                     g_vcNeedAudioRebase = 0;
                     sAudioBase = -1.0;
-                    VCLog(@"音频时钟重新取基准（录制开始）");
+                    // 音频素材本体也回绕（清缓冲 + 源回 0），
+                    //  否则缓冲里还留着回绕前那几百毫秒的旧内容。
+                    //  异步执行，不阻塞采集线程。
+                    [pipe alignToVideoPosition];
+                    VCLog(@"音频时钟重取基准（录制起点 / 素材回绕）");
                 }
                 double nowPlayed = pipe.playedSeconds;
                 if (sAudioBase < 0.0) {

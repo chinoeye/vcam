@@ -62,6 +62,7 @@ static NSLock *VCProxyLock(void)
 //  放成文件级静态量，所有实例共享同一份会话起点和累计计数。
 static double   g_videoSessionStart = 0.0;   // 首次出帧的绝对时刻，只赋值一次
 static uint64_t g_videoTotalFetched = 0;     // 累计出帧数，只增不减
+static double   g_recordStartAt = 0.0;       // 开始录制（首次有音频时钟）的绝对时刻
 
 // 音画对齐的诊断量（报告读它们）。
 //  为什么单独记：录完之后预览会继续推帧，直接用「当前视频位置 − 当前音频位置」
@@ -568,6 +569,24 @@ static double VCComputeLumaGainFromRealCamera(double realLuma)
             audioTarget = now - g_videoSessionStart;
         }
 
+        // ---- 真实时间上限：音频时钟再快，也不许超过真实流逝 ----
+        //
+        //  加速的根因：追帧目标是 playedSeconds（= 已消费音频帧 / 44100）。
+        //  音频环形缓冲欠载时 fillIOData 会**重复上一块**把缓冲填满，
+        //  这些重复帧照样计入 _consumed —— playedSeconds 于是跑得比真实时间快，
+        //  视频一路追着它取帧，看起来就是「播着播着开始加速」。
+        //
+        //  加一条硬上限：视频位置绝不超过「开始录制至今的真实秒数」。
+        //  音频再虚高，画面最多是稍微落后，不会变成倍速。
+        double wallSeconds = -1.0;
+        if (audioTarget > 0.0) {
+            if (g_recordStartAt <= 0.0) g_recordStartAt = now;
+            wallSeconds = now - g_recordStartAt;
+            if (wallSeconds < audioTarget) {
+                audioTarget = wallSeconds;
+            }
+        }
+
         int guard = 0;
         double loopT0 = CACurrentMediaTime();
         while (guard < 4) {
@@ -611,6 +630,18 @@ static double VCComputeLumaGainFromRealCamera(double realLuma)
                 VCLog(@"出帧 #%d 已出=%llu 允许=%.1f 本次取=%d 目标=%.2f 素材位置=%.3f",
                       sDbg, g_videoTotalFetched, allowed, guard,
                       audioTarget, [VCFrameSource shared].currentVideoSourceTime);
+            }
+        }
+
+        // 节奏日志：每 2 秒一行，长期跑也能看出是哪一边失控。
+        //  正常时三条数应该几乎相等；素材 > 真实 = 加速，素材 < 真实 = 卡顿。
+        {
+            static double sLastPaceLog = 0.0;
+            if (now - sLastPaceLog > 2.0) {
+                sLastPaceLog = now;
+                VCLog(@"节奏 素材=%.2f 音频=%.2f 真实=%.2f 本次取=%d",
+                      [VCFrameSource shared].currentVideoSourceTime,
+                      audioTarget, wallSeconds, guard);
             }
         }
 

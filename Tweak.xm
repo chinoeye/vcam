@@ -611,7 +611,11 @@ static OSStatus hook_AudioUnitRender(AudioUnit unit,
     //  T230 疯狂触发 634 次造成 13.5 秒静音。结论写在 T187：
     //  「实时链路里禁止任何 seek」。这一次是唯一允许的例外，因为它只发生一次。
     if (g_audioWriteOK == 1) {
-        VCLog(@"录制起点：视频读指针回到素材 0 秒（一次性）");
+        // 让帧源把音频时钟基准也重置 —— playedSeconds 是累计量（预览期也在涨），
+        //  必须与「视频回 0 秒」同一起跑线，否则追帧会一路加速。
+        extern volatile int g_vcNeedAudioRebase;
+        g_vcNeedAudioRebase = 1;
+        VCLog(@"录制起点：视频读指针回到素材 0 秒（一次性），音频时钟重取基准");
         [[VCFrameSource shared] seekVideoToTime:0.0];
     }
 

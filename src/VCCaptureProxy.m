@@ -64,6 +64,13 @@ static double   g_videoSessionStart = 0.0;   // 首次出帧的绝对时刻，�
 static uint64_t g_videoTotalFetched = 0;     // 累计出帧数，只增不减
 static double   g_recordStartAt = 0.0;       // 开始录制（首次有音频时钟）的绝对时刻
 
+// 录制开始时由 Tweak 置 1，让帧源重新取音频时钟基准。
+//
+//  playedSeconds 是「管道启动以来的累计消费时长」（绝对值），而素材位置是
+//  「从录制起点算起」（相对值）。两者原点不同，直接相减就会一路加速 ——
+//  实测：素材 88 秒时音频计数已经 834 秒，追帧永远追不上，每次回调都取满 4 帧。
+volatile int g_vcNeedAudioRebase = 0;
+
 // 音画对齐的诊断量（报告读它们）。
 //  为什么单独记：录完之后预览会继续推帧，直接用「当前视频位置 − 当前音频位置」
 //  会把停录后那几秒算成误差。分开记，报告里才说人话。
@@ -548,18 +555,39 @@ static double VCComputeLumaGainFromRealCamera(double realLuma)
         //  直到读指针追上目标。这样不管素材是 24 / 25 / 30 / 60 / 120 fps，
         //  输出都是真实时间速度。
         double audioTarget = -1.0;
+        double wallSeconds = -1.0;
         {
             VCAudioPipeline *pipe = [VCAudioPipeline shared];
             if (pipe.isRunning && pipe.consumedFrames > 0) {
-                // 用「已播时长」当目标：单调、平滑。
+                // ★ 必须用**增量**，不能用 playedSeconds 的绝对值。
                 //
-                //  以前用 decodedMaterialSeconds − currentDrift，那是「解码 − 缓冲」，
-                //  缓冲深度一变它就跳。实测录制刚启动时预热缓冲从 2 s 掉到 0.3 s，
-                //  这个值在一帧之内从 0.10 跳到 0.49 再跳到 0.91 ——
-                //  追帧循环当场吃满 8 帧上限，1080p 解码把采集线程堵死，
-                //  表现就是「一点录制就卡死」。
-                double p = pipe.playedSeconds;
-                if (isfinite(p) && p >= 0.0) audioTarget = p;
+                //  playedSeconds = _consumed / 44100，是从管道启动算起的累计量，
+                //  预览阶段也在增长（实测：App 跑了 840 秒，它就到 834 秒）。
+                //  而素材位置从这里录制起点算起，从 0 开始。
+                //  两者原点不同，拿绝对值当目标就会一路加速：
+                //      节奏 素材=88.67 音频=834.88 本次取=4   ← 追不上，每次取满 4 帧
+                //
+                //  所以录制开始时记一个基准，之后只取差值 —— 从 0 起跑，
+                //  与「视频被 seek 回 0」是同一条起跑线。
+                static double sAudioBase = -1.0;
+                if (g_vcNeedAudioRebase) {
+                    g_vcNeedAudioRebase = 0;
+                    sAudioBase = -1.0;
+                    VCLog(@"音频时钟重新取基准（录制开始）");
+                }
+                double nowPlayed = pipe.playedSeconds;
+                if (sAudioBase < 0.0) {
+                    sAudioBase = nowPlayed;
+                    g_recordStartAt = now;
+                    VCLog(@"音频时钟基准 = %.2f s", sAudioBase);
+                }
+                double p = nowPlayed - sAudioBase;
+                if (isfinite(p) && p >= 0.0) {
+                    audioTarget = p;
+                    // 兜底：真实流逝是硬上限，音频计数再虚高也不许超
+                    wallSeconds = now - g_recordStartAt;
+                    if (wallSeconds < audioTarget) audioTarget = wallSeconds;
+                }
             }
         }
         // 预览期没有音频时钟（还没开录，没人消费音频），退化成真实时间当目标。
@@ -567,24 +595,6 @@ static double VCComputeLumaGainFromRealCamera(double realLuma)
         //  看着像慢动作，很容易被当成同步出问题。
         if (audioTarget < 0.0 && g_videoSessionStart > 0.0) {
             audioTarget = now - g_videoSessionStart;
-        }
-
-        // ---- 真实时间上限：音频时钟再快，也不许超过真实流逝 ----
-        //
-        //  加速的根因：追帧目标是 playedSeconds（= 已消费音频帧 / 44100）。
-        //  音频环形缓冲欠载时 fillIOData 会**重复上一块**把缓冲填满，
-        //  这些重复帧照样计入 _consumed —— playedSeconds 于是跑得比真实时间快，
-        //  视频一路追着它取帧，看起来就是「播着播着开始加速」。
-        //
-        //  加一条硬上限：视频位置绝不超过「开始录制至今的真实秒数」。
-        //  音频再虚高，画面最多是稍微落后，不会变成倍速。
-        double wallSeconds = -1.0;
-        if (audioTarget > 0.0) {
-            if (g_recordStartAt <= 0.0) g_recordStartAt = now;
-            wallSeconds = now - g_recordStartAt;
-            if (wallSeconds < audioTarget) {
-                audioTarget = wallSeconds;
-            }
         }
 
         int guard = 0;

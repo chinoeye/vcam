@@ -442,10 +442,17 @@ double g_vcRecordEndErr      = 0.0;   // 停录瞬间的偏差
         if (fps < 1.0) fps = 30.0;
         double now = CACurrentMediaTime();
 
-        // ---- 先对齐音画，再谈节流 ----
-        //  顺序不能反：对齐会把读指针挪到音频位置，
-        //  挪完这一帧才算「真的从素材里取了一帧」，配额计数才有意义。
-        [self syncVideoToAudioClockNow:now];
+        // ---- 不再做周期性音画校正 ----
+        //
+        //  旧会话里这套东西试过五轮，每次都把链路搞坏：
+        //    T163  seek 死循环（254 次 = 调用次数）
+        //    T186  96 次 seek，丢 25 秒数据，103 次缓冲欠载
+        //    T230  疯狂触发 634 次，13.5 秒静音
+        //  结论（T187）：实时链路里禁止任何 seek。
+        //
+        //  现在只保留「追帧」：目标位置由音频已播时长决定，落后就多取几帧、
+        //  追上就停。全程不重建 reader，不跳位置。
+        //  录制起点由 Tweak 层一次性把视频拉回 0 秒，那是唯一的一次 seek。
 
         if (g_videoSessionStart <= 0) {
             g_videoSessionStart = now;

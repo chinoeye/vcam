@@ -361,39 +361,78 @@ static void VCSampleYRange(CVPixelBufferRef pb, const char *tag)
     CVPixelBufferUnlockBaseAddress(pb, kCVPixelBufferLock_ReadOnly);
 }
 
-// 亮度反补偿：把开播页那条提亮曲线抵掉。
+// 亮度 + 饱和度的反补偿：把开播页那条提亮曲线抵掉。
 //
-//  只动 Y 平面（亮度），色度 U/V 完全不动 —— 实测开播页只改了亮度曲线
-//  （暗部 +130%、中间调 +19%、高光封顶），对比度和饱和度基本没变。
+//  ★ 必须两个平面一起动。
 //
-//  gamma > 1 是压暗：out = 255 × (in/255)^gamma
-//  对 720x1280 来说 92 万次查表，约 1~3 ms，可接受。
-static void VCApplyOutputGamma(CVPixelBufferRef dst, double gamma)
+//  第一版只压了 Y，结果亮度是对了，但**饱和度凭空涨了 52%**：
+//    在 YUV 空间里饱和度 ∝ |U-128| / Y
+//    Y 压暗 34%、U/V 没动 → 相对色度变大 → 画面变艳、红色通道尤其突出
+//    （实测：R +29，而 G/B 只 +3~5）
+//
+//  所以：
+//    Y  平面： out = 255 × (in/255)^gamma       压暗
+//    UV 平面： out = 128 + (in-128) × satScale  把被放大的色度收回去
+//
+//  两个平面合计约 138 万次查表（720p），1~2 ms。
+static void VCApplyOutputGrade(CVPixelBufferRef dst, double gamma, double satScale)
 {
-    if (!dst || !(gamma > 0.01) || fabs(gamma - 1.0) < 0.005) return;
+    BOOL doY  = (gamma > 0.01 && fabs(gamma - 1.0) >= 0.005);
+    BOOL doUV = (satScale > 0.01 && fabs(satScale - 1.0) >= 0.005);
+    if (!dst || (!doY && !doUV)) return;
     if (CVPixelBufferGetPlaneCount(dst) < 1) return;
     if (CVPixelBufferLockBaseAddress(dst, 0) != kCVReturnSuccess) return;
 
-    static uint8_t sLut[256];
-    static double  sLutGamma = -1.0;
-    if (fabs(sLutGamma - gamma) > 0.001) {
+    // ---- Y：gamma 表 ----
+    static uint8_t sYLut[256];
+    static double  sYLutGamma = -1.0;
+    if (doY && fabs(sYLutGamma - gamma) > 0.001) {
         for (int i = 0; i < 256; i++) {
             double v = pow(i / 255.0, gamma) * 255.0;
-            sLut[i] = (uint8_t)(v < 0 ? 0 : (v > 255 ? 255 : v + 0.5));
+            sYLut[i] = (uint8_t)(v < 0 ? 0 : (v > 255 ? 255 : v + 0.5));
         }
-        sLutGamma = gamma;
+        sYLutGamma = gamma;
     }
 
-    uint8_t *base = CVPixelBufferGetBaseAddressOfPlane(dst, 0);
-    size_t h   = CVPixelBufferGetHeightOfPlane(dst, 0);
-    size_t w   = CVPixelBufferGetWidthOfPlane(dst, 0);
-    size_t bpr = CVPixelBufferGetBytesPerRowOfPlane(dst, 0);
-    if (base) {
-        for (size_t y = 0; y < h; y++) {
-            uint8_t *row = base + y * bpr;
-            for (size_t x = 0; x < w; x++) row[x] = sLut[row[x]];
+    // ---- UV：饱和度表（以 128 为中心缩放）----
+    static uint8_t sUVLut[256];
+    static double  sUVLutScale = -1.0;
+    if (doUV && fabs(sUVLutScale - satScale) > 0.001) {
+        for (int i = 0; i < 256; i++) {
+            double v = 128.0 + (i - 128.0) * satScale;
+            sUVLut[i] = (uint8_t)(v < 0 ? 0 : (v > 255 ? 255 : v + 0.5));
+        }
+        sUVLutScale = satScale;
+    }
+
+    // Y 平面
+    if (doY) {
+        uint8_t *base = CVPixelBufferGetBaseAddressOfPlane(dst, 0);
+        size_t h   = CVPixelBufferGetHeightOfPlane(dst, 0);
+        size_t w   = CVPixelBufferGetWidthOfPlane(dst, 0);
+        size_t bpr = CVPixelBufferGetBytesPerRowOfPlane(dst, 0);
+        if (base) {
+            for (size_t y = 0; y < h; y++) {
+                uint8_t *row = base + y * bpr;
+                for (size_t x = 0; x < w; x++) row[x] = sYLut[row[x]];
+            }
         }
     }
+
+    // UV 平面（420 半分辨率，每像素 2 字节 CbCr）
+    if (doUV && CVPixelBufferGetPlaneCount(dst) >= 2) {
+        uint8_t *base = CVPixelBufferGetBaseAddressOfPlane(dst, 1);
+        size_t h   = CVPixelBufferGetHeightOfPlane(dst, 1);
+        size_t bpr = CVPixelBufferGetBytesPerRowOfPlane(dst, 1);
+        size_t bytes = CVPixelBufferGetWidthOfPlane(dst, 1) * 2;
+        if (base) {
+            for (size_t y = 0; y < h; y++) {
+                uint8_t *row = base + y * bpr;
+                for (size_t x = 0; x < bytes; x++) row[x] = sUVLut[row[x]];
+            }
+        }
+    }
+
     CVPixelBufferUnlockBaseAddress(dst, 0);
 }
 
@@ -501,15 +540,19 @@ static void VCApplyOutputGamma(CVPixelBufferRef dst, double gamma)
         return NO;
     }
 
-    // 开播页那条提亮曲线的反补偿（config.plist 的 outputGamma，1.0 = 不补）
+    // 开播页那条提亮曲线的反补偿（config.plist 的 outputGamma / outputSaturation）
     {
         static int sGammaLogs = 0;
-        double g = VCamConfig.shared.outputGamma;
-        if (g > 0.01 && fabs(g - 1.0) > 0.005) {
+        VCamConfig *cfg = VCamConfig.shared;
+        double g = cfg.outputGamma;
+        double s = cfg.outputSaturation;
+        BOOL needG = (g > 0.01 && fabs(g - 1.0) > 0.005);
+        BOOL needS = (s > 0.01 && fabs(s - 1.0) > 0.005);
+        if (needG || needS) {
             if (sGammaLogs++ < 3) {
-                VCLog(@"亮度反补偿 gamma=%.2f 已应用", g);
+                VCLog(@"输出补偿 gamma=%.2f 饱和=%.2f 已应用", g, s);
             }
-            VCApplyOutputGamma(dst, g);
+            VCApplyOutputGrade(dst, g, s);
         }
     }
     return YES;

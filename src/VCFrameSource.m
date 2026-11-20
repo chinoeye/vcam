@@ -494,7 +494,9 @@ static volatile BOOL g_videoSeeking = NO;   // 有 seek 在跑（避免排队）
     //  这正是「播着播着突然加速」的真凶：素材长度一到就触发。
     {
         extern volatile int g_vcNeedAudioRebase;
+        extern volatile int g_vcNeedAudioRewind;
         g_vcNeedAudioRebase = 1;
+        g_vcNeedAudioRewind = 1;   // 回绕：音频素材也要真的 seek 回 0
     }
 
     return YES;

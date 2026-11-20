@@ -313,6 +313,22 @@ static volatile BOOL g_audioAligning = NO;
 
 - (BOOL)isAligning { return g_audioAligning; }
 
+/// 音频素材回到 0 秒。录制起点 / 素材回绕时用。
+///
+/// 必须和「视频 seek 回 0」配对。那两种场景视频都回到了 0，
+/// 音频若用 alignToVideoPosition（跳到视频**旧**位置），就会变成
+/// 视频 0、音频 11 秒 —— 画面冻在那一帧不动（实测踩过这个坑）。
+- (void)resetToStart
+{
+    g_audioAligning = YES;
+    dispatch_async(_queue, ^{
+        [self seekAudioToTime:0.0];
+        [self produceFrames:(size_t)(_dstFormat.mSampleRate * 0.3)];
+        g_audioAligning = NO;
+        VCLog(@"音频素材已回到 0 秒");
+    });
+}
+
 /// 把音频素材对齐到视频当前所在位置（录制起点的无缝衔接）。
 ///
 /// 只在偏差真的大到「明显错开」时才动（> 2 s），

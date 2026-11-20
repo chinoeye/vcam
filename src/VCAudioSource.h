@@ -46,6 +46,16 @@ extern NSString *const VCAudioSourceShouldResetNotification;
 /// 跳到素材内的指定秒（用于音画对齐校正）
 - (void)seekToTime:(double)seconds;
 
+/// 音频相对视频的整体偏移（秒），seekToTime 内部会自动加上。
+///
+///  直播录播素材常常自带音画错位（两条流独立录制、合成时差几十到几百毫秒）。
+///  实测这段素材「声音比画面快 0.5 秒」—— 是素材自己的问题，原样注入就会
+///  把这个错位一起带过去。
+///
+///  设 +0.5 表示音频读取位置整体往后挪 0.5 秒（读更晚的内容），听感上声音
+///  就往后推了 0.5 秒，与画面对齐。
+@property (nonatomic, assign) double offsetSeconds;
+
 /// 取下一块 PCM（float32 / 素材原始声道 / 素材原始采样率）。
 /// 没有数据时返回 nil。内部串行，可多线程调用。
 - (nullable NSData *)nextPCMWithFrames:(CMItemCount *)frames

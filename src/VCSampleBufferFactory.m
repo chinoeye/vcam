@@ -326,6 +326,41 @@
 //  PTS、attachments、format description 全部原生，App 不会察觉。
 //  代价是每帧多一次 memcpy（同格式）或一次 GPU 缩放（异格式）。
 
+// 采样 Y 平面，看 range 到底有没有被转换。
+//
+//  "偏白"在数值上只有两种形态：
+//    src Y 16~235（video）→ dst Y 也是 16~235  → range 没转，暗部发灰、亮部封顶
+//    src Y 16~235          → dst Y 变成 0~255  → range 转了
+//  量出来就不用猜了。
+static void VCSampleYRange(CVPixelBufferRef pb, const char *tag)
+{
+    if (!pb || CVPixelBufferGetPlaneCount(pb) < 1) return;
+    if (CVPixelBufferLockBaseAddress(pb, kCVPixelBufferLock_ReadOnly) != kCVReturnSuccess) return;
+
+    uint8_t *base = CVPixelBufferGetBaseAddressOfPlane(pb, 0);
+    size_t h   = CVPixelBufferGetHeightOfPlane(pb, 0);
+    size_t w   = CVPixelBufferGetWidthOfPlane(pb, 0);
+    size_t bpr = CVPixelBufferGetBytesPerRowOfPlane(pb, 0);
+
+    if (base && h > 0 && w > 0) {
+        uint8_t mn = 255, mx = 0;
+        double sum = 0; size_t n = 0;
+        for (size_t y = 0; y < h; y += 24) {
+            const uint8_t *row = base + y * bpr;
+            for (size_t x = 0; x < w; x += 24) {
+                uint8_t v = row[x];
+                if (v < mn) mn = v;
+                if (v > mx) mx = v;
+                sum += v; n++;
+            }
+        }
+        if (n) {
+            VCLog(@"Y范围[%s] min=%u max=%u mean=%.1f（%zu 点）", tag, mn, mx, sum / n, n);
+        }
+    }
+    CVPixelBufferUnlockBaseAddress(pb, kCVPixelBufferLock_ReadOnly);
+}
+
 - (BOOL)copyPixelBuffer:(CVPixelBufferRef)src into:(CVPixelBufferRef)dst
 {
     if (!src || !dst) return NO;
@@ -412,11 +447,16 @@
     OSStatus st = VTPixelTransferSessionTransferImage(_transfer, src, dst);
     {
         static int sConvLogs = 0;
-        if (sConvLogs < 6) {
+        if (sConvLogs < 3) {
             sConvLogs++;
             VCLog(@"像素转换 %zux%zu 0x%x → %zux%zu 0x%x  %@",
                   sw, sh, (unsigned)sf, dw, dh, (unsigned)df,
                   st == noErr ? @"成功" : @"失败");
+            if (st == noErr) {
+                // 转换前后各量一次 Y 范围，直接看出 range 有没有被处理
+                VCSampleYRange(src, "转换前 素材");
+                VCSampleYRange(dst, "转换后 系统");
+            }
         }
     }
     if (st != noErr) {

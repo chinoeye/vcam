@@ -70,6 +70,9 @@ static double   g_recordStartAt = 0.0;       // 开始录制（首次有音频�
 //  「从录制起点算起」（相对值）。两者原点不同，直接相减就会一路加速 ——
 //  实测：素材 88 秒时音频计数已经 834 秒，追帧永远追不上，每次回调都取满 4 帧。
 volatile int g_vcNeedAudioRebase = 0;
+// 只有「素材回绕」才需要把音频素材真的 seek 回 0（管道那时已经读到末尾了）。
+// 录制起点不需要 —— 管道本来就从素材 0 秒开始，seek 反而带进转换器残留数据。
+volatile int g_vcNeedAudioRewind = 0;
 
 // 音画对齐的诊断量（报告读它们）。
 //  为什么单独记：录完之后预览会继续推帧，直接用「当前视频位置 − 当前音频位置」
@@ -577,14 +580,10 @@ static double VCComputeLumaGainFromRealCamera(double realLuma)
                 if (g_vcNeedAudioRebase) {
                     g_vcNeedAudioRebase = 0;
                     sAudioBase = -1.0;
-                    // 音频也回 0，与「视频 seek 回 0」配对。
-                    //
-                    //  这里曾经调的是 alignToVideoPosition（音频跳到视频当前位置）——
-                    //  那一刻视频正准备回 0，音频就被拽到了视频的**旧**位置：
-                    //      905.948 录制起点对齐：音频 2.00 s → 11.47 s
-                    //      906.184 视频 seek 完成：目标 0.00 s
-                    //  → 视频 0、音频 11.47，画面冻死在那一帧。
-                    [pipe resetToStart];
+                    if (g_vcNeedAudioRewind) {
+                        g_vcNeedAudioRewind = 0;
+                        [pipe resetToStart];       // 素材回绕：音频也回 0
+                    }
                     VCLog(@"音频时钟重取基准（录制起点 / 素材回绕）");
                 }
                 double nowPlayed = pipe.playedSeconds;

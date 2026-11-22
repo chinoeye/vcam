@@ -98,6 +98,7 @@ static NSString *VCJailbreakRoot(void)
     _greenKeyThreshold = 0.25;
     _despillStrength = 0.8;   // 去绿边：压掉 80% 的多余绿分量
     _greenKeyMinArea = 600;   // 连通块小于这个面积当阴影抹掉
+    _keepScreenOn = YES;      // 强制常亮，防止准备开播页被系统锁屏后被杀
     // 默认关：先让用户确认"不参与"时画面是什么样，再决定要不要开。
     _realCameraInfluence = 0.0;
 }
@@ -243,6 +244,7 @@ static BOOL VCAssetDirUsable(NSString *p, BOOL createIfMissing,
     if (d[@"greenKeyThreshold"]) _greenKeyThreshold = [d[@"greenKeyThreshold"] doubleValue];
     if (d[@"despillStrength"])   _despillStrength = [d[@"despillStrength"] doubleValue];
     if (d[@"greenKeyMinArea"])   _greenKeyMinArea = [d[@"greenKeyMinArea"] doubleValue];
+    if (d[@"keepScreenOn"])      _keepScreenOn = [d[@"keepScreenOn"] boolValue];
     if (d[@"realCameraInfluence"]) _realCameraInfluence = [d[@"realCameraInfluence"] doubleValue];
 
     // 实时源（OBS 推流）：sourceKind=1 时走 VCLiveSource

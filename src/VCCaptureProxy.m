@@ -110,6 +110,10 @@ double g_vcRecordEndErr      = 0.0;   // 停录瞬间的偏差
     size_t   _gkRealUVCap;
     uint8_t *_gkMask;          // 绿/非绿掩膜（UV 分辨率），用于填补阴影孔洞
     size_t   _gkMaskCap;
+    uint8_t *_gkSeen;          // 连通域标记
+    size_t   _gkSeenCap;
+    int32_t *_gkStack;         // 泛洪栈
+    size_t   _gkStackCap;
     int      _gkLoggedFrames;
 }
 
@@ -674,6 +678,73 @@ static double VCComputeLumaGainFromRealCamera(double realLuma)
         }
     }
 
+    // ---- 第二遍半：按连通区域面积过滤 ----
+    //
+    //  3x3 只能填「被绿包围的单点」。实测绿幕上有灯泡打下来的阴影带，
+    //  宽度能到十几个像素，3x3 完全填不动，画面上就是一条条黑斑。
+    //
+    //  这一遍把整幅图的非绿连通块找出来，面积小的整块填成绿：
+    //      阴影碎片（几十~几百像素）  → 填
+    //      手（连续几千像素以上）      → 保留
+    //  面积阈值用 greenKeyMinArea 控制，默认 600（约 0.26% 画面）。
+    double minAreaCfg = VCamConfig.shared.greenKeyMinArea;
+    size_t minArea = (size_t)(minAreaCfg > 0 ? minAreaCfg : 600);
+    size_t bigFilled = 0;
+
+    if (!_gkSeen || _gkSeenCap < msz) {
+        free(_gkSeen);
+        _gkSeen = (uint8_t *)calloc(msz, 1);
+        _gkSeenCap = _gkSeen ? msz : 0;
+    }
+    if (!_gkStack || _gkStackCap < msz) {
+        free(_gkStack);
+        _gkStack = (int32_t *)malloc(msz * sizeof(int32_t));
+        _gkStackCap = _gkStack ? msz : 0;
+    }
+
+    if (_gkSeen && _gkStack) {
+        uint8_t *seen = _gkSeen;
+        int32_t *stk  = _gkStack;
+        memset(seen, 0, msz);
+
+        for (size_t sy = 0; sy < uvH; sy++) {
+            for (size_t sx = 0; sx < uvW; sx++) {
+                size_t si = sy * uvW + sx;
+                if (mask[si] || seen[si]) continue;
+
+                // 一次泛洪：stk[0..comp) 就是本连通块的全部成员
+                size_t head = 0, comp = 0;
+                stk[comp++] = (int32_t)si;
+                seen[si] = 1;
+
+                while (head < comp) {
+                    int32_t cur = stk[head++];
+                    size_t cy = (size_t)cur / uvW;
+                    size_t cx = (size_t)cur % uvW;
+                    for (int dy = -1; dy <= 1; dy++) {
+                        long yy = (long)cy + dy;
+                        if (yy < 0 || yy >= (long)uvH) continue;
+                        for (int dx = -1; dx <= 1; dx++) {
+                            long xx = (long)cx + dx;
+                            if (xx < 0 || xx >= (long)uvW) continue;
+                            if (dy == 0 && dx == 0) continue;
+                            size_t ni = (size_t)yy * uvW + (size_t)xx;
+                            if (mask[ni] || seen[ni]) continue;
+                            seen[ni] = 1;
+                            if (comp < msz) stk[comp++] = (int32_t)ni;
+                        }
+                    }
+                }
+
+                // 小块 = 阴影/噪声 → 整块填成绿（成员还在 stk 里，直接改）
+                if (comp < minArea) {
+                    for (size_t k = 0; k < comp; k++) mask[stk[k]] = 1;
+                    bigFilled += comp;
+                }
+            }
+        }
+    }
+
     // ---- 第三遍：按最终掩膜还原 ----
     double despill = VCamConfig.shared.despillStrength;   // 0 = 不去绿边
     long despilled = 0;
@@ -740,6 +811,8 @@ static double VCComputeLumaGainFromRealCamera(double realLuma)
     free(_gkRealY);  _gkRealY = NULL;
     free(_gkRealUV); _gkRealUV = NULL;
     free(_gkMask);   _gkMask = NULL;
+    free(_gkSeen);   _gkSeen = NULL;
+    free(_gkStack);  _gkStack = NULL;
     if (_lastSrcPB) CVPixelBufferRelease(_lastSrcPB);
 }
 

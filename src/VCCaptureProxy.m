@@ -611,9 +611,9 @@ static double VCComputeLumaGainFromRealCamera(double realLuma)
         _gkMask = (uint8_t *)malloc(msz);
         _gkMaskCap = _gkMask ? msz : 0;
     }
-    uint8_t *mask = _gkMask;
+    uint8_t *gkmask = _gkMask;
 
-    if (!mask) {
+    if (!gkmask) {
         // 没内存就退回单遍逻辑（宁可差一点也不能崩）
         for (size_t uy = 0; uy < uvH; uy++) {
             uint8_t *drow = uv + uy * uvBpr;
@@ -645,7 +645,7 @@ static double VCComputeLumaGainFromRealCamera(double realLuma)
     // ---- 第一遍：按绿度初判 ----
     for (size_t uy = 0; uy < uvH; uy++) {
         uint8_t *rrow = _gkRealUV + uy * uvBpr;
-        uint8_t *mrow = mask + uy * uvW;
+        uint8_t *mrow = gkmask + uy * uvW;
         for (size_t ux = 0; ux < uvW; ux++) {
             size_t off = ux * 2;
             if (off + 1 >= uvBpr) { mrow[ux] = 0; continue; }
@@ -659,14 +659,14 @@ static double VCComputeLumaGainFromRealCamera(double realLuma)
     //  手是一大块连续的非绿，不会被填掉；阴影是小片散布，能填回去。
     size_t filled = 0;
     for (size_t uy = 0; uy < uvH; uy++) {
-        uint8_t *mrow = mask + uy * uvW;
+        uint8_t *mrow = gkmask + uy * uvW;
         for (size_t ux = 0; ux < uvW; ux++) {
             if (mrow[ux]) continue;
             int n = 0, cnt = 0;
             for (int dy = -1; dy <= 1; dy++) {
                 long yy = (long)uy + dy;
                 if (yy < 0 || yy >= (long)uvH) continue;
-                uint8_t *nrow = mask + (size_t)yy * uvW;
+                uint8_t *nrow = gkmask + (size_t)yy * uvW;
                 for (int dx = -1; dx <= 1; dx++) {
                     long xx = (long)ux + dx;
                     if (xx < 0 || xx >= (long)uvW) continue;
@@ -688,7 +688,7 @@ static double VCComputeLumaGainFromRealCamera(double realLuma)
     //      阴影碎片（几十~几百像素）  → 填
     //      手（连续几千像素以上）      → 保留
     //  面积阈值用 greenKeyMinArea 控制，默认 600（约 0.26% 画面）。
-#if 0  // 二分排查：临时禁用连通域过滤
+#if 1  // 连通域过滤（mask 改名 gkmask 避开 SDK 符号冲突）
     double minAreaCfg = VCamConfig.shared.greenKeyMinArea;
     size_t minCompPx = (size_t)(minAreaCfg > 0 ? minAreaCfg : 600);
     size_t bigFilled = 0;
@@ -712,7 +712,7 @@ static double VCComputeLumaGainFromRealCamera(double realLuma)
         for (size_t sy = 0; sy < uvH; sy++) {
             for (size_t sx = 0; sx < uvW; sx++) {
                 size_t si = sy * uvW + sx;
-                if (mask[si] || seen[si]) continue;
+                if (gkmask[si] || seen[si]) continue;
 
                 // 一次泛洪：stk[0..comp) 就是本连通块的全部成员
                 size_t head = 0, comp = 0;
@@ -731,7 +731,7 @@ static double VCComputeLumaGainFromRealCamera(double realLuma)
                             if (xx < 0 || xx >= (long)uvW) continue;
                             if (dy == 0 && dx == 0) continue;
                             size_t ni = (size_t)yy * uvW + (size_t)xx;
-                            if (mask[ni] || seen[ni]) continue;
+                            if (gkmask[ni] || seen[ni]) continue;
                             seen[ni] = 1;
                             if (comp < msz) stk[comp++] = (int32_t)ni;
                         }
@@ -740,7 +740,7 @@ static double VCComputeLumaGainFromRealCamera(double realLuma)
 
                 // 小块 = 阴影/噪声 → 整块填成绿（成员还在 stk 里，直接改）
                 if (comp < minCompPx) {
-                    for (size_t k = 0; k < comp; k++) mask[stk[k]] = 1;
+                    for (size_t k = 0; k < comp; k++) gkmask[stk[k]] = 1;
                     bigFilled += comp;
                 }
             }
@@ -755,7 +755,7 @@ static double VCComputeLumaGainFromRealCamera(double realLuma)
     for (size_t uy = 0; uy < uvH; uy++) {
         uint8_t *drow = uv + uy * uvBpr;
         uint8_t *rrow = _gkRealUV + uy * uvBpr;
-        uint8_t *mrow = mask + uy * uvW;
+        uint8_t *mrow = gkmask + uy * uvW;
         for (size_t ux = 0; ux < uvW; ux++) {
             size_t off = ux * 2;
             if (off + 1 >= uvBpr) break;

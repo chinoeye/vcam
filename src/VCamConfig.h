@@ -89,6 +89,14 @@ typedef NS_ENUM(NSInteger, VCAudioMode) {
 ///      绿边  绿度 ≈ +30 → 压掉 80%，剩 +6，肉眼基本看不出
 @property (nonatomic, assign) double despillStrength;
 
+/// 连通区域最小面积（UV 像素数，默认 600）。
+///
+///  绿幕上的阴影带宽度能到十几个像素，3x3 邻域填不动。
+///  这里按「连通块面积」判断：小于这个数的块整块当阴影抹掉，
+///  大于的才当成真实物体（手）保留。
+///  720p 的 UV 平面是 360x640 = 23 万像素，600 约合画面的 0.26%。
+@property (nonatomic, assign) double greenKeyMinArea;
+
 /// 真实摄像头对画面的影响力（0 = 不参与，1 = 完全跟随）。
 ///
 /// 手机镜头实时拍着环境，我们**不把真实画面叠上去**，只用它的平均亮度

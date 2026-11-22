@@ -559,6 +559,29 @@ static double VCComputeLumaGainFromRealCamera(double realLuma)
     if (radius < 10) radius = 10;
     int r2 = radius * radius;
 
+    // 诊断：把实际读到的 UV 打出来。
+    //  判定失败时只看到「非绿 100%」是没用的 —— 得知道到底是
+    //  ① 绿幕颜色偏了（Cb/Cr 数值不在参考点附近）
+    //  ② 读错字节（UV 平面索引/字节序不对，读到的是一堆垃圾）
+    if (_gkLoggedFrames < 3) {
+        VCLog(@"绿幕诊断：UV %zux%zu bpr=%zu   Y %zux%zu bpr=%zu  radius=%d",
+              uvW, uvH, uvBpr, yW, yH, yBpr, radius);
+        // 取 5 个点：四角 + 中心
+        int px[5] = { (int)(uvW * 0.15), (int)(uvW * 0.85), (int)(uvW * 0.5),
+                      (int)(uvW * 0.30), (int)(uvW * 0.70) };
+        int py[5] = { (int)(uvH * 0.15), (int)(uvH * 0.15), (int)(uvH * 0.5),
+                      (int)(uvH * 0.60), (int)(uvH * 0.60) };
+        for (int i = 0; i < 5; i++) {
+            size_t off = (size_t)py[i] * uvBpr + (size_t)px[i] * 2;
+            if (off + 1 < _gkRealUVCap) {
+                int cb = _gkRealUV[off], cr = _gkRealUV[off + 1];
+                int d2 = (cb - 54) * (cb - 54) + (cr - 34) * (cr - 34);
+                VCLog(@"  点%d (%d,%d) Cb=%d Cr=%d  到纯绿距离²=%d %@",
+                      i, px[i], py[i], cb, cr, d2, (d2 <= r2) ? @"→绿" : @"→非绿");
+            }
+        }
+    }
+
     long nonGreen = 0, total = 0;
 
     for (size_t uy = 0; uy < uvH; uy++) {

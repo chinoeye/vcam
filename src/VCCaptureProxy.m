@@ -108,6 +108,8 @@ double g_vcRecordEndErr      = 0.0;   // 停录瞬间的偏差
     uint8_t *_gkRealUV;
     size_t   _gkRealYCap;
     size_t   _gkRealUVCap;
+    uint8_t *_gkMask;          // 绿/非绿掩膜（UV 分辨率），用于填补阴影孔洞
+    size_t   _gkMaskCap;
     int      _gkLoggedFrames;
 }
 
@@ -594,17 +596,95 @@ static double VCComputeLumaGainFromRealCamera(double realLuma)
 
     long nonGreen = 0, total = 0;
 
+    // 掩膜：1 = 绿幕（显示素材），0 = 非绿（显示真实画面）
+    //  为什么需要它：绿幕在灯光下会有明暗不均，阴影区的饱和度被压低，
+    //  绿度掉到阈值以下 → 被判成非绿 → 画面出现一块块黑斑。
+    //  所以分两遍：先按绿度初判，再把「被绿包围的小块非绿」填回绿。
+    size_t msz = uvW * uvH;
+    if (!_gkMask || _gkMaskCap < msz) {
+        free(_gkMask);
+        _gkMask = (uint8_t *)malloc(msz);
+        _gkMaskCap = _gkMask ? msz : 0;
+    }
+    uint8_t *mask = _gkMask;
+
+    if (!mask) {
+        // 没内存就退回单遍逻辑（宁可差一点也不能崩）
+        for (size_t uy = 0; uy < uvH; uy++) {
+            uint8_t *drow = uv + uy * uvBpr;
+            uint8_t *rrow = _gkRealUV + uy * uvBpr;
+            for (size_t ux = 0; ux < uvW; ux++) {
+                size_t off = ux * 2;
+                if (off + 1 >= uvBpr) break;
+                int g = (128 - (int)rrow[off]) + (128 - (int)rrow[off + 1]);
+                total++;
+                if (g >= greenMin) continue;
+                drow[off] = rrow[off];
+                drow[off + 1] = rrow[off + 1];
+                nonGreen++;
+                for (int dy = 0; dy < 2; dy++) {
+                    size_t yy = uy * 2 + dy;
+                    if (yy >= yH) break;
+                    uint8_t *dyl = y + yy * yBpr;
+                    uint8_t *ryl = _gkRealY + yy * yBpr;
+                    size_t x0 = ux * 2;
+                    if (x0 < yW)     dyl[x0] = ryl[x0];
+                    if (x0 + 1 < yW) dyl[x0 + 1] = ryl[x0 + 1];
+                }
+            }
+        }
+        CVPixelBufferUnlockBaseAddress(dst, 0);
+        return;
+    }
+
+    // ---- 第一遍：按绿度初判 ----
+    for (size_t uy = 0; uy < uvH; uy++) {
+        uint8_t *rrow = _gkRealUV + uy * uvBpr;
+        uint8_t *mrow = mask + uy * uvW;
+        for (size_t ux = 0; ux < uvW; ux++) {
+            size_t off = ux * 2;
+            if (off + 1 >= uvBpr) { mrow[ux] = 0; continue; }
+            int g = (128 - (int)rrow[off]) + (128 - (int)rrow[off + 1]);
+            mrow[ux] = (g >= greenMin) ? 1 : 0;
+        }
+    }
+
+    // ---- 第二遍：填补阴影造成的孔洞 ----
+    //  3x3 邻域里如果有 7 个以上是绿，把这个点也当绿。
+    //  手是一大块连续的非绿，不会被填掉；阴影是小片散布，能填回去。
+    size_t filled = 0;
+    for (size_t uy = 0; uy < uvH; uy++) {
+        uint8_t *mrow = mask + uy * uvW;
+        for (size_t ux = 0; ux < uvW; ux++) {
+            if (mrow[ux]) continue;
+            int n = 0, cnt = 0;
+            for (int dy = -1; dy <= 1; dy++) {
+                long yy = (long)uy + dy;
+                if (yy < 0 || yy >= (long)uvH) continue;
+                uint8_t *nrow = mask + (size_t)yy * uvW;
+                for (int dx = -1; dx <= 1; dx++) {
+                    long xx = (long)ux + dx;
+                    if (xx < 0 || xx >= (long)uvW) continue;
+                    if (dy == 0 && dx == 0) continue;
+                    cnt++;
+                    n += nrow[xx];
+                }
+            }
+            if (cnt >= 5 && n >= cnt - 1) { mrow[ux] = 1; filled++; }
+        }
+    }
+
+    // ---- 第三遍：按最终掩膜还原 ----
     for (size_t uy = 0; uy < uvH; uy++) {
         uint8_t *drow = uv + uy * uvBpr;
         uint8_t *rrow = _gkRealUV + uy * uvBpr;
+        uint8_t *mrow = mask + uy * uvW;
         for (size_t ux = 0; ux < uvW; ux++) {
             size_t off = ux * 2;
             if (off + 1 >= uvBpr) break;
-            int g = (128 - (int)rrow[off]) + (128 - (int)rrow[off + 1]);
             total++;
-            if (g >= greenMin) continue;   // 够绿 → 保留素材
+            if (mrow[ux]) continue;   // 绿 → 显示素材
 
-            // 不是绿色 → 还原真实画面（UV + 对应的 2x2 亮度块）
             drow[off]     = rrow[off];
             drow[off + 1] = rrow[off + 1];
             nonGreen++;
@@ -625,8 +705,8 @@ static double VCComputeLumaGainFromRealCamera(double realLuma)
 
     if (_gkLoggedFrames < 6) {
         _gkLoggedFrames++;
-        VCLog(@"绿幕：非绿区域 %.1f%%（阈值 %.2f → 绿度 %d）",
-              total ? (100.0 * nonGreen / (double)total) : 0.0, th, greenMin);
+        VCLog(@"绿幕：非绿区域 %.1f%%（阈值 %.2f → 绿度 %d，填孔 %zu 个）",
+              total ? (100.0 * nonGreen / (double)total) : 0.0, th, greenMin, filled);
     }
 }
 
@@ -634,6 +714,7 @@ static double VCComputeLumaGainFromRealCamera(double realLuma)
 {
     free(_gkRealY);  _gkRealY = NULL;
     free(_gkRealUV); _gkRealUV = NULL;
+    free(_gkMask);   _gkMask = NULL;
     if (_lastSrcPB) CVPixelBufferRelease(_lastSrcPB);
 }
 

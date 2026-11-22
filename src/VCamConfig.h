@@ -97,6 +97,16 @@ typedef NS_ENUM(NSInteger, VCAudioMode) {
 ///  720p 的 UV 平面是 360x640 = 23 万像素，600 约合画面的 0.26%。
 @property (nonatomic, assign) double greenKeyMinArea;
 
+/// 强制屏幕常亮（默认 YES）。
+///
+///  抖音只在真正录制/直播时置 idleTimerDisabled，停留在「准备开播」页时
+///  它不置位，两分钟后系统锁屏 → App 进后台 → 后台线程还在跑 →
+///  5 秒内没让出资源 → 被 watchdog 杀死（实测连续崩两次）。
+///
+///  开启后 hook setIdleTimerDisabled，不管抖音传什么一律置 YES。
+///  代价是耗电。不想常亮可以设 false。
+@property (nonatomic, assign) BOOL keepScreenOn;
+
 /// 真实摄像头对画面的影响力（0 = 不参与，1 = 完全跟随）。
 ///
 /// 手机镜头实时拍着环境，我们**不把真实画面叠上去**，只用它的平均亮度

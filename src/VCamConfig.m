@@ -96,6 +96,7 @@ static NSString *VCJailbreakRoot(void)
     //  0.25 → 42    默认（实测手机摄像头拍绿幕绿度约 55，留了余量）
     //  0.40 → 68    偏淡的绿幕
     _greenKeyThreshold = 0.25;
+    _despillStrength = 0.8;   // 去绿边：压掉 80% 的多余绿分量
     // 默认关：先让用户确认"不参与"时画面是什么样，再决定要不要开。
     _realCameraInfluence = 0.0;
 }
@@ -239,6 +240,7 @@ static BOOL VCAssetDirUsable(NSString *p, BOOL createIfMissing,
     if (d[@"audioOffsetMs"])     _audioOffsetMs = [d[@"audioOffsetMs"] doubleValue];
     if (d[@"greenKeyEnabled"])   _greenKeyEnabled = [d[@"greenKeyEnabled"] boolValue];
     if (d[@"greenKeyThreshold"]) _greenKeyThreshold = [d[@"greenKeyThreshold"] doubleValue];
+    if (d[@"despillStrength"])   _despillStrength = [d[@"despillStrength"] doubleValue];
     if (d[@"realCameraInfluence"]) _realCameraInfluence = [d[@"realCameraInfluence"] doubleValue];
 
     // 实时源（OBS 推流）：sourceKind=1 时走 VCLiveSource

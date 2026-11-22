@@ -688,6 +688,7 @@ static double VCComputeLumaGainFromRealCamera(double realLuma)
     //      阴影碎片（几十~几百像素）  → 填
     //      手（连续几千像素以上）      → 保留
     //  面积阈值用 greenKeyMinArea 控制，默认 600（约 0.26% 画面）。
+#if 0  // 二分排查：临时禁用连通域过滤
     double minAreaCfg = VCamConfig.shared.greenKeyMinArea;
     size_t minCompPx = (size_t)(minAreaCfg > 0 ? minAreaCfg : 600);
     size_t bigFilled = 0;
@@ -745,6 +746,7 @@ static double VCComputeLumaGainFromRealCamera(double realLuma)
             }
         }
     }
+#endif
 
     // ---- 第三遍：按最终掩膜还原 ----
     double despill = VCamConfig.shared.despillStrength;   // 0 = 不去绿边

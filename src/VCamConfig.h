@@ -81,6 +81,14 @@ typedef NS_ENUM(NSInteger, VCAudioMode) {
 ///  0.15 只抠很纯的绿；0.35 默认；0.6 连偏黄偏青的绿幕都能抠掉。
 @property (nonatomic, assign) double greenKeyThreshold;
 
+/// 去绿边强度（0~1，0 = 关闭）。
+///
+///  绿幕反光打在手部边缘，那圈像素偏绿，直接照搬会有一道绿边。
+///  这里把非绿像素里「多余的绿分量」按比例压掉：
+///      肤色  绿度 ≈ -2  → 负数，完全不受影响
+///      绿边  绿度 ≈ +30 → 压掉 80%，剩 +6，肉眼基本看不出
+@property (nonatomic, assign) double despillStrength;
+
 /// 真实摄像头对画面的影响力（0 = 不参与，1 = 完全跟随）。
 ///
 /// 手机镜头实时拍着环境，我们**不把真实画面叠上去**，只用它的平均亮度

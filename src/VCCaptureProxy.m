@@ -1,4 +1,4 @@
-﻿//
+//
 //  VCCaptureProxy.m
 //
 
@@ -934,6 +934,34 @@ static double VCComputeLumaGainFromRealCamera(double realLuma)
         //  看着像慢动作，很容易被当成同步出问题。
         if (audioTarget < 0.0 && g_videoSessionStart > 0.0) {
             audioTarget = now - g_videoSessionStart;
+        }
+
+        // ---- 素材回绕检测（预览模式也要管）----
+        //
+        //  素材播到末尾会绕回 0，但「真实流逝时间」不会回绕 ——
+        //  于是目标一直往前跑，素材回到 0，差距变成「整个素材长度」，
+        //  追帧每帧取满 4 帧也追不上，观感就是 3 倍速。
+        //
+        //  实测日志：
+        //      素材=1097.23 音频=3126.11 本次取=4
+        //      素材= 765.20 音频=3816.82 本次取=4     ← 素材倒退 332 秒 = 回绕
+        //
+        //  处理：位置突然倒退超过 10 秒就认定回绕，把时钟基准拉回素材当前位置。
+        //  录制模式（有音频时钟）走 g_vcNeedAudioRebase，预览模式走这里。
+        {
+            static double sLastSrcPos = -1.0;
+            double srcPos = [VCFrameSource shared].currentVideoSourceTime;
+
+            if (sLastSrcPos >= 0.0 && srcPos + 10.0 < sLastSrcPos) {
+                if (audioTarget > 0.0) {
+                    // 预览：把会话起点挪到「现在 - 素材位置」，目标立刻等于素材位置
+                    g_videoSessionStart = now - srcPos;
+                    audioTarget = srcPos;
+                }
+                g_vcNeedAudioRebase = 1;   // 录制模式：强制重取音频基准
+                VCLog(@"检测到素材回绕：位置 %.1f → %.1f，预览时钟已重置", sLastSrcPos, srcPos);
+            }
+            sLastSrcPos = srcPos;
         }
 
         int guard = 0;

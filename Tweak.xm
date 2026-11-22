@@ -963,6 +963,24 @@ didFinishLaunchingWithOptions:(NSDictionary *)launchOptions
     return ret;
 }
 
+// 强制屏幕常亮。
+//
+//  实测现象：停在「准备开播」页面不动，两分钟后系统锁屏 → 抖音进后台 →
+//  5 秒内没让出资源 → 被 watchdog 杀（0x8badf00d / process-exit）。
+//  重启后配额还被收紧到 1.83 秒，紧接着又崩一次（scene-create）。
+//
+//  根因：抖音只在真正录制/直播时才置 idleTimerDisabled，准备页不置。
+//  这里直接把它锁成 YES —— 不管抖音怎么设，屏幕都不息。
+//  代价是耗电，但相比「开播前被系统杀掉」这个代价小得多。
+- (void)setIdleTimerDisabled:(BOOL)disabled
+{
+    if (VCamConfig.shared.keepScreenOn) {
+        %orig(YES);
+    } else {
+        %orig(disabled);
+    }
+}
+
 // 后台控制入口：vcam://on / off / pause / asset/xxx / audio/0|1|2
 - (BOOL)application:(UIApplication *)app
             openURL:(NSURL *)url

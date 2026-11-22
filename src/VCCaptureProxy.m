@@ -688,65 +688,52 @@ static double VCComputeLumaGainFromRealCamera(double realLuma)
     //      阴影碎片（几十~几百像素）  → 填
     //      手（连续几千像素以上）      → 保留
     //  面积阈值用 greenKeyMinArea 控制，默认 600（约 0.26% 画面）。
-#if 1  // 连通域过滤（mask 改名 gkmask 避开 SDK 符号冲突）
-    double minAreaCfg = VCamConfig.shared.greenKeyMinArea;
-    size_t minCompPx = (size_t)(minAreaCfg > 0 ? minAreaCfg : 600);
-    size_t bigFilled = 0;
+    // ---- 连通区域过滤（保守写法：全部局部变量）----
+    {
+        size_t minPx = (size_t)VCamConfig.shared.greenKeyMinArea;
+        if (minPx < 50) minPx = 600;
 
-    if (!_gkSeen || _gkSeenCap < msz) {
-        free(_gkSeen);
-        _gkSeen = (uint8_t *)calloc(msz, 1);
-        _gkSeenCap = _gkSeen ? msz : 0;
-    }
-    if (!_gkStack || _gkStackCap < msz) {
-        free(_gkStack);
-        _gkStack = (int32_t *)malloc(msz * sizeof(int32_t));
-        _gkStackCap = _gkStack ? msz : 0;
-    }
+        uint8_t *seenBuf = (uint8_t *)calloc(msz, 1);
+        int32_t *stkBuf = (int32_t *)malloc(msz * sizeof(int32_t));
 
-    if (_gkSeen && _gkStack) {
-        uint8_t *seen = _gkSeen;
-        int32_t *stk  = _gkStack;
-        memset(seen, 0, msz);
+        if (seenBuf && stkBuf) {
+            for (size_t sy2 = 0; sy2 < uvH; sy2++) {
+                for (size_t sx2 = 0; sx2 < uvW; sx2++) {
+                    size_t si2 = sy2 * uvW + sx2;
+                    if (gkmask[si2] || seenBuf[si2]) continue;
 
-        for (size_t sy = 0; sy < uvH; sy++) {
-            for (size_t sx = 0; sx < uvW; sx++) {
-                size_t si = sy * uvW + sx;
-                if (gkmask[si] || seen[si]) continue;
+                    size_t head2 = 0, comp2 = 0;
+                    stkBuf[comp2++] = (int32_t)si2;
+                    seenBuf[si2] = 1;
 
-                // 一次泛洪：stk[0..comp) 就是本连通块的全部成员
-                size_t head = 0, comp = 0;
-                stk[comp++] = (int32_t)si;
-                seen[si] = 1;
-
-                while (head < comp) {
-                    int32_t cur = stk[head++];
-                    size_t cy = (size_t)cur / uvW;
-                    size_t cx = (size_t)cur % uvW;
-                    for (int dy = -1; dy <= 1; dy++) {
-                        long yy = (long)cy + dy;
-                        if (yy < 0 || yy >= (long)uvH) continue;
-                        for (int dx = -1; dx <= 1; dx++) {
-                            long xx = (long)cx + dx;
-                            if (xx < 0 || xx >= (long)uvW) continue;
-                            if (dy == 0 && dx == 0) continue;
-                            size_t ni = (size_t)yy * uvW + (size_t)xx;
-                            if (gkmask[ni] || seen[ni]) continue;
-                            seen[ni] = 1;
-                            if (comp < msz) stk[comp++] = (int32_t)ni;
+                    while (head2 < comp2) {
+                        int32_t cur2 = stkBuf[head2++];
+                        size_t cy2 = (size_t)cur2 / uvW;
+                        size_t cx2 = (size_t)cur2 % uvW;
+                        for (int dy2 = -1; dy2 <= 1; dy2++) {
+                            long yy2 = (long)cy2 + dy2;
+                            if (yy2 < 0 || yy2 >= (long)uvH) continue;
+                            for (int dx2 = -1; dx2 <= 1; dx2++) {
+                                long xx2 = (long)cx2 + dx2;
+                                if (xx2 < 0 || xx2 >= (long)uvW) continue;
+                                if (dy2 == 0 && dx2 == 0) continue;
+                                size_t ni2 = (size_t)yy2 * uvW + (size_t)xx2;
+                                if (gkmask[ni2] || seenBuf[ni2]) continue;
+                                seenBuf[ni2] = 1;
+                                if (comp2 < msz) stkBuf[comp2++] = (int32_t)ni2;
+                            }
                         }
                     }
-                }
 
-                // 小块 = 阴影/噪声 → 整块填成绿（成员还在 stk 里，直接改）
-                if (comp < minCompPx) {
-                    for (size_t k = 0; k < comp; k++) gkmask[stk[k]] = 1;
-                    bigFilled += comp;
+                    if (comp2 < minPx) {
+                        for (size_t k2 = 0; k2 < comp2; k2++) gkmask[stkBuf[k2]] = 1;
+                    }
                 }
             }
         }
+        free(seenBuf);
+        free(stkBuf);
     }
-#endif
 
     // ---- 第三遍：按最终掩膜还原 ----
     double despill = VCamConfig.shared.despillStrength;   // 0 = 不去绿边

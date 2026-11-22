@@ -1,4 +1,4 @@
-//
+﻿//
 //  VCCaptureProxy.m
 //
 
@@ -14,6 +14,7 @@
 
 #import <AudioToolbox/AudioToolbox.h>
 #import <string.h>
+#import <stdlib.h>
 #import <math.h>
 
 // ------------------------------------------------------------------ 注册表
@@ -688,7 +689,7 @@ static double VCComputeLumaGainFromRealCamera(double realLuma)
     //      手（连续几千像素以上）      → 保留
     //  面积阈值用 greenKeyMinArea 控制，默认 600（约 0.26% 画面）。
     double minAreaCfg = VCamConfig.shared.greenKeyMinArea;
-    size_t minArea = (size_t)(minAreaCfg > 0 ? minAreaCfg : 600);
+    size_t minCompPx = (size_t)(minAreaCfg > 0 ? minAreaCfg : 600);
     size_t bigFilled = 0;
 
     if (!_gkSeen || _gkSeenCap < msz) {
@@ -737,7 +738,7 @@ static double VCComputeLumaGainFromRealCamera(double realLuma)
                 }
 
                 // 小块 = 阴影/噪声 → 整块填成绿（成员还在 stk 里，直接改）
-                if (comp < minArea) {
+                if (comp < minCompPx) {
                     for (size_t k = 0; k < comp; k++) mask[stk[k]] = 1;
                     bigFilled += comp;
                 }

@@ -555,18 +555,28 @@ static double VCComputeLumaGainFromRealCamera(double realLuma)
 
     double th = VCamConfig.shared.greenKeyThreshold;
     if (!(th > 0.01)) th = 0.35;
-    int radius = (int)(th * 120.0);      // 0.35 → 42
-    if (radius < 10) radius = 10;
-    int r2 = radius * radius;
 
-    // 诊断：把实际读到的 UV 打出来。
-    //  判定失败时只看到「非绿 100%」是没用的 —— 得知道到底是
-    //  ① 绿幕颜色偏了（Cb/Cr 数值不在参考点附近）
-    //  ② 读错字节（UV 平面索引/字节序不对，读到的是一堆垃圾）
+    // ★ 用「绿度」而不是「到纯绿的距离」。
+    //
+    //  实测数据：摄像头拍绿幕读出来是 Cb≈114 / Cr≈87，
+    //  而标准纯绿是 (54, 34) —— 差了 60 多。
+    //  手机 sensor 的白平衡和色彩矩阵会把绿幕饱和度压掉一大截，
+    //  拿「到纯绿的绝对距离」判断，绿幕永远判不进去（实测 100% 非绿）。
+    //
+    //  绿度 = (128 - Cb) + (128 - Cr)，越大越绿：
+    //      纯绿幕 (54,34)   → 168
+    //      实际绿幕 (114,87) →  55
+    //      中性灰 (128,128)  →   0
+    //      亚洲肤色(110,148) →  -2      ← 天然是负数，不会把手指抠掉
+    //      红色 (90,180)     → -14
+    //  阈值映射到 0~170，默认 0.25 → 42.5，落在 0 和 55 之间。
+    int greenMin = (int)(th * 170.0);
+    if (greenMin < 5) greenMin = 5;
+
+    // 诊断：判定失败时得知道实际读到什么
     if (_gkLoggedFrames < 3) {
-        VCLog(@"绿幕诊断：UV %zux%zu bpr=%zu   Y %zux%zu bpr=%zu  radius=%d",
-              uvW, uvH, uvBpr, yW, yH, yBpr, radius);
-        // 取 5 个点：四角 + 中心
+        VCLog(@"绿幕诊断：UV %zux%zu bpr=%zu   Y %zux%zu bpr=%zu  绿度阈值=%d",
+              uvW, uvH, uvBpr, yW, yH, yBpr, greenMin);
         int px[5] = { (int)(uvW * 0.15), (int)(uvW * 0.85), (int)(uvW * 0.5),
                       (int)(uvW * 0.30), (int)(uvW * 0.70) };
         int py[5] = { (int)(uvH * 0.15), (int)(uvH * 0.15), (int)(uvH * 0.5),
@@ -575,9 +585,9 @@ static double VCComputeLumaGainFromRealCamera(double realLuma)
             size_t off = (size_t)py[i] * uvBpr + (size_t)px[i] * 2;
             if (off + 1 < _gkRealUVCap) {
                 int cb = _gkRealUV[off], cr = _gkRealUV[off + 1];
-                int d2 = (cb - 54) * (cb - 54) + (cr - 34) * (cr - 34);
-                VCLog(@"  点%d (%d,%d) Cb=%d Cr=%d  到纯绿距离²=%d %@",
-                      i, px[i], py[i], cb, cr, d2, (d2 <= r2) ? @"→绿" : @"→非绿");
+                int g = (128 - cb) + (128 - cr);
+                VCLog(@"  点%d (%d,%d) Cb=%d Cr=%d  绿度=%d %@",
+                      i, px[i], py[i], cb, cr, g, (g >= greenMin) ? @"→绿" : @"→非绿");
             }
         }
     }
@@ -590,10 +600,9 @@ static double VCComputeLumaGainFromRealCamera(double realLuma)
         for (size_t ux = 0; ux < uvW; ux++) {
             size_t off = ux * 2;
             if (off + 1 >= uvBpr) break;
-            int cb = (int)rrow[off]     - 54;    // 相对纯绿的 Cb
-            int cr = (int)rrow[off + 1] - 34;    // 相对纯绿的 Cr
+            int g = (128 - (int)rrow[off]) + (128 - (int)rrow[off + 1]);
             total++;
-            if (cb * cb + cr * cr <= r2) continue;   // 是绿色 → 保留素材
+            if (g >= greenMin) continue;   // 够绿 → 保留素材
 
             // 不是绿色 → 还原真实画面（UV + 对应的 2x2 亮度块）
             drow[off]     = rrow[off];
@@ -616,8 +625,8 @@ static double VCComputeLumaGainFromRealCamera(double realLuma)
 
     if (_gkLoggedFrames < 6) {
         _gkLoggedFrames++;
-        VCLog(@"绿幕：非绿区域 %.1f%%（阈值 %.2f → 半径 %d）",
-              total ? (100.0 * nonGreen / (double)total) : 0.0, th, radius);
+        VCLog(@"绿幕：非绿区域 %.1f%%（阈值 %.2f → 绿度 %d）",
+              total ? (100.0 * nonGreen / (double)total) : 0.0, th, greenMin);
     }
 }
 

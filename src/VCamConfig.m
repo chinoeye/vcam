@@ -91,7 +91,11 @@ static NSString *VCJailbreakRoot(void)
     _outputSaturation = 1.0;
     _audioOffsetMs = 0.0;   // 素材自带音画错位时用，正数=声音往后推
     _greenKeyEnabled = NO;
-    _greenKeyThreshold = 0.35;
+    // 阈值含义：绿度阈值 = 本值 × 170（0~1）。
+    //  0.15 → 25    只抠很浓的绿
+    //  0.25 → 42    默认（实测手机摄像头拍绿幕绿度约 55，留了余量）
+    //  0.40 → 68    偏淡的绿幕
+    _greenKeyThreshold = 0.25;
     // 默认关：先让用户确认"不参与"时画面是什么样，再决定要不要开。
     _realCameraInfluence = 0.0;
 }

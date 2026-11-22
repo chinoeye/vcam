@@ -675,6 +675,9 @@ static double VCComputeLumaGainFromRealCamera(double realLuma)
     }
 
     // ---- 第三遍：按最终掩膜还原 ----
+    double despill = VCamConfig.shared.despillStrength;   // 0 = 不去绿边
+    long despilled = 0;
+
     for (size_t uy = 0; uy < uvH; uy++) {
         uint8_t *drow = uv + uy * uvBpr;
         uint8_t *rrow = _gkRealUV + uy * uvBpr;
@@ -685,8 +688,30 @@ static double VCComputeLumaGainFromRealCamera(double realLuma)
             total++;
             if (mrow[ux]) continue;   // 绿 → 显示素材
 
-            drow[off]     = rrow[off];
-            drow[off + 1] = rrow[off + 1];
+            int rc = rrow[off], rr = rrow[off + 1];
+
+            // ★ 去绿边（despill）
+            //
+            //  绿幕的反光会打在手部边缘，那圈像素偏绿 —— 直接照搬真实画面，
+            //  手边上就会有一道绿边，非常刺眼。
+            //
+            //  做法：算这个像素的绿度（正值 = 偏绿），把多出来的绿分量按比例压掉。
+            //      手部皮肤  绿度 ≈ -2   → 负数，完全不动
+            //      绿边      绿度 ≈ +30  → 压掉 80%，剩 +6，肉眼基本看不出
+            //      绿色衣服  会一起被压淡（可以接受，绿幕现场不该穿绿）
+            if (despill > 0.01) {
+                int gsp = (128 - rc) + (128 - rr);
+                if (gsp > 0) {
+                    int d = (int)(gsp * despill * 0.5);
+                    int nc = rc + d; if (nc > 255) nc = 255;
+                    int nr = rr + d; if (nr > 255) nr = 255;
+                    rc = nc; rr = nr;
+                    despilled++;
+                }
+            }
+
+            drow[off]     = (uint8_t)rc;
+            drow[off + 1] = (uint8_t)rr;
             nonGreen++;
 
             for (int dy = 0; dy < 2; dy++) {
@@ -705,8 +730,8 @@ static double VCComputeLumaGainFromRealCamera(double realLuma)
 
     if (_gkLoggedFrames < 6) {
         _gkLoggedFrames++;
-        VCLog(@"绿幕：非绿区域 %.1f%%（阈值 %.2f → 绿度 %d，填孔 %zu 个）",
-              total ? (100.0 * nonGreen / (double)total) : 0.0, th, greenMin, filled);
+        VCLog(@"绿幕：非绿区域 %.1f%%（阈值 %.2f → 绿度 %d，填孔 %zu，去绿边 %ld）",
+              total ? (100.0 * nonGreen / (double)total) : 0.0, th, greenMin, filled, despilled);
     }
 }
 

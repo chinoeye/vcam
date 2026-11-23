@@ -22,6 +22,7 @@
 #import "VCAudioPipeline.h"
 #import "VCFrameSource.h"
 #import "VCAudioSource.h"
+#import "VCamConfig.h"   // micLevel / materialLevel（真麦混音用）
 #import "VCLog.h"
 
 #import <pthread.h>

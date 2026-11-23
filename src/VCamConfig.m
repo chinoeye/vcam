@@ -402,34 +402,96 @@ static BOOL VCDownloadHTTP(NSString *host, uint16_t port, NSString *path, NSStri
         return NO;
     }
 
-    NSMutableData *buf = [NSMutableData dataWithCapacity:4 * 1024 * 1024];
-    char tmp[32768];
-    ssize_t n;
-    while ((n = recv(fd, tmp, sizeof(tmp), 0)) > 0) {
-        [buf appendBytes:tmp length:(NSUInteger)n];
-    }
-    close(fd);
-
-    if (buf.length == 0) return NO;
-
+    // ★ 边收边写盘，绝不把整个文件读进内存。
+    //
+    //  以前是 `NSMutableData` 一路 appendBytes，698 MB 素材直接吃 698 MB 内存
+    //  （扩容时峰值还要翻倍）。iPhone 8 的 App 内存上限约 1.4 GB，
+    //  加上抖音本身占用必然爆掉 —— 实测表现就是「打开抖音 → 自动退出」，
+    //  而且不留崩溃报告（Jetsam 内存击杀不产生 .ips）。
+    //
+    //  现在：头部单独收（最多 64 KB），正文每收到一块就直接 fwrite 落盘，
+    //  常驻内存只有 32 KB 的接收缓冲。
     NSData *sep = [@"\r\n\r\n" dataUsingEncoding:NSUTF8StringEncoding];
-    NSRange r = [buf rangeOfData:sep options:0
-                           range:NSMakeRange(0, MIN(buf.length, (NSUInteger)8192))];
-    if (r.location == NSNotFound) return NO;
 
-    NSString *head = [[NSString alloc] initWithData:[buf subdataWithRange:NSMakeRange(0, r.location)]
-                                           encoding:NSUTF8StringEncoding];
-    if (![head hasPrefix:@"HTTP/1.0 200"] && ![head hasPrefix:@"HTTP/1.1 200"]) {
-        VCLog(@"下载被拒: %@", [head componentsSeparatedByString:@"\r\n"].firstObject);
+    NSString *tmpPath = [dest stringByAppendingString:@".part"];
+    [[NSFileManager defaultManager] removeItemAtPath:tmpPath error:NULL];
+    FILE *fp = fopen(tmpPath.UTF8String, "wb");
+    if (!fp) {
+        close(fd);
+        VCLog(@"下载失败：无法创建临时文件");
         return NO;
     }
 
-    NSData *body = [buf subdataWithRange:
-                    NSMakeRange(r.location + r.length,
-                                buf.length - r.location - r.length)];
-    if (body.length < 4096) return NO;   // 太小，肯定不是视频
+    NSMutableData *headBuf = [NSMutableData dataWithCapacity:8192];
+    char tmp[32768];
+    ssize_t n;
+    BOOL headerDone = NO;
+    BOOL httpOK = NO;
+    long long bodyBytes = 0;
 
-    return [body writeToFile:dest atomically:YES];
+    while ((n = recv(fd, tmp, sizeof(tmp), 0)) > 0) {
+        if (!headerDone) {
+            [headBuf appendBytes:tmp length:(NSUInteger)n];
+
+            NSRange r = [headBuf rangeOfData:sep options:0
+                                       range:NSMakeRange(0, headBuf.length)];
+            if (r.location == NSNotFound) {
+                if (headBuf.length > 65536) {   // 头部异常大，放弃
+                    fclose(fp);
+                    close(fd);
+                    [[NSFileManager defaultManager] removeItemAtPath:tmpPath error:NULL];
+                    VCLog(@"下载失败：响应头异常");
+                    return NO;
+                }
+                continue;
+            }
+
+            NSString *head = [[NSString alloc]
+                              initWithData:[headBuf subdataWithRange:NSMakeRange(0, r.location)]
+                                  encoding:NSUTF8StringEncoding];
+            httpOK = [head hasPrefix:@"HTTP/1.0 200"] || [head hasPrefix:@"HTTP/1.1 200"];
+            if (!httpOK) {
+                VCLog(@"下载被拒: %@", [head componentsSeparatedByString:@"\r\n"].firstObject);
+                fclose(fp);
+                close(fd);
+                [[NSFileManager defaultManager] removeItemAtPath:tmpPath error:NULL];
+                return NO;
+            }
+
+            // 头部后面可能已经跟着正文，先写掉
+            NSUInteger bodyStart = r.location + r.length;
+            if (bodyStart < headBuf.length) {
+                NSUInteger len = headBuf.length - bodyStart;
+                fwrite((const uint8_t *)headBuf.bytes + bodyStart, 1, len, fp);
+                bodyBytes += (long long)len;
+            }
+            headerDone = YES;
+            [headBuf setLength:0];
+        } else {
+            fwrite(tmp, 1, (size_t)n, fp);
+            bodyBytes += (long long)n;
+        }
+    }
+    fclose(fp);
+    close(fd);
+
+    if (!httpOK || bodyBytes < 4096) {
+        [[NSFileManager defaultManager] removeItemAtPath:tmpPath error:NULL];
+        VCLog(@"下载失败：正文只有 %lld 字节", bodyBytes);
+        return NO;
+    }
+
+    // 原子替换：先写 .part，成功后再改名，避免半截文件被当成素材
+    [[NSFileManager defaultManager] removeItemAtPath:dest error:NULL];
+    NSError *mvErr = nil;
+    if (![[NSFileManager defaultManager] moveItemAtPath:tmpPath toPath:dest error:&mvErr]) {
+        VCLog(@"下载失败：落盘失败 %@", mvErr.localizedDescription);
+        [[NSFileManager defaultManager] removeItemAtPath:tmpPath error:NULL];
+        return NO;
+    }
+
+    VCLog(@"下载完成：%lld 字节（%.1f MB）", bodyBytes, bodyBytes / 1048576.0);
+    return YES;
 }
 
 - (BOOL)ensureAssetDownloaded

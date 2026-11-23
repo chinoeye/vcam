@@ -133,6 +133,15 @@ static OSStatus VCPipeInputProc(AudioConverterRef cvt,
     double   _startPlaySeconds; // 启动那一刻视频所在的素材位置
     double   _playError;        // 当前音画偏差（正=音频数据不够，负=数据太多）
     uint64_t _tuneBlocks;       // 累计微调次数（诊断：稳定后应停止增长）
+
+    // ---- 真麦混音 ----
+    //  每次填充前把系统给的原始数据（真实麦克风）备份一份，
+    //  填完素材音频后按比例叠回去 —— 效果是「助播在旁边说话」，
+    //  素材里主播的声音保持原样不被压低（不做闪避）。
+    //  不说话时真麦自然拾取房间底噪，画面听起来更像现场。
+    uint8_t *_micBackup;
+    size_t   _micBackupCap;
+    size_t   _micBackupBytes;
     NSData  *_probeData;        // 探测源格式时取走的那一块，必须留着复用
     NSMutableData *_srcCarry;   // 上一轮没被转换器吃掉的源数据（字节）
     size_t   _srcCarryFrames;   // 上面那份缓存里的帧数
@@ -790,6 +799,91 @@ static volatile BOOL g_audioAligning = NO;
 // ------------------------------------------------------------------ 消费
 
 - (void)fillIOData:(AudioBufferList *)ioData frames:(UInt32)frames
+{
+    if (!ioData || frames == 0) return;
+
+    // ---- 先备份真实麦克风数据 ----
+    //  必须在覆盖之前拿走 —— ioData 此刻装的还是 AURemoteIO 采到的声音。
+    //  备份失败（没内存）就退化成「纯素材」，不能因此不出声。
+    BOOL haveMic = [self backupMic:ioData frames:frames];
+
+    [self fillMaterialInto:ioData frames:frames];
+
+    // ---- 混合 ----
+    //  dst = 素材 × materialLevel + 真麦 × micLevel
+    //  素材默认保持 1.0（不被压低），真麦默认 0.35（像助播的音量）。
+    if (haveMic) [self mixMicInto:ioData];
+}
+
+/// 备份 ioData 里的原始（真实麦克风）数据。
+- (BOOL)backupMic:(AudioBufferList *)ioData frames:(UInt32)frames
+{
+    _micBackupBytes = 0;
+    if (!ioData || ioData->mNumberBuffers == 0 || frames == 0) return NO;
+
+    AudioBuffer *b0 = &ioData->mBuffers[0];
+    if (!b0->mData || b0->mDataByteSize == 0) return NO;
+
+    size_t contract = (size_t)frames * _bytesPerFrame;
+    size_t n = b0->mDataByteSize < contract ? b0->mDataByteSize : contract;
+    if (n == 0) return NO;
+
+    if (!_micBackup || _micBackupCap < n) {
+        free(_micBackup);
+        _micBackup = (uint8_t *)malloc(n);
+        _micBackupCap = _micBackup ? n : 0;
+    }
+    if (!_micBackup) return NO;
+
+    memcpy(_micBackup, b0->mData, n);
+    _micBackupBytes = n;
+    return YES;
+}
+
+/// 把备份的真麦数据按 micLevel 叠加到已填好的素材音频上。
+- (void)mixMicInto:(AudioBufferList *)ioData
+{
+    if (!_micBackup || _micBackupBytes == 0 || !ioData) return;
+
+    double micLevel = VCamConfig.shared.micLevel;
+    double matLevel = VCamConfig.shared.materialLevel;
+    if (micLevel <= 0.001 && matLevel >= 0.999) return;   // 不需要混
+
+    AudioBuffer *b0 = &ioData->mBuffers[0];
+    if (!b0->mData) return;
+
+    size_t n = b0->mDataByteSize < _micBackupBytes ? b0->mDataByteSize : _micBackupBytes;
+    if (n < 2) return;
+
+    BOOL isFloat = (_dstFormat.mFormatFlags & kAudioFormatFlagIsFloat) != 0;
+    uint32_t bits = _dstFormat.mBitsPerChannel;
+
+    if (isFloat && bits == 32) {
+        float *dst = (float *)b0->mData;
+        const float *mic = (const float *)_micBackup;
+        size_t cnt = n / sizeof(float);
+        for (size_t i = 0; i < cnt; i++) {
+            float v = dst[i] * (float)matLevel + mic[i] * (float)micLevel;
+            if (v > 1.0f) v = 1.0f;
+            if (v < -1.0f) v = -1.0f;
+            dst[i] = v;
+        }
+    } else if (!isFloat && bits == 16) {
+        int16_t *dst = (int16_t *)b0->mData;
+        const int16_t *mic = (const int16_t *)_micBackup;
+        size_t cnt = n / sizeof(int16_t);
+        for (size_t i = 0; i < cnt; i++) {
+            int v = (int)(dst[i] * matLevel) + (int)(mic[i] * micLevel);
+            if (v > 32767)  v = 32767;
+            if (v < -32768) v = -32768;
+            dst[i] = (int16_t)v;
+        }
+    }
+    // 其它格式（24bit 等）不处理，退化成纯素材
+}
+
+/// 原 fillIOData 的全部逻辑（把素材音频填进 ioData）。
+- (void)fillMaterialInto:(AudioBufferList *)ioData frames:(UInt32)frames
 {
     if (!ioData || frames == 0) return;
 

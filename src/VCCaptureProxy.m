@@ -922,10 +922,40 @@ static double VCComputeLumaGainFromRealCamera(double realLuma)
                 }
                 double p = nowPlayed - sAudioBase;
                 if (isfinite(p) && p >= 0.0) {
-                    audioTarget = p;
-                    // 兜底：真实流逝是硬上限，音频计数再虚高也不许超
-                    wallSeconds = now - g_recordStartAt;
-                    if (wallSeconds < audioTarget) audioTarget = wallSeconds;
+                    // ★ 音频停了就别再拿它当时钟。
+                    //
+                    //  实测：停止录制之后音频不再被消费，playedSeconds 冻住，
+                    //  audioTarget 也跟着冻住 → 追帧每次取 0 帧 → 画面卡死：
+                    //      节奏 素材=21.93 音频=21.93 真实=85.36 本次取=0
+                    //  但此时用户已经回到预览页，画面本该继续播。
+                    //
+                    //  所以：1.5 秒内 playedSeconds 没有增长 → 判定「音频不活跃」，
+                    //  退回下面那条「真实时间」驱动，画面继续走。
+                    static double sLastPlayed = -1.0;
+                    static double sLastPlayedAt = 0.0;
+                    if (nowPlayed > sLastPlayed + 0.0005) {
+                        sLastPlayed = nowPlayed;
+                        sLastPlayedAt = now;
+                    }
+                    BOOL audioActive = (now - sLastPlayedAt) < 1.5;
+
+                    if (audioActive) {
+                        audioTarget = p;
+                        // 兜底：真实流逝是硬上限，音频计数再虚高也不许超
+                        wallSeconds = now - g_recordStartAt;
+                        if (wallSeconds < audioTarget) audioTarget = wallSeconds;
+                    } else {
+                        // 音频不再消费（停录/暂停）→ 交回预览模式。
+                        //  同时把预览基准挪到「现在 - 素材当前位置」，
+                        //  这样画面从当前帧继续，不会跳回开头。
+                        double srcPos = [VCFrameSource shared].currentVideoSourceTime;
+                        g_videoSessionStart = now - srcPos;
+                        static int sInactiveLogs = 0;
+                        if (sInactiveLogs < 3) {
+                            sInactiveLogs++;
+                            VCLog(@"音频已停止消费，预览时钟接管（素材 %.1f s 处继续）", srcPos);
+                        }
+                    }
                 }
             }
         }

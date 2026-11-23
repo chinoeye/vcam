@@ -941,6 +941,22 @@ static void VCApplyURL(NSURL *url)
             [cfg persist];
             VCLog(@"URL 控制: 音频模式 %ld", (long)mode);
         }
+    } else if ([host isEqualToString:@"mic"]) {
+        // vcam://mic/0.5  —— 真麦音量（助播音量）
+        double v = path.length > 1 ? [[path substringFromIndex:1] doubleValue] : -1;
+        if (v >= 0.0 && v <= 1.0) {
+            cfg.micLevel = v;
+            [cfg persist];
+            VCLog(@"URL 控制: 真麦音量 %.2f", v);
+        }
+    } else if ([host isEqualToString:@"vol"] || [host isEqualToString:@"material"]) {
+        // vcam://vol/0.85  —— 素材音量
+        double v = path.length > 1 ? [[path substringFromIndex:1] doubleValue] : -1;
+        if (v >= 0.0 && v <= 1.0) {
+            cfg.materialLevel = v;
+            [cfg persist];
+            VCLog(@"URL 控制: 素材音量 %.2f", v);
+        }
     } else if ([host isEqualToString:@"status"]) {
         VCLog(@"URL 控制: 状态查询 inject=%d asset=%@",
               cfg.injectEnabled, cfg.assetName);

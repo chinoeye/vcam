@@ -1,4 +1,4 @@
-//
+﻿//
 //  VCamConfig.m
 //
 
@@ -494,6 +494,65 @@ static BOOL VCDownloadHTTP(NSString *host, uint16_t port, NSString *path, NSStri
     return YES;
 }
 
+/// 发 HEAD 请求取远程文件大小。失败返回 -1（网络不通、服务器不在等）。
+///
+///  只用来判断「服务器上的素材是不是换了」—— 拿不到就当没变化，
+///  绝不能因此挡住本地播放（用户可能在没 WiFi 的地方用）。
+static long long VCQueryRemoteSize(NSString *host, uint16_t port, NSString *path)
+{
+    if (host.length == 0 || path.length == 0) return -1;
+
+    struct hostent *he = gethostbyname(host.UTF8String);
+    if (!he || he->h_addrtype != AF_INET || !he->h_addr_list[0]) return -1;
+
+    int fd = socket(AF_INET, SOCK_STREAM, 0);
+    if (fd < 0) return -1;
+
+    // 短超时：查不到就赶紧用本地文件，别让启动卡住
+    struct timeval tv;
+    tv.tv_sec = 1;
+    tv.tv_usec = 500000;
+    setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+    setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+
+    struct sockaddr_in addr;
+    memset(&addr, 0, sizeof(addr));
+    addr.sin_family = AF_INET;
+    addr.sin_port   = htons(port);
+    memcpy(&addr.sin_addr.s_addr, he->h_addr_list[0], sizeof(uint32_t));
+
+    if (connect(fd, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
+        close(fd);
+        return -1;
+    }
+
+    char req[512];
+    snprintf(req, sizeof(req),
+             "HEAD %s HTTP/1.0\r\nHost: %s\r\nConnection: close\r\n\r\n",
+             path.UTF8String, host.UTF8String);
+    if (send(fd, req, strlen(req), 0) <= 0) { close(fd); return -1; }
+
+    char buf[4096];
+    ssize_t n = recv(fd, buf, sizeof(buf) - 1, 0);
+    close(fd);
+    if (n <= 0) return -1;
+    buf[n] = 0;
+
+    NSString *head = [NSString stringWithUTF8String:buf];
+    if (!head) return -1;
+
+    NSRange r = [head rangeOfString:@"Content-Length:" options:NSCaseInsensitiveSearch];
+    if (r.location == NSNotFound) return -1;
+
+    NSString *rest = [head substringFromIndex:NSMaxRange(r)];
+    NSRange eol = [rest rangeOfString:@"\r\n"];
+    if (eol.location != NSNotFound) rest = [rest substringToIndex:eol.location];
+    rest = [rest stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceCharacterSet]];
+
+    long long v = rest.longLongValue;
+    return v > 0 ? v : -1;
+}
+
 - (BOOL)ensureAssetDownloaded
 {
     if (_assetName.length == 0) return NO;
@@ -503,9 +562,47 @@ static BOOL VCDownloadHTTP(NSString *host, uint16_t port, NSString *path, NSStri
                       [_assetName stringByAppendingPathExtension:@"mp4"]];
 
     NSFileManager *fm = [NSFileManager defaultManager];
-    if ([fm fileExistsAtPath:dest]) {
+    BOOL haveLocal = [fm fileExistsAtPath:dest];
+
+    uint16_t port = _httpPort > 0 ? _httpPort : 8088;
+    NSString *escaped = [_assetName stringByAddingPercentEncodingWithAllowedCharacters:
+                         [NSCharacterSet URLPathAllowedCharacterSet]];
+    NSString *path = [NSString stringWithFormat:@"/%@.mp4", escaped];
+
+    // ---- 自动检测服务器上的素材是否已更换 ----
+    //
+    //  用途：电脑换文件 → 手机打开抖音 → 自动更新 → 开播。
+    //  换素材不再需要在手机上做任何操作。
+    //
+    //  判断依据是文件大小（HEAD 请求的 Content-Length）：
+    //    大小不同  → 认定换了素材，删掉本地重下
+    //    大小相同  → 认为没变，直接用本地（避免每次都重下）
+    //  拿不到（服务器没开/没 WiFi）→ 服务本地文件，不阻塞。
+    //
+    //  局限：新素材如果和旧素材字节数完全一样就不会被检测到。
+    //        实际使用里清洗产物的体积每次都不同，碰上的概率极低。
+    if (haveLocal && _liveHost.length > 0) {
+        long long remoteSize = VCQueryRemoteSize(_liveHost, port, path);
+        if (remoteSize > 0) {
+            NSDictionary *attr = [fm attributesOfItemAtPath:dest error:NULL];
+            unsigned long long localSize = attr ? [attr fileSize] : 0;
+            if ((long long)localSize != remoteSize) {
+                VCLog(@"服务器素材已更换（本地 %llu → 远程 %lld 字节），重新下载",
+                      localSize, remoteSize);
+                [fm removeItemAtPath:dest error:NULL];
+                haveLocal = NO;
+            } else {
+                VCLog(@"本地素材与服务器一致（%lld 字节），直接用本地", remoteSize);
+            }
+        } else {
+            VCLog(@"服务器不可达，使用本地素材");
+        }
+    }
+
+    if (haveLocal) {
         return YES;   // 已经有了
     }
+
     [fm createDirectoryAtPath:dir withIntermediateDirectories:YES attributes:nil error:NULL];
 
     if (_liveHost.length == 0) {
@@ -513,10 +610,6 @@ static BOOL VCDownloadHTTP(NSString *host, uint16_t port, NSString *path, NSStri
         return NO;
     }
 
-    uint16_t port = _httpPort > 0 ? _httpPort : 8088;
-    NSString *escaped = [_assetName stringByAddingPercentEncodingWithAllowedCharacters:
-                         [NSCharacterSet URLPathAllowedCharacterSet]];
-    NSString *path = [NSString stringWithFormat:@"/%@.mp4", escaped];
 
     VCLog(@"本地无素材，从 %@:%u 拉 %@", _liveHost, port, path);
     BOOL ok = VCDownloadHTTP(_liveHost, port, path, dest);

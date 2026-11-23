@@ -107,6 +107,17 @@ typedef NS_ENUM(NSInteger, VCAudioMode) {
 ///  代价是耗电。不想常亮可以设 false。
 @property (nonatomic, assign) BOOL keepScreenOn;
 
+/// 真实麦克风混入音量（0~1，默认 0.35）。
+///
+///  效果是「助播在旁边说话」：素材里主播的声音保持原样不压，
+///  真麦按这个比例叠上去。不说话时就是房间底噪，画面听着更像现场。
+///  设 0 = 只有素材（等于 audioMode 1 的老行为）。
+@property (nonatomic, assign) double micLevel;
+
+/// 素材音量（0~1，默认 1.0 = 原样）。
+///  只有想让素材更小声时才需要动它。
+@property (nonatomic, assign) double materialLevel;
+
 /// 真实摄像头对画面的影响力（0 = 不参与，1 = 完全跟随）。
 ///
 /// 手机镜头实时拍着环境，我们**不把真实画面叠上去**，只用它的平均亮度

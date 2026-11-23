@@ -99,6 +99,8 @@ static NSString *VCJailbreakRoot(void)
     _despillStrength = 0.8;   // 去绿边：压掉 80% 的多余绿分量
     _greenKeyMinArea = 600;   // 连通块小于这个面积当阴影抹掉
     _keepScreenOn = YES;      // 强制常亮，防止准备开播页被系统锁屏后被杀
+    _micLevel = 0.35;         // 真麦叠加音量（助播效果）
+    _materialLevel = 1.0;     // 素材保持原样
     // 默认关：先让用户确认"不参与"时画面是什么样，再决定要不要开。
     _realCameraInfluence = 0.0;
 }
@@ -232,6 +234,8 @@ static BOOL VCAssetDirUsable(NSString *p, BOOL createIfMissing,
     if (d[@"despillStrength"])   _despillStrength = [d[@"despillStrength"] doubleValue];
     if (d[@"greenKeyMinArea"])   _greenKeyMinArea = [d[@"greenKeyMinArea"] doubleValue];
     if (d[@"keepScreenOn"])      _keepScreenOn = [d[@"keepScreenOn"] boolValue];
+    if (d[@"micLevel"])          _micLevel = [d[@"micLevel"] doubleValue];
+    if (d[@"materialLevel"])     _materialLevel = [d[@"materialLevel"] doubleValue];
     if (d[@"realCameraInfluence"]) _realCameraInfluence = [d[@"realCameraInfluence"] doubleValue];
 
     // 实时源（OBS 推流）：sourceKind=1 时走 VCLiveSource

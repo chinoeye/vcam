@@ -1,4 +1,4 @@
-﻿//
+//
 //  VCamConfig.m
 //
 
@@ -494,19 +494,24 @@ static BOOL VCDownloadHTTP(NSString *host, uint16_t port, NSString *path, NSStri
     return YES;
 }
 
-/// 发 HEAD 请求取远程文件大小。失败返回 -1（网络不通、服务器不在等）。
+/// 发 HEAD 请求取远程文件的 大小 + 修改时间。
 ///
-///  只用来判断「服务器上的素材是不是换了」—— 拿不到就当没变化，
-///  绝不能因此挡住本地播放（用户可能在没 WiFi 的地方用）。
-static long long VCQueryRemoteSize(NSString *host, uint16_t port, NSString *path)
+///  返回 YES 表示查到了；NO 表示查不到（服务器没开 / 没网络），调用方应退回本地文件。
+///
+///  为什么两个值都要：只比大小会漏判「两份素材字节数恰好相同」；
+///  只比时间又会被「拷贝时保留原时间戳」骗过。两个一起看才稳。
+static BOOL VCQueryRemoteInfo(NSString *host, uint16_t port, NSString *path,
+                              long long *outSize, NSString **outLastModified)
 {
-    if (host.length == 0 || path.length == 0) return -1;
+    if (outSize) *outSize = -1;
+    if (outLastModified) *outLastModified = nil;
+    if (host.length == 0 || path.length == 0) return NO;
 
     struct hostent *he = gethostbyname(host.UTF8String);
-    if (!he || he->h_addrtype != AF_INET || !he->h_addr_list[0]) return -1;
+    if (!he || he->h_addrtype != AF_INET || !he->h_addr_list[0]) return NO;
 
     int fd = socket(AF_INET, SOCK_STREAM, 0);
-    if (fd < 0) return -1;
+    if (fd < 0) return NO;
 
     // 短超时：查不到就赶紧用本地文件，别让启动卡住
     struct timeval tv;
@@ -523,34 +528,43 @@ static long long VCQueryRemoteSize(NSString *host, uint16_t port, NSString *path
 
     if (connect(fd, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
         close(fd);
-        return -1;
+        return NO;
     }
 
     char req[512];
     snprintf(req, sizeof(req),
              "HEAD %s HTTP/1.0\r\nHost: %s\r\nConnection: close\r\n\r\n",
              path.UTF8String, host.UTF8String);
-    if (send(fd, req, strlen(req), 0) <= 0) { close(fd); return -1; }
+    if (send(fd, req, strlen(req), 0) <= 0) { close(fd); return NO; }
 
-    char buf[4096];
+    char buf[8192];
     ssize_t n = recv(fd, buf, sizeof(buf) - 1, 0);
     close(fd);
-    if (n <= 0) return -1;
+    if (n <= 0) return NO;
     buf[n] = 0;
 
     NSString *head = [NSString stringWithUTF8String:buf];
-    if (!head) return -1;
+    if (!head) return NO;
 
     NSRange r = [head rangeOfString:@"Content-Length:" options:NSCaseInsensitiveSearch];
-    if (r.location == NSNotFound) return -1;
+    if (r.location != NSNotFound) {
+        NSString *rest = [head substringFromIndex:NSMaxRange(r)];
+        NSRange eol = [rest rangeOfString:@"\r\n"];
+        if (eol.location != NSNotFound) rest = [rest substringToIndex:eol.location];
+        rest = [rest stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceCharacterSet]];
+        if (outSize) *outSize = rest.longLongValue;
+    }
 
-    NSString *rest = [head substringFromIndex:NSMaxRange(r)];
-    NSRange eol = [rest rangeOfString:@"\r\n"];
-    if (eol.location != NSNotFound) rest = [rest substringToIndex:eol.location];
-    rest = [rest stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceCharacterSet]];
+    NSRange rm = [head rangeOfString:@"Last-Modified:" options:NSCaseInsensitiveSearch];
+    if (rm.location != NSNotFound) {
+        NSString *rest = [head substringFromIndex:NSMaxRange(rm)];
+        NSRange eol = [rest rangeOfString:@"\r\n"];
+        if (eol.location != NSNotFound) rest = [rest substringToIndex:eol.location];
+        rest = [rest stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceCharacterSet]];
+        if (outLastModified) *outLastModified = rest;
+    }
 
-    long long v = rest.longLongValue;
-    return v > 0 ? v : -1;
+    return ((outSize && *outSize > 0) || (outLastModified && *outLastModified != nil));
 }
 
 - (BOOL)ensureAssetDownloaded
@@ -560,6 +574,9 @@ static long long VCQueryRemoteSize(NSString *host, uint16_t port, NSString *path
     NSString *dir  = [self assetDirectory];
     NSString *dest = [dir stringByAppendingPathComponent:
                       [_assetName stringByAppendingPathExtension:@"mp4"]];
+    // 记录上次下载时服务器上的修改时间，用来判断素材换没换过
+    NSString *stampPath = [dir stringByAppendingPathComponent:
+                           [_assetName stringByAppendingPathExtension:@"stamp"]];
 
     NSFileManager *fm = [NSFileManager defaultManager];
     BOOL haveLocal = [fm fileExistsAtPath:dest];
@@ -572,35 +589,51 @@ static long long VCQueryRemoteSize(NSString *host, uint16_t port, NSString *path
     // ---- 自动检测服务器上的素材是否已更换 ----
     //
     //  用途：电脑换文件 → 手机打开抖音 → 自动更新 → 开播。
-    //  换素材不再需要在手机上做任何操作。
+    //  换素材不需要在手机上做任何操作。
     //
-    //  判断依据是文件大小（HEAD 请求的 Content-Length）：
-    //    大小不同  → 认定换了素材，删掉本地重下
-    //    大小相同  → 认为没变，直接用本地（避免每次都重下）
-    //  拿不到（服务器没开/没 WiFi）→ 服务本地文件，不阻塞。
-    //
-    //  局限：新素材如果和旧素材字节数完全一样就不会被检测到。
-    //        实际使用里清洗产物的体积每次都不同，碰上的概率极低。
-    if (haveLocal && _liveHost.length > 0) {
-        long long remoteSize = VCQueryRemoteSize(_liveHost, port, path);
-        if (remoteSize > 0) {
-            NSDictionary *attr = [fm attributesOfItemAtPath:dest error:NULL];
-            unsigned long long localSize = attr ? [attr fileSize] : 0;
-            if ((long long)localSize != remoteSize) {
-                VCLog(@"服务器素材已更换（本地 %llu → 远程 %lld 字节），重新下载",
-                      localSize, remoteSize);
-                [fm removeItemAtPath:dest error:NULL];
-                haveLocal = NO;
-            } else {
-                VCLog(@"本地素材与服务器一致（%lld 字节），直接用本地", remoteSize);
-            }
+    //  判断依据（两个都看，任一不同就重下）：
+    //    ① 文件大小   抓住绝大多数情况
+    //    ② 修改时间   抓住「字节数碰巧相同」的情况
+    //  拿不到 HEAD 响应（服务器没开/没 WiFi）→ 直接用本地，不阻塞播放。
+    long long remoteSize = -1;
+    NSString *remoteMod = nil;
+    BOOL haveRemote = NO;
+
+    if (_liveHost.length > 0) {
+        haveRemote = VCQueryRemoteInfo(_liveHost, port, path, &remoteSize, &remoteMod);
+    }
+
+    if (haveLocal && haveRemote) {
+        NSDictionary *attr = [fm attributesOfItemAtPath:dest error:NULL];
+        unsigned long long localSize = attr ? [attr fileSize] : 0;
+        NSString *savedStamp = [NSString stringWithContentsOfFile:stampPath
+                                                         encoding:NSUTF8StringEncoding
+                                                            error:NULL];
+        savedStamp = [savedStamp stringByTrimmingCharactersInSet:
+                      [NSCharacterSet whitespaceAndNewlineCharacterSet]];
+
+        BOOL sizeDiffers = (remoteSize > 0 && (long long)localSize != remoteSize);
+        BOOL timeDiffers = (savedStamp.length > 0 && remoteMod.length > 0 &&
+                            ![savedStamp isEqualToString:remoteMod]);
+
+        if (sizeDiffers || timeDiffers) {
+            VCLog(@"服务器素材已更换（大小 %llu→%lld，时间 %@→%@），重新下载",
+                  localSize, remoteSize,
+                  savedStamp.length ? savedStamp : @"(无)",
+                  remoteMod.length ? remoteMod : @"(无)");
+            [fm removeItemAtPath:dest error:NULL];
+            [fm removeItemAtPath:stampPath error:NULL];
+            haveLocal = NO;
         } else {
-            VCLog(@"服务器不可达，使用本地素材");
+            VCLog(@"本地素材与服务器一致（%lld 字节 / %@），直接用本地",
+                  remoteSize, remoteMod.length ? remoteMod : @"(无时间戳)");
         }
+    } else if (haveLocal && !haveRemote) {
+        VCLog(@"服务器不可达，使用本地素材");
     }
 
     if (haveLocal) {
-        return YES;   // 已经有了
+        return YES;   // 已经有了，直接播
     }
 
     [fm createDirectoryAtPath:dir withIntermediateDirectories:YES attributes:nil error:NULL];
@@ -614,6 +647,18 @@ static long long VCQueryRemoteSize(NSString *host, uint16_t port, NSString *path
     VCLog(@"本地无素材，从 %@:%u 拉 %@", _liveHost, port, path);
     BOOL ok = VCDownloadHTTP(_liveHost, port, path, dest);
     VCLog(@"素材下载%@", ok ? @"成功" : @"失败");
+
+    // 下载成功后记下服务器这次的修改时间，下次启动靠它判断「换没换过」。
+    //  重新查一次 HEAD：下载过程可能有几十秒，服务器上的文件也许又变了。
+    if (ok) {
+        long long s2 = -1;
+        NSString *m2 = nil;
+        if (VCQueryRemoteInfo(_liveHost, port, path, &s2, &m2) && m2.length > 0) {
+            [m2 writeToFile:stampPath atomically:YES
+                   encoding:NSUTF8StringEncoding error:NULL];
+            VCLog(@"已记录素材时间戳：%@", m2);
+        }
+    }
     return ok;
 }
 

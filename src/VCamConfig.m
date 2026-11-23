@@ -140,32 +140,19 @@ static BOOL VCAssetDirUsable(NSString *p, BOOL createIfMissing,
 {
     NSMutableArray *candidates = [NSMutableArray array];
 
-    // ① 越狱环境优先：抖音沙盒之外。
+    // ① 容器内的 Cache 目录 —— **唯一第一优先**。
     //
-    //   素材是个几百 MB 的成品视频，放在 App 自己的 Documents 里
-    //   （`.../Aweme/Documents/VCam/assets/current.mp4`）是唯一的**文件级**
-    //   痕迹 —— API 层我们已经是原地改写、PTS/attachments 全原生，
-    //   抖音看不出画面来源，唯一能抓的就是这个文件名。
+    //  为什么不再优先 /var/mobile/Media/VCamAssets：
+    //    越狱环境下那个目录可写，App 会优先用它；非越狱时不可写，回退到 Caches。
+    //    结果就是「两种环境用不同的目录」—— 推送工具、清理脚本、App 三方
+    //    各说各话，实测踩过一次：素材推到了 Caches，App 却在空的 Media 目录里
+    //    找文件，表现为「素材位置一直是 0、一帧都不出」。
     //
-    //   /var/mobile/Media 在越狱环境下可读可写（需预建并 chown 给 _installd），
-    //   非越狱时它对 App 只读 —— 下面的探针写会失败，自动降级到 ②，
-    //   所以两种环境都不会因此失效。
-    [candidates addObject:@"/var/mobile/Media/VCamAssets"];
-
-    // ② 非越狱 / TrollStore：只有容器内可写。
+    //  统一到 Caches 之后三种环境行为一致，而且它伪装成抖音自己的缓存：
+    //      Library/Caches/com.ss.iphone.ugc.Aweme.cache/video.mp4
     //
-    //   ★ 现在优先放 **Library/Caches** 下一个伪装成抖音自己缓存目录的位置。
-    //
-    //     为什么换：以前是 `Documents/VCam/assets/current.mp4` ——
-    //     「VCam」直接写明用途、「current」写明是当前播放的那份，
-    //     一个几 GB 的 mp4 摆在那儿，翻一眼沙盒就知道是什么。
-    //     现在改成：
-    //         Library/Caches/com.ss.iphone.ugc.Aweme.cache/video.mp4
-    //     目录名看着就是抖音自己的缓存，文件名是最普通的 video.mp4。
-    //
-    //     代价：Caches 可能被系统/App 清理，素材会消失。
-    //     使用方式是「每次开播前换素材」，所以这个代价可以接受 ——
-    //     而且清掉了也只是回到「没素材」状态，不会崩。
+    //  代价：Caches 可能被系统/App 清理。使用方式是「每次开播前换素材」，
+    //       清掉了也只是回到「没素材」状态，App 会自动重下，不会崩。
     NSString *caches = NSSearchPathForDirectoriesInDomains(NSCachesDirectory,
                                                             NSUserDomainMask, YES).firstObject;
     if (caches.length > 0) {

@@ -1154,30 +1154,37 @@ static void VCBootstrap(void)
             dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
                 VCamConfig *c = VCamConfig.shared;
                 if (c.sourceKind == VCSourceKindAsset) {
-                    // ★ 加载绝不能放主线程。
+                    // ★ 先下载完，再加载 —— 不能反过来。
                     //
-                    //  实测崩溃：exception 0x8badf00d
-                    //    reason: scene-create watchdog transgression
-                    //    exhausted CPU time allowance of 3.59 seconds
-                    //    实际用了 8.02 秒 CPU
+                    //  实测：本地没有素材时 assetURL 会返回 HTTP URL，
+                    //  但 AVAssetReader 对 HTTP 源不工作：
+                    //      素材帧率 30.00 fps     ← 元数据读得到
+                    //      素材时长 1461.83 s     ← 说明 HTTP 通着
+                    //      装载失败：操作已停止   ← 但 startReading 直接失败
+                    //  AVAssetReader 需要随机访问，HTTP 流式满足不了（AVPlayer 才行）。
                     //
-                    //  698 MB 素材的 moov 解析 + AVAssetReader 初始化要几秒，
-                    //  放在 main queue 上直接顶掉 watchdog 配额，App 被杀。
-                    //  （日志特征：心跳一直在打、采集帧计数始终 0、绿幕日志一条没有
-                    //    —— 说明根本没走到采集回调就崩了。）
-                    //
-                    //  改到后台队列：慢一点没关系，主线程不被堵就不会被 watchdog 杀。
+                    //  所以非越狱环境下的正路是：App 自己把文件完整下到 Caches，
+                    //  再按本地文件加载。698 MB 走局域网约 1~2 分钟。
+                    //  这段时间画面是真实摄像头，下完自动接上。
                     dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+                        BOOL ready = [c ensureAssetDownloaded];
+                        if (!ready) {
+                            VCRemoteLog(@"素材不可用：本地没有且下载失败");
+                            return;
+                        }
                         VCLoadAssetNow();
                         VCPrewarmAudioPipeline();
                         dispatch_async(dispatch_get_main_queue(), ^{
                             VCStartStatReporter();
                         });
                     });
-                    BOOL got = [c ensureAssetDownloaded];
-                    VCRemoteLog(@"后台缓存%@（不影响当前播放）", got ? @"已就绪" : @"未完成");
                 } else {
                     dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+                        BOOL ready = [c ensureAssetDownloaded];
+                        if (!ready) {
+                            VCRemoteLog(@"素材不可用：本地没有且下载失败");
+                            return;
+                        }
                         VCLoadAssetNow();
                         VCPrewarmAudioPipeline();
                         dispatch_async(dispatch_get_main_queue(), ^{

@@ -89,6 +89,7 @@ static NSString *VCJailbreakRoot(void)
     // 由 config.plist 的 outputGamma 决定（实测 1.5 左右抵得住）。
     _outputGamma = 1.0;
     _outputSaturation = 1.0;
+    _outputLumaGain = 1.0;   // 开播页提亮补偿（0.914 = 抵消 +9.43%）
     _audioOffsetMs = 0.0;   // 素材自带音画错位时用，正数=声音往后推
     _greenKeyEnabled = NO;
     // 阈值含义：绿度阈值 = 本值 × 170（0~1）。
@@ -228,6 +229,7 @@ static BOOL VCAssetDirUsable(NSString *p, BOOL createIfMissing,
     if (d[@"audioMode"])         _audioMode = (VCAudioMode)[d[@"audioMode"] integerValue];
     if (d[@"outputGamma"])       _outputGamma = [d[@"outputGamma"] doubleValue];
     if (d[@"outputSaturation"])  _outputSaturation = [d[@"outputSaturation"] doubleValue];
+    if (d[@"outputLumaGain"])    _outputLumaGain = [d[@"outputLumaGain"] doubleValue];
     if (d[@"audioOffsetMs"])     _audioOffsetMs = [d[@"audioOffsetMs"] doubleValue];
     if (d[@"greenKeyEnabled"])   _greenKeyEnabled = [d[@"greenKeyEnabled"] boolValue];
     if (d[@"greenKeyThreshold"]) _greenKeyThreshold = [d[@"greenKeyThreshold"] doubleValue];

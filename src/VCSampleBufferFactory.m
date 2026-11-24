@@ -547,19 +547,21 @@ static void VCApplyOutputGrade(CVPixelBufferRef dst, double gamma, double satSca
         return NO;
     }
 
-    // 开播页提亮曲线的反补偿 + 真实摄像头的光照跟随
+    // 开播页色彩处理的反补偿 + 真实摄像头的光照跟随
     {
         static int sGammaLogs = 0;
         VCamConfig *cfg = VCamConfig.shared;
         double g = cfg.outputGamma;
         double s = cfg.outputSaturation;
-        double gain = self.lumaGain;
+        // 固定亮度增益（补偿开播页的提亮）× 光照跟随的动态增益
+        double gain = self.lumaGain * (cfg.outputLumaGain > 0.01 ? cfg.outputLumaGain : 1.0);
         BOOL needG = (g > 0.01 && fabs(g - 1.0) > 0.005);
         BOOL needS = (s > 0.01 && fabs(s - 1.0) > 0.005);
         BOOL needL = (gain > 0.01 && fabs(gain - 1.0) > 0.005);
         if (needG || needS || needL) {
             if (sGammaLogs++ < 3) {
-                VCLog(@"输出处理 gamma=%.2f 饱和=%.2f 光照增益=%.3f", g, s, gain);
+                VCLog(@"输出处理 gamma=%.2f 饱和=%.2f 亮度增益=%.3f（含固定 %.3f）",
+                      g, s, gain, cfg.outputLumaGain);
             }
             VCApplyOutputGrade(dst, g, s, gain);
         }

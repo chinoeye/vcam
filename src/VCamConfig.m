@@ -143,32 +143,35 @@ static BOOL VCAssetDirUsable(NSString *p, BOOL createIfMissing,
 {
     NSMutableArray *candidates = [NSMutableArray array];
 
-    // ① 容器内的 Cache 目录 —— **唯一第一优先**。
+    // ① Documents 下的伪装目录 —— **第一优先**。
     //
-    //  为什么不再优先 /var/mobile/Media/VCamAssets：
-    //    越狱环境下那个目录可写，App 会优先用它；非越狱时不可写，回退到 Caches。
-    //    结果就是「两种环境用不同的目录」—— 推送工具、清理脚本、App 三方
-    //    各说各话，实测踩过一次：素材推到了 Caches，App 却在空的 Media 目录里
-    //    找文件，表现为「素材位置一直是 0、一帧都不出」。
+    //  为什么不放 Caches 了：
+    //    起初放 `Library/Caches/com.ss.iphone.ugc.Aweme.cache/`，为的是
+    //    "看起来像抖音自己的缓存"。但实测踩了坑：**手机重启后系统把 Caches
+    //    清了**，素材消失，4.84 GB 要重新下载 14 分钟，而重启后还得重新越狱，
+    //    等于每次开机都要等半小时才能开播。
     //
-    //  统一到 Caches 之后三种环境行为一致，而且它伪装成抖音自己的缓存：
-    //      Library/Caches/com.ss.iphone.ugc.Aweme.cache/video.mp4
-    //
-    //  代价：Caches 可能被系统/App 清理。使用方式是「每次开播前换素材」，
-    //       清掉了也只是回到「没素材」状态，App 会自动重下，不会崩。
+    //  Documents 不会被系统清理，一次放进去长期可用。
+    //  目录名仍然伪装（com.ss.iphone.ugc.Aweme.data，看着像 App 自己的数据目录），
+    //  而且抖音没开 UIFileSharingEnabled，iTunes/爱思也看不到这个目录，外部不暴露。
+    NSString *docs = NSSearchPathForDirectoriesInDomains(NSDocumentDirectory,
+                                                         NSUserDomainMask, YES).firstObject;
+    if (docs.length > 0) {
+        [candidates addObject:[docs stringByAppendingPathComponent:@"com.ss.iphone.ugc.Aweme.data"]];
+    }
+
+    // ② 旧的 Caches 位置（平滑过渡：存量素材还能用，重启被清后自动降级到 ①）
     NSString *caches = NSSearchPathForDirectoriesInDomains(NSCachesDirectory,
                                                             NSUserDomainMask, YES).firstObject;
     if (caches.length > 0) {
         [candidates addObject:[caches stringByAppendingPathComponent:@"com.ss.iphone.ugc.Aweme.cache"]];
     }
 
-    // 旧的 Documents 位置保留在探测链后面，方便平滑过渡（存量的素材还能用）
-    NSString *docs = NSSearchPathForDirectoriesInDomains(NSDocumentDirectory,
-                                                         NSUserDomainMask, YES).firstObject;
+    // ③ 更老的位置
     if (docs.length > 0) {
         [candidates addObject:[docs stringByAppendingPathComponent:@"VCam/assets"]];
     }
-    // ③ 最后的兜底
+    // ④ 最后的兜底
     [candidates addObject:[NSTemporaryDirectory() stringByAppendingPathComponent:@"VCam/assets"]];
 
     for (NSString *p in candidates) {
@@ -201,13 +204,17 @@ static BOOL VCAssetDirUsable(NSString *p, BOOL createIfMissing,
 {
     NSMutableArray<NSString *> *paths = [NSMutableArray array];
 
+    // 与素材目录保持一致：Documents 优先（重启不清），Caches 次之（兼容旧位置）
+    NSString *docs = NSSearchPathForDirectoriesInDomains(NSDocumentDirectory,
+                                                         NSUserDomainMask, YES).firstObject;
+    if (docs.length > 0) {
+        [paths addObject:[docs stringByAppendingPathComponent:@"com.ss.iphone.ugc.Aweme.data/config.plist"]];
+    }
     NSString *caches = NSSearchPathForDirectoriesInDomains(NSCachesDirectory,
                                                             NSUserDomainMask, YES).firstObject;
     if (caches.length > 0) {
         [paths addObject:[caches stringByAppendingPathComponent:@"com.ss.iphone.ugc.Aweme.cache/config.plist"]];
     }
-    NSString *docs = NSSearchPathForDirectoriesInDomains(NSDocumentDirectory,
-                                                         NSUserDomainMask, YES).firstObject;
     if (docs.length > 0) {
         [paths addObject:[docs stringByAppendingPathComponent:@"VCam/config.plist"]];
     }

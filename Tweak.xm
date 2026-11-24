@@ -1167,7 +1167,23 @@ static void VCBootstrap(void)
             //  现在assetURL 本来就是「本地有就用本地，没有就 HTTP 直连」，
             //  所以直接加载即可：小素材本地秒开，大素材按需拉几 MB 开播。
             //  下载退化成后台缓存，只为下次启动更快，不再挡路。
-            dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
+            // ★ 延迟 3 秒再加载素材 —— 错开 iOS 的 scene-create 窗口。
+            //
+            //  实测崩溃（2026-11-24 19:49）：
+            //      exception 0x8badf00d
+            //      reason  scene-create watchdog transgression
+            //              exhausted CPU time allowance of 2.25 seconds
+            //      实际用了 8.700 秒 CPU（72% CPU）
+            //
+            //  scene-create 是 iOS 建界面场景的阶段，系统要求这段时间 CPU 安静。
+            //  我们在这个窗口里解析 5 GB 素材的 moov（约 30 MB）+ 建 AVAssetReader
+            //  + 音频预热，即使都放在后台队列，CPU 占用照样算进去。
+            //
+            //  延迟 3 秒让系统的场景创建先跑完，再把重活丢进去。
+            //  使用习惯是「进开播页 → 等一分钟 → 点开播」，
+            //  3 秒延迟完全被这一分钟吃掉，不会露出绿幕。
+            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(3.0 * NSEC_PER_SEC)),
+                           dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
                 VCamConfig *c = VCamConfig.shared;
                 if (c.sourceKind == VCSourceKindAsset) {
                     // ★ 先下载完，再加载 —— 不能反过来。
